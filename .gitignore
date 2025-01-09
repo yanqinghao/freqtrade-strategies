@@ -78,3 +78,5 @@ target/
 .idea
 .vscode
 *.feather
+.last_result.json
+backtest-result-*

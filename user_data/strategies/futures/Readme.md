@@ -215,3 +215,9 @@ freqtrade backtesting --config config.json --strategy OptimizedStrategy --timera
 ```shell
 freqtrade hyperopt --config config.json --strategy OptimizedStrategy --epochs 100 --spaces buy sell --timerange 20230101-20240101
 ```
+
+4. 结果打印
+
+```shell
+freqtrade backtesting-show --filename user_data/backtest_results/backtest-result.json
+```
