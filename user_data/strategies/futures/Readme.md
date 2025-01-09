@@ -208,6 +208,9 @@ freqtrade backtesting --config config.json --strategy OptimizedStrategy --pairs 
 # 更详细的回测报告
 freqtrade backtesting --config config.json --strategy OptimizedStrategy --timerange 20230101-20240101 --enable-full-position-metrics --enable-protections
 
+# 修改路径
+freqtrade backtesting --config user_data/config.json --strategy-path user_data/strategies/futures --strategy FOttStrategy --timerange 20241001-20250108
+
 ```
 
 3. 超参数优化
