@@ -190,14 +190,7 @@
 1. download data
 
 ```shell
-# 第一阶段：近期验证（3个月）
-freqtrade backtesting --config config.json --strategy OptimizedStrategy --timerange 20231001-20240108
-
-# 第二阶段：中期验证（6-12个月）
-freqtrade backtesting --config config.json --strategy OptimizedStrategy --timerange 20230101-20240108
-
-# 第三阶段：长期验证（1.5-2年）
-freqtrade backtesting --config config.json --strategy OptimizedStrategy --timerange 20220701-20240108
+freqtrade download-data --config config.json --timerange 20230101-20240101 --timeframe 30m 4h
 ```
 
 2. backtesting 
