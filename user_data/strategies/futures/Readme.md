@@ -190,7 +190,7 @@
 1. download data
 
 ```shell
-freqtrade download-data --config user_data/config.json --timerange 20230101-20250109 --timeframe 15m 4h 1h
+freqtrade download-data --config user_data/config.json --timerange 20230101-20250110 --timeframe 15m 4h 1h
 ```
 
 2. backtesting 
@@ -212,6 +212,8 @@ freqtrade backtesting --config config.json --strategy OptimizedStrategy --timera
 freqtrade backtesting --config user_data/config.json --strategy-path user_data/strategies/futures --strategy FOttStrategy --timerange 20241001-20250108
 
 freqtrade backtesting --config user_data/config.json --strategy-path user_data/strategies/futures --strategy LeverageFOttStrategy --timerange 20241201-20250108 --breakdown day --export signals
+
+freqtrade backtesting --config user_data/config.json --strategy-path user_data/strategies --strategy LeverageSupertrend --timerange 20241210-20250111 --breakdown day --export signals
 ```
 
 3. 超参数优化

@@ -15,7 +15,8 @@ BLACKLIST_PAIRS = [
     'ALCH/USDT:USDT',
     'GRIFFAIN/USDT:USDT',
     'D/USDT:USDT',
-    'COOKIE/USDT:USDT'
+    'COOKIE/USDT:USDT',
+    'PHA/USDT:USDT',
 ]
 
 def get_futures_exchange_info() -> Dict:
