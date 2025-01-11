@@ -190,7 +190,7 @@
 1. download data
 
 ```shell
-freqtrade download-data --config config.json --timerange 20230101-20240101 --timeframe 30m 4h
+freqtrade download-data --config user_data/config.json --timerange 20230101-20250109 --timeframe 15m 4h 1h
 ```
 
 2. backtesting 
@@ -211,6 +211,7 @@ freqtrade backtesting --config config.json --strategy OptimizedStrategy --timera
 # 修改路径
 freqtrade backtesting --config user_data/config.json --strategy-path user_data/strategies/futures --strategy FOttStrategy --timerange 20241001-20250108
 
+freqtrade backtesting --config user_data/config.json --strategy-path user_data/strategies/futures --strategy LeverageFOttStrategy --timerange 20241201-20250108 --breakdown day --export signals
 ```
 
 3. 超参数优化
@@ -223,4 +224,10 @@ freqtrade hyperopt --config config.json --strategy OptimizedStrategy --epochs 10
 
 ```shell
 freqtrade backtesting-show --filename user_data/backtest_results/backtest-result.json
+```
+
+5. 结果分析
+
+```shell
+freqtrade backtesting-analysis -c user_data/config.json --filename user_data/backtest_results/backtest-result-2025-01-10_13-28-09.json --analysis-to-csv --analysis-groups 0 1 2 3 4 5
 ```

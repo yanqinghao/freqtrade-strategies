@@ -80,3 +80,6 @@ target/
 *.feather
 .last_result.json
 backtest-result-*
+**/backtest_results/*
+*.bak
+**/pairs_analysis.csv
