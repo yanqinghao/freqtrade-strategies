@@ -27,6 +27,7 @@ def main():
     CONFIG_PATH = 'user_data/config.json'
     CSV_PATH = 'user_data/backtest_results/group_3.csv'
     REMOVE_THRESHOLD = -10  # 仅删除表现特别差的交易对
+    MAX_PAIRS = 30  # 最多选择30个交易对
     
     # 读取CSV文件
     print(f"读取交易对数据: {CSV_PATH}")
@@ -38,21 +39,25 @@ def main():
     # 找出表现特别差的交易对
     bad_pairs = df[df['profit_abs_sum'] < REMOVE_THRESHOLD]
     
-    # 保留其他所有交易对
+    # 保留收益大于阈值的交易对
     good_pairs = df[df['profit_abs_sum'] >= REMOVE_THRESHOLD]
     
-    # 按照收益排序
-    good_pairs = good_pairs.sort_values('profit_abs_sum', ascending=False)
+    # 按照收益排序并只取前30个
+    good_pairs = good_pairs.sort_values('profit_abs_sum', ascending=False).head(MAX_PAIRS)
     
     # 显示统计信息
     print("\n=== 交易对分析结果 ===")
     print(f"总交易对数量: {total_pairs}")
-    print(f"保留交易对数量: {len(good_pairs)}")
-    print(f"移除交易对数量: {len(bad_pairs)}")
+    print(f"符合收益阈值的交易对数量: {len(df[df['profit_abs_sum'] >= REMOVE_THRESHOLD])}")
+    print(f"最终选择的交易对数量: {len(good_pairs)}")
+    print(f"移除的交易对数量: {len(bad_pairs)}")
     
     if len(bad_pairs) > 0:
         print("\n已移除的交易对（表现特别差）:")
         print(bad_pairs[['pair', 'num_buys', 'profit_abs_sum', 'mean_profit_pct']].to_string(index=False))
+    
+    print("\n选择的前30个交易对:")
+    print(good_pairs[['pair', 'num_buys', 'profit_abs_sum', 'mean_profit_pct']].to_string(index=False))
     
     # 获取要保留的交易对列表
     selected_pairs = good_pairs['pair'].tolist()
