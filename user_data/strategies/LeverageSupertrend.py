@@ -14,25 +14,25 @@ class LeverageSupertrend(IStrategy):
     position_adjustment_enable = True
 
     buy_params = {
-        "buy_m1": 4,
-        "buy_m2": 7,
-        "buy_m3": 1,
-        "buy_p1": 8,
-        "buy_p2": 9,
-        "buy_p3": 8,
+        "buy_m1": 5,   # 长期趋势，低敏感度
+        "buy_m2": 3,   # 中期趋势，中等敏感度
+        "buy_m3": 1,   # 短期趋势，高敏感度
+        "buy_p1": 24,  # 24小时
+        "buy_p2": 8,   # 8小时
+        "buy_p3": 4,   # 4小时
         "buy_rsi_period": 14,
-        "buy_rsi_period_long": 100  # 长周期RSI
+        "buy_rsi_period_long": 100
     }
 
     sell_params = {
-        "sell_m1": 1,
+        "sell_m1": 5,
         "sell_m2": 3,
-        "sell_m3": 6,
-        "sell_p1": 16,
-        "sell_p2": 18,
-        "sell_p3": 18,
+        "sell_m3": 1,
+        "sell_p1": 24,
+        "sell_p2": 8,
+        "sell_p3": 4,
         "sell_rsi_period": 14,
-        "sell_rsi_period_long": 100  # 长周期RSI
+        "sell_rsi_period_long": 100
     }
 
     minimal_roi = {"0": 0.1, "30": 0.75, "60": 0.05, "120": 0.025}
@@ -121,36 +121,57 @@ class LeverageSupertrend(IStrategy):
                 return 2
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # 添加短周期和长周期RSI指标
+
+        dataframe['TR'] = ta.TRANGE(dataframe)
+        dataframe['ATR'] = ta.SMA(dataframe['TR'], 14)  # 使用14周期的ATR
+        
+        # 计算ATR百分比
+        dataframe['ATR_pct'] = dataframe['ATR'] / dataframe['close'] * 100
+
+        # 添加RSI指标
         dataframe['rsi'] = ta.RSI(dataframe, timeperiod=self.buy_rsi_period.value)
         dataframe['rsi_long'] = ta.RSI(dataframe, timeperiod=self.buy_rsi_period_long.value)
         
-        # Supertrend indicators
-        for multiplier in self.buy_m1.range:
-            for period in self.buy_p1.range:
-                dataframe[f'supertrend_1_buy_{multiplier}_{period}'] = self.supertrend(dataframe, multiplier, period)['STX']
+        # 只计算实际需要用到的supertrend
+        # 买入信号的三条线
+        dataframe['supertrend_1_buy'] = self.supertrend(
+            dataframe, 
+            self.buy_m1.value, 
+            self.buy_p1.value
+        )['STX']
+        
+        dataframe['supertrend_2_buy'] = self.supertrend(
+            dataframe,
+            self.buy_m2.value,
+            self.buy_p2.value
+        )['STX']
+        
+        dataframe['supertrend_3_buy'] = self.supertrend(
+            dataframe,
+            self.buy_m3.value,
+            self.buy_p3.value
+        )['STX']
+        
+        # 卖出信号的三条线
+        dataframe['supertrend_1_sell'] = self.supertrend(
+            dataframe,
+            self.sell_m1.value,
+            self.sell_p1.value
+        )['STX']
+        
+        dataframe['supertrend_2_sell'] = self.supertrend(
+            dataframe,
+            self.sell_m2.value,
+            self.sell_p2.value
+        )['STX']
+        
+        dataframe['supertrend_3_sell'] = self.supertrend(
+            dataframe,
+            self.sell_m3.value,
+            self.sell_p3.value
+        )['STX']
 
-        for multiplier in self.buy_m2.range:
-            for period in self.buy_p2.range:
-                dataframe[f'supertrend_2_buy_{multiplier}_{period}'] = self.supertrend(dataframe, multiplier, period)['STX']
-
-        for multiplier in self.buy_m3.range:
-            for period in self.buy_p3.range:
-                dataframe[f'supertrend_3_buy_{multiplier}_{period}'] = self.supertrend(dataframe, multiplier, period)['STX']
-
-        for multiplier in self.sell_m1.range:
-            for period in self.sell_p1.range:
-                dataframe[f'supertrend_1_sell_{multiplier}_{period}'] = self.supertrend(dataframe, multiplier, period)['STX']
-
-        for multiplier in self.sell_m2.range:
-            for period in self.sell_p2.range:
-                dataframe[f'supertrend_2_sell_{multiplier}_{period}'] = self.supertrend(dataframe, multiplier, period)['STX']
-
-        for multiplier in self.sell_m3.range:
-            for period in self.sell_p3.range:
-                dataframe[f'supertrend_3_sell_{multiplier}_{period}'] = self.supertrend(dataframe, multiplier, period)['STX']
-
-        # 计算RSI变化并添加动态RSI阈值
+        # RSI相关计算
         dataframe['rsi_long_prev'] = dataframe['rsi_long'].shift(1)
         dataframe[['rsi_upper', 'rsi_lower']] = dataframe.apply(
             lambda x: self.get_rsi_thresholds(x['rsi_long'], x['rsi_long_prev']), 
@@ -161,23 +182,28 @@ class LeverageSupertrend(IStrategy):
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        volatility_condition = (
+            dataframe['ATR'] / dataframe['close'] * 100 < 3.0  # ATR不超过3%
+        )
         dataframe.loc[
             (
-               (dataframe[f'supertrend_1_buy_{self.buy_m1.value}_{self.buy_p1.value}'] == 'up') &
-               (dataframe[f'supertrend_2_buy_{self.buy_m2.value}_{self.buy_p2.value}'] == 'up') &
-               (dataframe[f'supertrend_3_buy_{self.buy_m3.value}_{self.buy_p3.value}'] == 'up') &
-               (dataframe['rsi'] < dataframe['rsi_upper']) &
-               (dataframe['volume'] > 0)
+            (dataframe['supertrend_1_buy'] == 'up') &
+            (dataframe['supertrend_2_buy'] == 'up') &
+            (dataframe['supertrend_3_buy'] == 'up') &
+            (dataframe['rsi'] < dataframe['rsi_upper']) &
+            (dataframe['volume'] > 0) &
+            (volatility_condition)  # 添加波动率过滤
             ),
             'enter_long'] = 1
 
         dataframe.loc[
             (
-               (dataframe[f'supertrend_1_sell_{self.sell_m1.value}_{self.sell_p1.value}'] == 'down') &
-               (dataframe[f'supertrend_2_sell_{self.sell_m2.value}_{self.sell_p2.value}'] == 'down') &
-               (dataframe[f'supertrend_3_sell_{self.sell_m3.value}_{self.sell_p3.value}'] == 'down') &
-               (dataframe['rsi'] > dataframe['rsi_lower']) &
-               (dataframe['volume'] > 0)
+            (dataframe['supertrend_1_sell'] == 'down') &
+            (dataframe['supertrend_2_sell'] == 'down') &
+            (dataframe['supertrend_3_sell'] == 'down') &
+            (dataframe['rsi'] > dataframe['rsi_lower']) &
+            (dataframe['volume'] > 0) &
+            (volatility_condition)  # 添加波动率过滤
             ),
             'enter_short'] = 1
 
@@ -186,15 +212,15 @@ class LeverageSupertrend(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe.loc[
             (
-                (dataframe[f'supertrend_2_sell_{self.sell_m2.value}_{self.sell_p2.value}'] == 'down') |
-                (dataframe['rsi'] >= dataframe['rsi_upper'])  # 使用动态RSI上限退出多头
+                (dataframe['supertrend_1_sell'] == 'down') |  # 使用第一条趋势线
+                (dataframe['rsi'] >= dataframe['rsi_upper'])
             ),
             'exit_long'] = 1
 
         dataframe.loc[
             (
-                (dataframe[f'supertrend_2_buy_{self.buy_m2.value}_{self.buy_p2.value}'] == 'up') |
-                (dataframe['rsi'] <= dataframe['rsi_lower'])  # 使用动态RSI下限退出空头
+                (dataframe['supertrend_1_buy'] == 'up') |
+                (dataframe['rsi'] <= dataframe['rsi_lower'])
             ),
             'exit_short'] = 1
 
@@ -235,3 +261,23 @@ class LeverageSupertrend(IStrategy):
             'ST' : df[st],
             'STX' : df[stx]
         })
+
+
+    def custom_exit(self, pair: str, trade: 'Trade', current_time: 'datetime', current_rate: float,
+                current_profit: float, **kwargs) -> str:
+        """
+        自定义退出逻辑:
+        1. 持仓时间超过8小时
+        2. 收益在-10%到10%之间
+        则强制止损
+        """
+        # 计算持仓时间（分钟）- 使用 total_seconds() 转换为分钟
+        hold_time_minutes = (current_time - trade.open_date).total_seconds() / 60
+        
+        # 如果持仓超过16小时(960分钟) 且 收益在-0.1到0.1之间
+        if (hold_time_minutes > 960 and 
+            current_profit < -0.15):
+            
+            return "force_exit_time_profit_range"
+            
+        return None  # 不满足条件则不退出
