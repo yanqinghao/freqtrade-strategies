@@ -323,7 +323,7 @@ class FreqtradeScheduler:
             final_results = self.run_backtesting()
             if final_results:
                 summary_stats = self.extract_summary_stats(final_results)
-                self.send_telegram_message(f"📊 每日回测汇总统计:\n\n{summary_stats}")
+                self.send_telegram_message(summary_stats)
             
             # 7. 更新配置文件
             self.update_config_pairs()
