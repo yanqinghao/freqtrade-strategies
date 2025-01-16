@@ -27,7 +27,7 @@ def main():
     CONFIG_PATH = 'user_data/config.json'
     CSV_PATH = 'user_data/backtest_results/group_3.csv'
     REMOVE_THRESHOLD = -10  # 仅删除表现特别差的交易对
-    MAX_PAIRS = 50  # 最多选择70个交易对
+    MAX_PAIRS = 40  # 最多选择70个交易对
     
     # 读取CSV文件
     print(f"读取交易对数据: {CSV_PATH}")

@@ -11,7 +11,6 @@ class LeverageSupertrend(IStrategy):
     INTERFACE_VERSION: int = 3
     
     can_short = True
-    position_adjustment_enable = True
 
     buy_params = {
         "buy_m1": 5,   # 长期趋势，低敏感度
@@ -35,7 +34,7 @@ class LeverageSupertrend(IStrategy):
         "sell_rsi_period_long": 100
     }
 
-    minimal_roi = {"0": 0.1, "30": 0.75, "60": 0.05, "120": 0.025}
+    minimal_roi = {"0": 0.08, "30": 0.06, "60": 0.04, "120": 0.02, "480": 0}
     
     stoploss = -0.24
 
@@ -99,26 +98,27 @@ class LeverageSupertrend(IStrategy):
         """
         根据趋势强度动态调整杠杆
         """
-        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-        last_candle = dataframe.iloc[-1].squeeze()
+        # dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        # last_candle = dataframe.iloc[-1].squeeze()
         
-        rsi_long = last_candle['rsi_long']
+        # rsi_long = last_candle['rsi_long']
         
-        # 根据趋势强度和方向调整杠杆
-        if side == "long":
-            if rsi_long > 70:  # 强势牛市
-                return min(3, max_leverage)
-            elif rsi_long > 50:  # 普通牛市
-                return min(2, max_leverage)
-            else:  # 熊市
-                return 2
-        else:  # short
-            if rsi_long < 30:  # 强势熊市
-                return min(3, max_leverage)
-            elif rsi_long < 50:  # 普通熊市
-                return min(2, max_leverage)
-            else:  # 牛市
-                return 2
+        # # 根据趋势强度和方向调整杠杆
+        # if side == "long":
+        #     if rsi_long > 70:  # 强势牛市
+        #         return min(3, max_leverage)
+        #     elif rsi_long > 50:  # 普通牛市
+        #         return min(2, max_leverage)
+        #     else:  # 熊市
+        #         return 2
+        # else:  # short
+        #     if rsi_long < 30:  # 强势熊市
+        #         return min(3, max_leverage)
+        #     elif rsi_long < 50:  # 普通熊市
+        #         return min(2, max_leverage)
+        #     else:  # 牛市
+        #         return 2
+        return 2
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
 
@@ -203,7 +203,10 @@ class LeverageSupertrend(IStrategy):
             (dataframe['supertrend_3_sell'] == 'down') &
             (dataframe['rsi'] > dataframe['rsi_lower']) &
             (dataframe['volume'] > 0) &
-            (volatility_condition)  # 添加波动率过滤
+            (dataframe['ATR'] / dataframe['close'] * 100 < 4.0) &  # 放宽波动率限制
+            # 添加额外的空头确认条件
+            (dataframe['close'] < dataframe['close'].shift(1)) &  # 价格在下跌
+            (dataframe['volume'] > dataframe['volume'].shift(1))  # 放量下跌
             ),
             'enter_short'] = 1
 
@@ -212,15 +215,20 @@ class LeverageSupertrend(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe.loc[
             (
-                (dataframe['supertrend_1_sell'] == 'down') |  # 使用第一条趋势线
+                (dataframe['supertrend_1_buy'] == 'down') |  # 使用第一条趋势线
                 (dataframe['rsi'] >= dataframe['rsi_upper'])
             ),
             'exit_long'] = 1
 
         dataframe.loc[
             (
-                (dataframe['supertrend_1_buy'] == 'up') |
-                (dataframe['rsi'] <= dataframe['rsi_lower'])
+                (dataframe['supertrend_1_sell'] == 'up') |
+                (dataframe['rsi'] <= dataframe['rsi_lower']) |
+                # 添加快速止盈条件
+                (
+                    (dataframe['close'] < dataframe['close'].shift(2)) &  # 连续上涨
+                    (dataframe['volume'] > dataframe['volume'].shift(1) * 1.5)  # 放量
+                )
             ),
             'exit_short'] = 1
 

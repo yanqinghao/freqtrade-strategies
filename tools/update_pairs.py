@@ -5,19 +5,22 @@ from typing import List, Dict
 import shutil
 import time
 
-# 黑名单交易对
-BLACKLIST_PAIRS = [
-    'AI16Z/USDT:USDT',
-    'SWARMS/USDT:USDT',
-    'SONIC/USDT:USDT',
-    'BIO/USDT:USDT',
-    'ZEREBRO/USDT:USDT',
-    'ALCH/USDT:USDT',
-    'GRIFFAIN/USDT:USDT',
-    'D/USDT:USDT',
-    'COOKIE/USDT:USDT',
-    'PHA/USDT:USDT',
-]
+with open("./tools/black_list.json", "r") as f:
+    BLACKLIST_PAIRS = json.load(f)
+# # 黑名单交易对
+# BLACKLIST_PAIRS = [
+#     'AI16Z/USDT:USDT',
+#     'SWARMS/USDT:USDT',
+#     'SONIC/USDT:USDT',
+#     'BIO/USDT:USDT',
+#     'ZEREBRO/USDT:USDT',
+#     'ALCH/USDT:USDT',
+#     'GRIFFAIN/USDT:USDT',
+#     'D/USDT:USDT',
+#     'COOKIE/USDT:USDT',
+#     'PHA/USDT:USDT',
+#     'PROM/USDT:USDT',
+# ]
 
 def get_futures_exchange_info() -> Dict:
     """获取合约市场所有交易对信息"""

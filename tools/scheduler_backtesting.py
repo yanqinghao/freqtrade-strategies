@@ -48,20 +48,77 @@ class FreqtradeScheduler:
         self.run_command(command)
 
     def run_backtesting(self, timerange=None):
-        """运行回测"""
+        """运行回测并处理无法回测的交易对"""
         if not timerange:
             end_date = datetime.datetime.now()
             start_date = end_date - datetime.timedelta(days=7)
             timerange = f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
 
         command = (f"../.venv/bin/python -m freqtrade backtesting --config {self.config_path} "
-                  f"--strategy-path {self.strategy_path} "
-                  f"--strategy {self.backtesting_strategy} "
-                  f"--timerange {timerange} --breakdown day --export signals")
-
-        # command = (f"../.venv/bin/python -m freqtrade backtesting-show --breakdown day")
+                f"--strategy-path {self.strategy_path} "
+                f"--strategy {self.backtesting_strategy} "
+                f"--timerange {timerange} --breakdown day --export signals")
+        
         print("正在运行回测...")
-        return self.run_command(command)
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        
+        # 检查输出中是否有无法回测的交易对
+        output = result.stdout + result.stderr
+        problematic_pairs = []
+        for line in output.split('\n'):
+            if 'got no leverage tiers available' in line:
+                # 提取交易对名称
+                pair = line.split('Pairs ')[1].split(' got no')[0].strip()
+                problematic_pairs.append(pair)
+        
+        if problematic_pairs:
+            print(f"发现无法回测的交易对: {problematic_pairs}")
+            # 从配置文件中移除这些交易对
+            self.remove_pairs_from_config(problematic_pairs)
+            # 更新黑名单
+            self.update_blacklist(problematic_pairs)
+            # 重新运行回测
+            print("重新运行回测...")
+            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            return result.stdout
+        
+        return result.stdout if result.returncode == 0 else None
+
+    def remove_pairs_from_config(self, pairs_to_remove):
+        """从配置文件中移除指定的交易对"""
+        try:
+            with open(self.config_path, 'r') as f:
+                config = json.load(f)
+            
+            # 移除交易对
+            current_pairs = config['exchange']['pair_whitelist']
+            new_pairs = [pair for pair in current_pairs if pair not in pairs_to_remove]
+            config['exchange']['pair_whitelist'] = new_pairs
+            
+            # 保存更新后的配置
+            with open(self.config_path, 'w') as f:
+                json.dump(config, f, indent=4)
+            
+            print(f"已从配置文件中移除交易对: {pairs_to_remove}")
+        except Exception as e:
+            print(f"更新配置文件失败: {e}")
+
+    def update_blacklist(self, new_pairs):
+        """更新黑名单文件"""
+        try:
+            blacklist_file = 'tools/black_list.json'
+            with open(blacklist_file, 'r') as f:
+                blacklist = json.load(f)
+            
+            blacklist = blacklist + new_pairs
+                
+            # 保存更新后的文件
+            with open(blacklist_file, 'w') as f:
+                json.dump(blacklist, f, indent=4)
+                
+            print(f"已更新黑名单: {new_pairs}")
+        except Exception as e:
+            print(f"更新黑名单失败: {e}")
 
     def analyze_backtesting(self):
         """分析回测结果"""
@@ -125,7 +182,7 @@ class FreqtradeScheduler:
         """从回测输出中提取关键统计信息并格式化"""
         try:
             lines = backtesting_output.split('\n')
-            message = "============== 📊 回测汇总统计 ==============\n\n"
+            message = "======= 📊 回测汇总统计 =======\n\n"
             
             # 主要统计信息
             found_summary = False
@@ -170,7 +227,7 @@ class FreqtradeScheduler:
                     
                     # 记录其他指标
                     for key in key_metrics.keys():
-                        if key in line and '│' in line:
+                        if key in line and '│' in line and not key_metrics[key]:
                             key_metrics[key] = line.split('│')[2].strip()
             
             # 格式化主要统计信息
@@ -236,7 +293,7 @@ class FreqtradeScheduler:
                 if found_daily and '──────' in line and found_daily:
                     break
             
-            message += "\n============== 🔚 报告结束 =============="
+            message += "\n======= 🔚 报告结束 ======="
             return message
                     
         except Exception as e:
@@ -272,7 +329,7 @@ class FreqtradeScheduler:
             self.update_config_pairs()
             
             # 8. 重启机器人
-            # self.restart_bot()
+            self.restart_bot()
             
             print("每日任务执行完成")
         except Exception as e:
