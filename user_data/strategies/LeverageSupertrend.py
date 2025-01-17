@@ -46,8 +46,8 @@ class LeverageSupertrend(IStrategy):
     stoploss = -0.24
 
     trailing_stop = True
-    trailing_stop_positive = 0.03
-    trailing_stop_positive_offset = 0.6
+    trailing_stop_positive = 0.02
+    trailing_stop_positive_offset = 0.4
     trailing_only_offset_is_reached = False
 
     timeframe = '1h'
