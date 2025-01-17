@@ -193,6 +193,8 @@ class LeverageSupertrend(IStrategy):
                 & (dataframe['rsi'] < dataframe['rsi_upper'])
                 & (dataframe['volume'] > 0)
                 & (volatility_condition)  # 添加波动率过滤
+                & (dataframe['close'] > dataframe['close'].shift(1))
+                & (dataframe['volume'] > dataframe['volume'].shift(1))  # 价格在下跌  # 放量下跌
             ),
             'enter_long',
         ] = 1
