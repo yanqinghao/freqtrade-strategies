@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # 设置工作目录
-SCRIPT_DIR="/home/yanqinghao/ft_userdata/freqtrade-strategies"
+SCRIPT_DIR="~/code/freqtrade-strategies"
 cd $SCRIPT_DIR
 
 # 激活虚拟环境
-source ../.venv/bin/activate
+source ./.venv/bin/activate
 
 # 设置日志目录
 LOG_DIR="$SCRIPT_DIR/logs"

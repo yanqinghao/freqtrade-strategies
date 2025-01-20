@@ -1,11 +1,15 @@
 {
-  "max_open_trades": -1,
+  "max_open_trades": 3,
   "stake_currency": "USDT",
-  "stake_amount": 100,
+  "stake_amount": "unlimited",
   "tradable_balance_ratio": 0.99,
   "fiat_display_currency": "USD",
   "dry_run": true,
+  "dry_run_wallet": 1000,
   "cancel_open_orders_on_exit": false,
+  "use_exit_signal": true,
+  "exit_profit_only": false,
+  "ignore_roi_if_entry_signal": false,
   "trading_mode": "futures",
   "margin_mode": "isolated",
   "unfilledtimeout": {
@@ -15,7 +19,7 @@
     "unit": "minutes"
   },
   "entry_pricing": {
-    "price_side": "same",
+    "price_side": "other",
     "use_order_book": true,
     "order_book_top": 1,
     "price_last_balance": 0.0,
@@ -25,7 +29,7 @@
     }
   },
   "exit_pricing": {
-    "price_side": "same",
+    "price_side": "other",
     "use_order_book": true,
     "order_book_top": 1
   },
@@ -33,43 +37,37 @@
     "name": "binance",
     "key": "",
     "secret": "",
-    "ccxt_config": {},
-    "ccxt_async_config": {},
+    "ccxt_config": {
+      "enableRateLimit": true
+    },
+    "ccxt_async_config": {
+      "enableRateLimit": true,
+      "rateLimit": 50
+    },
     "pair_whitelist": [
-      "ENA/USDT:USDT",
-      "DOGE/USDT:USDT",
-      "ALGO/USDT:USDT",
-      "VIRTUAL/USDT:USDT",
-      "HBAR/USDT:USDT",
-      "PENGU/USDT:USDT",
-      "MORPHO/USDT:USDT",
-      "EOS/USDT:USDT",
-      "SOL/USDT:USDT",
-      "IOTA/USDT:USDT",
-      "POPCAT/USDT:USDT",
-      "COW/USDT:USDT",
-      "LINK/USDT:USDT",
+      "FARTCOIN/USDT:USDT",
+      "CGPT/USDT:USDT",
       "AGLD/USDT:USDT",
-      "KAS/USDT:USDT",
-      "NEIRO/USDT:USDT",
+      "MOVE/USDT:USDT",
+      "JUP/USDT:USDT",
+      "FIDA/USDT:USDT",
+      "BAN/USDT:USDT",
+      "USUAL/USDT:USDT",
       "ZEN/USDT:USDT",
-      "ADA/USDT:USDT",
-      "SAND/USDT:USDT",
-      "GOAT/USDT:USDT",
-      "FIL/USDT:USDT",
-      "1000SHIB/USDT:USDT",
-      "BTC/USDT:USDT",
-      "AIXBT/USDT:USDT",
-      "NEAR/USDT:USDT",
-      "1000PEPE/USDT:USDT",
-      "MOODENG/USDT:USDT",
-      "WLD/USDT:USDT",
-      "SUI/USDT:USDT",
-      "EIGEN/USDT:USDT"
+      "GMT/USDT:USDT",
+      "SOL/USDT:USDT",
+      "XRP/USDT:USDT",
+      "PNUT/USDT:USDT",
+      "COW/USDT:USDT",
+      "PENGU/USDT:USDT",
+      "RAYSOL/USDT:USDT",
+      "NEIRO/USDT:USDT",
+      "VANA/USDT:USDT",
+      "ONDO/USDT:USDT",
+      "1MBABYDOGE/USDT:USDT",
+      "POPCAT/USDT:USDT"
     ],
-    "pair_blacklist": [
-      "BNB/.*"
-    ]
+    "pair_blacklist": []
   },
   "pairlists": [
     {
@@ -79,7 +77,7 @@
   "edge": {
     "enabled": false,
     "process_throttle_secs": 3600,
-    "calculate_since_number_of_days": 7,
+    "calculate_since_number_of_days": 14,
     "allowed_risk": 0.01,
     "stoploss_range_min": -0.01,
     "stoploss_range_max": -0.1,
@@ -93,20 +91,52 @@
   "telegram": {
     "enabled": true,
     "token": "",
-    "chat_id": ""
+    "chat_id": "",
+    "keyboard": [
+      [
+        "/daily",
+        "/stats",
+        "/balance",
+        "/profit"
+      ],
+      [
+        "/status table",
+        "/performance",
+        "/whitelist"
+      ],
+      [
+        "/reload_config",
+        "/count",
+        "/logs"
+      ]
+    ],
+    "notification_settings": {
+      "status": "silent",
+      "warning": "on",
+      "startup": "silent",
+      "entry": "silent",
+      "exit": "off",
+      "entry_cancel": "silent",
+      "exit_cancel": "silent",
+      "entry_fill": "silent",
+      "exit_fill": "silent",
+      "protection_trigger": "silent",
+      "protection_trigger_global": "silent"
+    },
+    "reload": true,
+    "balance_dust_level": 0.01
   },
   "api_server": {
-    "enabled": true,
+    "enabled": false,
     "listen_ip_address": "0.0.0.0",
     "listen_port": 8080,
-    "verbosity": "error",
-    "enable_openapi": false,
-    "jwt_secret_key": "556ebba5770ae3a07e80eda0f0f2b55df102896f8a5b86459c3433c1314345c4",
+    "verbosity": "info",
+    "jwt_secret_key": "somethingrandom",
     "CORS_origins": [],
     "username": "",
     "password": ""
   },
-  "bot_name": "",
+  "bot_name": "freqtrade",
   "initial_state": "running",
   "force_entry_enable": false,
   "internals": {

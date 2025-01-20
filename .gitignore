@@ -83,3 +83,6 @@ backtest-result-*
 **/backtest_results/*
 *.bak
 **/pairs_analysis.csv
+deploy/
+tradesv3*
+config_production.json

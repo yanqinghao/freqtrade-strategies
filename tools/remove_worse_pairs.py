@@ -34,6 +34,11 @@ def main():
     # 读取CSV文件
     print(f'读取交易对数据: {CSV_PATH}')
     df = pd.read_csv(CSV_PATH)
+    df = (
+        df.groupby('pair')
+        .agg({'profit_abs_sum': 'sum', 'num_buys': 'sum', 'mean_profit_pct': 'sum'})
+        .reset_index()
+    )
 
     # 记录原始交易对数量
     total_pairs = len(df)
