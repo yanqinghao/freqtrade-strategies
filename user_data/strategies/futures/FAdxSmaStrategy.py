@@ -25,10 +25,10 @@ import freqtrade.vendor.qtpylib.indicators as qtpylib
 class FAdxSmaStrategy(IStrategy):
 
     INTERFACE_VERSION = 3
-    timeframe = "1h"
+    timeframe = '1h'
     # Minimal ROI designed for the strategy.
     # This attribute will be overridden if the config file contains "minimal_roi".
-    minimal_roi = {"60": 0.075, "30": 0.1, "0": 0.05}
+    minimal_roi = {'60': 0.075, '30': 0.1, '0': 0.05}
     # minimal_roi = {"0": 1}
 
     stoploss = -0.05
@@ -49,8 +49,8 @@ class FAdxSmaStrategy(IStrategy):
     # Hyperoptable parameters
 
     # Define the guards spaces
-    pos_entry_adx = DecimalParameter(15, 40, decimals=1, default=30.0, space="buy")
-    pos_exit_adx = DecimalParameter(15, 40, decimals=1, default=30.0, space="sell")
+    pos_entry_adx = DecimalParameter(15, 40, decimals=1, default=30.0, space='buy')
+    pos_exit_adx = DecimalParameter(15, 40, decimals=1, default=30.0, space='sell')
 
     # Define the parameter spaces
     adx_period = IntParameter(4, 24, default=14)
@@ -78,9 +78,7 @@ class FAdxSmaStrategy(IStrategy):
         conditions_short = []
 
         # GUARDS AND TRIGGERS
-        conditions_long.append(
-            dataframe[f"adx_{self.adx_period.value}"] > self.pos_entry_adx.value
-        )
+        conditions_long.append(dataframe[f"adx_{self.adx_period.value}"] > self.pos_entry_adx.value)
         conditions_short.append(
             dataframe[f"adx_{self.adx_period.value}"] > self.pos_entry_adx.value
         )
@@ -100,12 +98,12 @@ class FAdxSmaStrategy(IStrategy):
 
         dataframe.loc[
             reduce(lambda x, y: x & y, conditions_long),
-            "enter_long",
+            'enter_long',
         ] = 1
 
         dataframe.loc[
             reduce(lambda x, y: x & y, conditions_short),
-            "enter_short",
+            'enter_short',
         ] = 1
 
         return dataframe
@@ -119,12 +117,12 @@ class FAdxSmaStrategy(IStrategy):
 
         dataframe.loc[
             reduce(lambda x, y: x & y, conditions_close),
-            "exit_long",
+            'exit_long',
         ] = 1
 
         dataframe.loc[
             reduce(lambda x, y: x & y, conditions_close),
-            "exit_short",
+            'exit_short',
         ] = 1
 
         return dataframe
