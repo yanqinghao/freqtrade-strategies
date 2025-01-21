@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # 设置工作目录
-SCRIPT_DIR="~/code/freqtrade-strategies"
-cd $SCRIPT_DIR
+SCRIPT_DIR="$HOME/code/freqtrade-strategies"
+cd "$SCRIPT_DIR"
 
 # 激活虚拟环境
 source ./.venv/bin/activate
