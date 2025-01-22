@@ -8,7 +8,7 @@ from update_pairs import main as update_pairs_main
 from remove_worse_pairs import main as remove_worse_pairs_main
 
 # 加载.env文件
-load_dotenv('./tools/.env')
+load_dotenv()
 
 
 class FreqtradeScheduler:
