@@ -86,3 +86,4 @@ backtest-result-*
 deploy/
 tradesv3*
 config_production.json
+logs
