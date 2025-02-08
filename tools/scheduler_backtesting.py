@@ -41,7 +41,7 @@ class FreqtradeScheduler:
         start_date = os.getenv('START_DATE', '20240101')
         command = (
             f".venv/bin/python -m freqtrade download-data --config {self.config_path} "
-            f"--timerange {start_date}-{today} --timeframe 5m 15m 4h 1h"
+            f"--timerange {start_date}-{today} --timeframe 5m 15m 4h 1h 1d"
         )
         print('正在下载数据...')
         self.run_command(command)
