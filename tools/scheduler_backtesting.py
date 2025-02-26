@@ -5,7 +5,10 @@ import os
 import requests
 from dotenv import load_dotenv
 from update_pairs import main as update_pairs_main
+from strategy_selector import main as strategy_selector_main
+from update_strategy_state import main as update_strategy_state_main
 from remove_worse_pairs import main as remove_worse_pairs_main
+from remove_worse_pairs import data as good_pairs_data
 
 # 加载.env文件
 load_dotenv()
@@ -35,6 +38,11 @@ class FreqtradeScheduler:
         print('正在更新交易对...')
         update_pairs_main()
 
+    def update_strategy_mode(self, strategy_mode):
+        """更新交易对"""
+        print(f'正在更新交易对策略为{strategy_mode}...')
+        update_strategy_state_main(strategy_mode)
+
     def download_data(self):
         """下载最新数据"""
         today = datetime.datetime.now().strftime('%Y%m%d')
@@ -54,7 +62,7 @@ class FreqtradeScheduler:
             timerange = f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
 
         command = (
-            f".venv/bin/python -m freqtrade backtesting --config {self.config_path} "
+            f".venv/bin/python -m freqtrade backtesting --config {self.config_path} --cache none "
             f"--strategy-path {self.strategy_path} "
             f"--strategy {self.backtesting_strategy} "
             f"--timerange {timerange} --breakdown day --export signals"
@@ -137,6 +145,16 @@ class FreqtradeScheduler:
         """移除表现差的交易对"""
         print('正在移除表现差的交易对...')
         remove_worse_pairs_main()
+
+    def select_strategies(self):
+        """更新交易对策略"""
+        print('更新交易对策略...')
+        strategy_selector_main()
+
+    def get_good_pairs(self, strategy_mode):
+        """获取表现好的交易对"""
+        print('正在获取表现好的交易对...')
+        good_pairs_data(strategy_mode)
 
     def send_telegram_message(self, message):
         """发送Telegram消息"""
@@ -330,14 +348,22 @@ class FreqtradeScheduler:
             # 2. 下载最新数据
             self.download_data()
 
-            # 3. 运行初始回测
+            # 3. 运行long回测
+            self.update_strategy_mode('long')
             self.run_backtesting()
 
             # 4. 分析回测结果
             self.analyze_backtesting()
+            self.get_good_pairs('long')
+
+            # 5. 运行short回测
+            self.update_strategy_mode('short')
+            self.run_backtesting()
+            self.analyze_backtesting()
+            self.get_good_pairs('short')
 
             # 5. 移除表现差的交易对
-            self.remove_worse_pairs()
+            self.select_strategies()
 
             # 6. 运行最终回测并发送结果
             final_results = self.run_backtesting()
@@ -362,7 +388,7 @@ def main():
     # 从环境变量获取配置
     config_path = os.getenv('CONFIG_PATH', 'user_data/config.json')
     strategy_path = os.getenv('STRATEGY_PATH', 'user_data/strategies')
-    backtesting_strategy = os.getenv('BACKTESTING_STRATEGY', 'E0V1E')
+    backtesting_strategy = 'KamaFama_Dynamic'
     docker_compose_path = os.getenv('DOCKER_COMPOSE_PATH', './')
 
     # 检查必要的环境变量是否存在

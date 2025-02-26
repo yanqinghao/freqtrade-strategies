@@ -87,3 +87,4 @@ deploy/
 tradesv3*
 config_production.json
 logs
+*.csv

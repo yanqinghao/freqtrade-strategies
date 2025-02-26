@@ -1,0 +1,31 @@
+{
+  "pair_strategy_mode": {
+    "ACH/USDT:USDT": "short",
+    "VIRTUAL/USDT:USDT": "short",
+    "GLM/USDT:USDT": "short",
+    "1000RATS/USDT:USDT": "short",
+    "AIXBT/USDT:USDT": "short",
+    "POPCAT/USDT:USDT": "short",
+    "RUNE/USDT:USDT": "short",
+    "FARTCOIN/USDT:USDT": "long",
+    "MASK/USDT:USDT": "short",
+    "RAYSOL/USDT:USDT": "short",
+    "AUCTION/USDT:USDT": "short",
+    "USUAL/USDT:USDT": "short",
+    "WIF/USDT:USDT": "long",
+    "PENGU/USDT:USDT": "short",
+    "TURBO/USDT:USDT": "short",
+    "BAN/USDT:USDT": "long",
+    "XLM/USDT:USDT": "short",
+    "APT/USDT:USDT": "short",
+    "BNX/USDT:USDT": "long",
+    "CAKE/USDT:USDT": "short",
+    "NEIRO/USDT:USDT": "short",
+    "LTC/USDT:USDT": "short",
+    "ACT/USDT:USDT": "short",
+    "SPX/USDT:USDT": "short",
+    "SUI/USDT:USDT": "short",
+    "ME/USDT:USDT": "short",
+    "ZEN/USDT:USDT": "short"
+  }
+}

@@ -23,6 +23,7 @@ services:
     volumes:
       - "./user_data:/freqtrade/user_data"
       - "./deploy/config.json:/freqtrade/config_production.json"
+      - "./deploy/strategy_state.json:/freqtrade/user_data/strategy_state.json"
     # Expose api on port 8080 (localhost only)
     # Please read the https://www.freqtrade.io/en/stable/rest-api/ documentation
     # for more information.
@@ -34,4 +35,4 @@ services:
       --logfile /freqtrade/user_data/logs/freqtrade.log
       --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
       --config /freqtrade/config_production.json
-      --strategy KamaFama_2
+      --strategy KamaFama_Dynamic
