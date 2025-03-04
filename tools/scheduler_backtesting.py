@@ -146,10 +146,10 @@ class FreqtradeScheduler:
         print('正在移除表现差的交易对...')
         remove_worse_pairs_main()
 
-    def select_strategies(self):
+    def select_strategies(self, threshold=-50):
         """更新交易对策略"""
         print('更新交易对策略...')
-        strategy_selector_main()
+        strategy_selector_main(threshold)
 
     def get_good_pairs(self, strategy_mode):
         """获取表现好的交易对"""
@@ -197,6 +197,61 @@ class FreqtradeScheduler:
         print('正在重启机器人...')
         self.run_command(f"cd {self.docker_compose_path} && docker compose down")
         self.run_command(f"cd {self.docker_compose_path} && docker compose up -d")
+
+    def extract_key_metrics(self, backtesting_output):
+        """从回测输出中提取关键统计信息并格式化"""
+        try:
+            lines = backtesting_output.split('\n')
+
+            # 主要统计信息
+            found_summary = False
+            key_metrics = {
+                'Total/Daily Avg Trades': None,
+                'Starting balance': None,
+                'Final balance': None,
+                'Absolute profit': None,
+                'Total profit %': None,
+                'Avg. daily profit %': None,
+                'Best Pair': None,
+                'Worst Pair': None,
+                'Best trade': None,
+                'Worst trade': None,
+                # 'Long / Short': None,
+                # 'Total profit Long %': None,
+                # 'Total profit Short %': None,
+                'Market change': None,
+                'Max % of account underwater': None,
+                'Absolute Drawdown': None,
+            }
+
+            # 回撤信息
+            drawdown_info = {
+                'Drawdown Start': None,
+                'Drawdown End': None,
+                'Drawdown high': None,
+                'Drawdown low': None,
+            }
+
+            # 解析主要统计信息
+            for line in lines:
+                if 'SUMMARY METRICS' in line:
+                    found_summary = True
+                    continue
+
+                if found_summary:
+                    # 记录回撤信息
+                    if any(key in line for key in drawdown_info.keys()) and '│' in line:
+                        key = next(k for k in drawdown_info.keys() if k in line)
+                        drawdown_info[key] = line.split('│')[2].strip()
+
+                    # 记录其他指标
+                    for key in key_metrics.keys():
+                        if key in line and '│' in line and not key_metrics[key]:
+                            key_metrics[key] = line.split('│')[2].strip()
+
+            return key_metrics, drawdown_info
+        except Exception:
+            return None, None
 
     def extract_summary_stats(self, backtesting_output):
         """从回测输出中提取关键统计信息并格式化"""
@@ -362,15 +417,35 @@ class FreqtradeScheduler:
             self.analyze_backtesting()
             self.get_good_pairs('short')
 
-            # 5. 移除表现差的交易对
-            self.select_strategies()
+            summaries = []
+            results = []
+            reports = []
+            threshholds = []
+            for threshhold in range(-50, 50, 10):
+                # 5. 移除表现差的交易对
+                self.select_strategies(threshhold)
 
-            # 6. 运行最终回测并发送结果
-            final_results = self.run_backtesting()
-            if final_results:
-                summary_stats = self.extract_summary_stats(final_results)
-                self.send_telegram_message(summary_stats)
+                # 6. 运行最终回测并发送结果
+                final_results = self.run_backtesting()
+                if final_results:
+                    key_metrics, _ = self.extract_key_metrics(final_results)
+                    report = self.extract_summary_stats(final_results)
+                    summaries.append(key_metrics)
+                    results.append(final_results)
+                    reports.append(report)
+                    threshholds.append(threshhold)
 
+            max_profit_pos = max(enumerate(summaries), key=lambda x: x[1]['Absolute profit'])[0]
+            self.select_strategies(threshholds[max_profit_pos])
+
+            self.send_telegram_message(reports[max_profit_pos])
+
+            import json
+
+            with open('user_data/strategy_state.json', 'r') as f:
+                strategy_state = json.load(f)
+
+            self.send_telegram_message(f"交易对多空设置为：{strategy_state}")
             # 7. 更新配置文件
             self.update_config_pairs()
 

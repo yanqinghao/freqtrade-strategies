@@ -24,6 +24,7 @@ services:
       - "./user_data:/freqtrade/user_data"
       - "./deploy/config.json:/freqtrade/config_production.json"
       - "./deploy/strategy_state.json:/freqtrade/user_data/strategy_state.json"
+      - "./deploy/stop_entry_records.json:/freqtrade/user_data/stop_entry_records.json"
     # Expose api on port 8080 (localhost only)
     # Please read the https://www.freqtrade.io/en/stable/rest-api/ documentation
     # for more information.

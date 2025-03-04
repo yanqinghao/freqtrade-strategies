@@ -60,7 +60,7 @@ def select_strategies(long_data, short_data, threshold=10):
     return strategies
 
 
-def main():
+def main(threshold=-50):
     # For command-line usage, you can read from files
     with open('long.csv', 'r') as f:
         # For demonstration, paste your data directly here
@@ -74,7 +74,7 @@ def main():
     short_data = parse_data(short_data_str, 'short')
 
     # Select the strategies
-    strategies = select_strategies(long_data, short_data, threshold=-50)
+    strategies = select_strategies(long_data, short_data, threshold=threshold)
 
     pairs = list(strategies.keys())
 
