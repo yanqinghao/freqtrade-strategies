@@ -434,7 +434,6 @@ class FreqtradeScheduler:
                     results.append(final_results)
                     reports.append(report)
                     threshholds.append(threshhold)
-
             max_profit_pos = max(enumerate(summaries), key=lambda x: x[1]['Absolute profit'])[0]
             self.select_strategies(threshholds[max_profit_pos])
 
@@ -445,7 +444,10 @@ class FreqtradeScheduler:
             with open('user_data/strategy_state.json', 'r') as f:
                 strategy_state = json.load(f)
 
-            self.send_telegram_message(f"交易对多空设置为：{strategy_state}")
+            self.send_telegram_message(f"交易对多空设置为：{strategy_state['pair_strategy_mode']}")
+            self.send_telegram_message(
+                f"交易对多空比为：{sum([v == 'long' for v in strategy_state['pair_strategy_mode'].values()])} : {sum([v == 'short' for v in strategy_state['pair_strategy_mode'].values()])}"
+            )
             # 7. 更新配置文件
             self.update_config_pairs()
 

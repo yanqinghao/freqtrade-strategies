@@ -583,7 +583,7 @@ class KamaFama_Dynamic(IStrategy):
                     cc = df.iloc[-1].squeeze()
                     # 对于做空，在fastk值较低时平仓
                     if cc['fastk'] < self.buy_fastx_short.value:
-                        return 'fastk_profit_buy_to_cover'
+                        return 'fastk_profit_buy_to_cover_2'
             else:
                 if current_candle['fastk'] < self.buy_fastx_short.value:
                     return 'fastk_profit_buy_to_cover'
