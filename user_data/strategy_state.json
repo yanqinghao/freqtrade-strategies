@@ -1,19 +1,23 @@
 {
   "pair_strategy_mode": {
-    "MKR/USDT:USDT": "short",
-    "ENA/USDT:USDT": "short",
-    "RUNE/USDT:USDT": "long",
-    "HBAR/USDT:USDT": "short",
-    "WIF/USDT:USDT": "short",
-    "ORDI/USDT:USDT": "short",
-    "NOT/USDT:USDT": "short",
-    "AUCTION/USDT:USDT": "short",
-    "APT/USDT:USDT": "short",
-    "SEI/USDT:USDT": "short",
-    "LTC/USDT:USDT": "short",
-    "REZ/USDT:USDT": "short",
+    "ARKM/USDT:USDT": "short",
     "CRV/USDT:USDT": "short",
+    "RUNE/USDT:USDT": "short",
+    "HBAR/USDT:USDT": "short",
+    "RARE/USDT:USDT": "short",
+    "BANANA/USDT:USDT": "short",
+    "APT/USDT:USDT": "short",
+    "1000PEPE/USDT:USDT": "short",
+    "LTC/USDT:USDT": "short",
     "ADA/USDT:USDT": "short",
-    "BNX/USDT:USDT": "long"
+    "IOST/USDT:USDT": "short",
+    "WIF/USDT:USDT": "short",
+    "ENA/USDT:USDT": "short",
+    "SEI/USDT:USDT": "short",
+    "BNX/USDT:USDT": "long",
+    "AAVE/USDT:USDT": "short",
+    "ORDI/USDT:USDT": "short",
+    "AUCTION/USDT:USDT": "short",
+    "REZ/USDT:USDT": "short"
   }
 }
