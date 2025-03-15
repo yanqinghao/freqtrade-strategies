@@ -61,6 +61,8 @@ from freqtrade.util import (
     round_value,
 )
 from freqtrade.freqllm.analysis_agent import CryptoTechnicalAnalyst
+from freqtrade.freqllm.key_level_agent import TradingSignalExtractor
+from freqtrade.freqllm.db_manager import connect_to_db, get_todays_analysis, insert_analysis_result
 
 
 MAX_MESSAGE_LENGTH = MessageLimit.MAX_TEXT_LENGTH
@@ -179,6 +181,8 @@ class Telegram(RPCHandler):
             ['/status', '/status table', '/performance'],
             ['/count', '/start', '/stop', '/help'],
             ['/chart', '/analysis'],
+            ['/addpair', '/delpair'],
+            ['/setpairstrategy', '/delpairstrategy', '/showpairstrategy'],
         ]
         # do not allow commands with mandatory arguments and critical cmds
         # TODO: DRY! - its not good to list all valid cmds here. But otherwise
@@ -228,8 +232,13 @@ class Telegram(RPCHandler):
             r'/version$',
             r'/marketdir (long|short|even|none)$',
             r'/marketdir$',
-            r'/chart \S+( \S+)?$',  # chart命令格式
-            r'/analysis \S+( \S+)?$',  # analysis命令格式
+            r'/chart$',  # chart命令格式
+            r'/analysis$',  # analysis命令格式
+            r'/addpair$',
+            r'/delpair$',
+            r'/setpairstrategy$',
+            r'/delpairstrategy$',
+            r'/showpairstrategy$',
         ]
         # Create keys for generation
         valid_keys_print = [k.replace('$', '') for k in valid_keys]
@@ -318,6 +327,11 @@ class Telegram(RPCHandler):
             CommandHandler('tg_info', self._tg_info),
             CommandHandler('chart', self._chart),
             CommandHandler('analysis', self._analysis),
+            CommandHandler('addpair', self._add_pair),
+            CommandHandler('delpair', self._del_pair),
+            CommandHandler('setpairstrategy', self._set_pair_strategy),
+            CommandHandler('delpairstrategy', self._del_pair_strategy),
+            CommandHandler('showpairstrategy', self._show_pair_strategy),
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern='update_status_table'),
@@ -2345,6 +2359,119 @@ class Telegram(RPCHandler):
             # 确保索引是日期时间类型
             candles = candles.set_index(pd.DatetimeIndex(candles['date']))
 
+            # 计算技术指标和市场统计
+            # 1. 计算波动率 (ATR - 平均真实范围)
+            candles['tr1'] = abs(candles['high'] - candles['low'])
+            candles['tr2'] = abs(candles['high'] - candles['close'].shift())
+            candles['tr3'] = abs(candles['low'] - candles['close'].shift())
+            candles['tr'] = candles[['tr1', 'tr2', 'tr3']].max(axis=1)
+            candles['atr'] = candles['tr'].rolling(14).mean()
+
+            # 2. 计算RSI
+            delta = candles['close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+            loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+            rs = gain / loss
+            candles['rsi'] = 100 - (100 / (1 + rs))
+
+            # 3. 计算移动平均线
+            candles['sma20'] = candles['close'].rolling(window=20).mean()
+            candles['sma50'] = candles['close'].rolling(window=50).mean()
+            candles['sma200'] = candles['close'].rolling(window=200).mean()
+
+            # 4. 计算MACD
+            candles['ema12'] = candles['close'].ewm(span=12, adjust=False).mean()
+            candles['ema26'] = candles['close'].ewm(span=26, adjust=False).mean()
+            candles['macd'] = candles['ema12'] - candles['ema26']
+            candles['signal'] = candles['macd'].ewm(span=9, adjust=False).mean()
+            candles['histogram'] = candles['macd'] - candles['signal']
+
+            # 5. 计算布林带
+            candles['bb_middle'] = candles['close'].rolling(window=20).mean()
+            candles['bb_std'] = candles['close'].rolling(window=20).std()
+            candles['bb_upper'] = candles['bb_middle'] + (candles['bb_std'] * 2)
+            candles['bb_lower'] = candles['bb_middle'] - (candles['bb_std'] * 2)
+
+            # 获取基本市场统计数据
+            latest_candle = candles.iloc[-1]
+            prev_candle = candles.iloc[-2]
+
+            # 计算重要价格水平
+            last_close = latest_candle['close']
+            last_open = latest_candle['open']
+            day_high = latest_candle['high']
+            day_low = latest_candle['low']
+            sma20 = latest_candle['sma20']
+            sma50 = latest_candle['sma50']
+
+            # 计算24小时价格变化
+            price_change_24h = last_close - candles['close'].iloc[-24 if timeframe == '1h' else -1]
+            price_change_percent_24h = (
+                price_change_24h / candles['close'].iloc[-24 if timeframe == '1h' else -1]
+            ) * 100
+
+            # 计算波动性指标
+            atr = latest_candle['atr']
+            atr_percent = (atr / last_close) * 100
+
+            # 计算交易量变化
+            volume = latest_candle['volume']
+            avg_volume = candles['volume'].rolling(20).mean().iloc[-1]
+            volume_change = ((volume / avg_volume) - 1) * 100
+
+            # 计算关键技术指标
+            rsi = latest_candle['rsi']
+            # macd = latest_candle['macd']
+            # signal = latest_candle['signal']
+            histogram = latest_candle['histogram']
+
+            # 准备市场状态描述
+            market_status = '看涨' if last_close > last_open else '看跌'
+            price_position = ''
+            if last_close > sma20 and last_close > sma50:
+                price_position = '多头趋势'
+            elif last_close < sma20 and last_close < sma50:
+                price_position = '空头趋势'
+            else:
+                price_position = '震荡区间'
+
+            # RSI状态
+            rsi_status = ''
+            if rsi > 70:
+                rsi_status = '超买'
+            elif rsi < 30:
+                rsi_status = '超卖'
+            else:
+                rsi_status = '中性'
+
+            # 布林带位置
+            bb_upper = latest_candle['bb_upper']
+            bb_lower = latest_candle['bb_lower']
+            bb_position = ''
+            if last_close > bb_upper:
+                bb_position = '突破上轨(可能超买)'
+            elif last_close < bb_lower:
+                bb_position = '突破下轨(可能超卖)'
+            else:
+                width = (bb_upper - bb_lower) / latest_candle['bb_middle'] * 100
+                if width < 10:
+                    bb_position = '带宽收窄(可能突破)'
+                else:
+                    bb_position = '正常波动区间'
+
+            # MACD信号
+            macd_signal = ''
+            if histogram > 0 and histogram > prev_candle['histogram']:
+                macd_signal = '看涨(加速)'
+            elif histogram > 0 and histogram < prev_candle['histogram']:
+                macd_signal = '看涨(减速)'
+            elif histogram < 0 and histogram < prev_candle['histogram']:
+                macd_signal = '看跌(加速)'
+            elif histogram < 0 and histogram > prev_candle['histogram']:
+                macd_signal = '看跌(减速)'
+            else:
+                macd_signal = '横盘整理'
+
             # 根据时间框架设置显示的蜡烛数量
             try:
                 if timeframe.endswith('m'):
@@ -2404,6 +2531,18 @@ class Telegram(RPCHandler):
             else:
                 date_format = '%Y-%m-%d'
 
+            # 添加指标到图表上
+            apds = [
+                mpf.make_addplot(candles['sma20'].tail(max_candles), color='blue', width=0.7),
+                mpf.make_addplot(candles['sma50'].tail(max_candles), color='orange', width=0.7),
+                mpf.make_addplot(
+                    candles['bb_upper'].tail(max_candles), color='gray', width=0.5, linestyle='--'
+                ),
+                mpf.make_addplot(
+                    candles['bb_lower'].tail(max_candles), color='gray', width=0.5, linestyle='--'
+                ),
+            ]
+
             # 绘制K线图
             fig, axes = mpf.plot(
                 candles.tail(max_candles),
@@ -2414,17 +2553,48 @@ class Telegram(RPCHandler):
                 returnfig=True,
                 datetime_format=date_format,
                 figsize=(12, 8),
+                addplot=apds,
             )
 
             # 保存图表到BytesIO对象
             fig.savefig(buf, format='png', dpi=150)
             buf.seek(0)
 
+            # 生成市场分析文本
+            # 处理浮点数显示
+            def fmt_num(num):
+                if abs(num) < 0.001:
+                    return f"{num:.8f}"
+                elif abs(num) < 1:
+                    return f"{num:.4f}"
+                elif abs(num) < 10:
+                    return f"{num:.2f}"
+                else:
+                    return f"{num:.1f}"
+
+            # 生成市场分析文本
+            currency = used_pair.split('/')[1] if '/' in used_pair else 'USD'
+            analysis_text = (
+                f"{used_pair} ({timeframe}) - 最近 {max_candles} 根K线\n"
+                f"——————市场概况——————\n"
+                f"价格: {fmt_num(last_close)} {currency} ({'+' if price_change_percent_24h > 0 else ''}{price_change_percent_24h:.2f}%)\n"
+                f"成交量: {fmt_num(volume)} ({'+' if volume_change > 0 else ''}{volume_change:.1f}%)\n"
+                f"日内: 高 {fmt_num(day_high)} / 低 {fmt_num(day_low)}\n"
+                f"波动性: ATR {fmt_num(atr)} ({atr_percent:.2f}%)\n"
+                f"——————技术指标——————\n"
+                f"RSI(14): {rsi:.1f} ({rsi_status})\n"
+                f"MACD: {macd_signal}\n"
+                f"趋势: {price_position}\n"
+                f"布林带: {bb_position}\n"
+                f"当前状态: {market_status}\n"
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
             # 发送图表图像
             await self._app.bot.send_photo(
                 chat_id=update.effective_chat.id,
                 photo=buf,
-                caption=f"{used_pair} ({timeframe}) - 最近 {max_candles} 根K线",
+                caption=analysis_text,
                 message_thread_id=self._config['telegram'].get('topic_id'),
             )
 
@@ -2443,30 +2613,414 @@ class Telegram(RPCHandler):
         if not context.args or len(context.args) == 0:
             raise RPCException('Usage: /analysis <pair> [timeframe]')
 
-        pair = context.args[0]
-        timeframe = context.args[1] if len(context.args) > 1 else self._config['timeframe']
+        pair = context.args[0].upper()
 
         try:
+            # Show analysis in progress message
+            await self._send_msg(f"📊 Analyzing {pair}... Please wait.")
+
+            # Connect to database
+            conn = connect_to_db()
+            if not conn:
+                logger.error('Failed to connect to database.')
+                await self._send_msg(
+                    '❌ Database connection failed. Proceeding with direct analysis.'
+                )
+                conn = None
+
+            # Check if we already have today's analysis
+            existing_analysis = None
+            if conn:
+                existing_analysis = get_todays_analysis(conn, pair)
+            # Perform new analysis
             exchange_config = self._rpc._freqtrade.config.get('exchange', {})
-            # 初始化分析器
+
+            # Initialize analyzer
             analyst = CryptoTechnicalAnalyst(
                 api_key=exchange_config.get('key', ''),
                 api_secret=exchange_config.get('secret', ''),
             )
+            if existing_analysis:
+                # Use existing analysis from today
+                logger.info(f"Using existing analysis from today for {pair}")
+                table_output, analysis_text, raw_json_db, processed_json_db = existing_analysis
 
-            analyst.analyze_crypto(pair)
+                # Convert from database JSONB to Python objects if needed
+                if isinstance(raw_json_db, str):
+                    raw_json = json.loads(raw_json_db)
+                else:
+                    raw_json = raw_json_db
 
-            # 获取技术指标表格
-            table = analyst.generate_multi_timeframe_table(pair)
+                if isinstance(processed_json_db, str):
+                    processed_json = json.loads(processed_json_db)
+                else:
+                    processed_json = processed_json_db
 
-            await self._send_msg(table, parse_mode=ParseMode.MARKDOWN)
+                # Send the cached results
+                await self._send_msg(table_output, parse_mode=ParseMode.HTML)
 
-            # 获取LLM分析
-            analysis = analyst.get_llm_analysis(pair)
+                # 检查分析结果是否符合特定格式（包含 ##1. 和 --- 标记）
+                if '##1.' in analysis_text and '---' in analysis_text:
+                    # 使用特定格式化方法
+                    formatted_analysis = analyst.format_specific_analysis(analysis_text)
+                else:
+                    # 使用通用格式化方法
+                    formatted_analysis = analyst.format_llm_analysis(analysis_text)
 
-            # 发送分析结果
-            await self._send_msg(analysis, parse_mode=ParseMode.MARKDOWN)
+                # Split and send the analysis text
+                analysis_chunks = analyst.split_text(formatted_analysis)
+
+                await self._send_msg(f"🤖 Cached in-depth analysis for {pair}:")
+                for i, chunk in enumerate(analysis_chunks):
+                    if i == 0:
+                        await self._send_msg(chunk, parse_mode=ParseMode.HTML)
+                    else:
+                        await self._send_msg(
+                            f"(continued {i + 1}/{len(analysis_chunks)})\n\n{chunk}",
+                            parse_mode=ParseMode.HTML,
+                        )
+                # Send the processed JSON data
+                await self._send_msg(f"📋 Processed JSON data for {pair}:")
+                await self._send_msg(f"```json\n{json.dumps(processed_json, indent=2)}\n```")
+            else:
+                # Analyze trading pair
+                analyst.analyze_crypto(pair)
+
+                # Generate formatted table
+                table_output = analyst.generate_formatted_table(pair)
+                await self._send_msg(table_output, parse_mode=ParseMode.HTML)
+
+                # Get deep analysis
+                await self._send_msg(f"🤖 Generating in-depth analysis for {pair}...")
+                analysis_chunks, analysis_text = analyst.get_formatted_llm_analysis(pair)
+
+                # Extract trading signals if needed
+                extractor = TradingSignalExtractor()
+                raw_json, processed_json = extractor.extract_to_json_string(
+                    analysis_text, consolidate=True
+                )
+
+                # Store results in database if connection exists
+                if conn:
+                    insert_analysis_result(
+                        conn, pair, table_output, analysis_text, raw_json, processed_json
+                    )
+                    logger.info(f"Analysis results stored in database for {pair}")
+
+                # Send the analysis results
+                for i, chunk in enumerate(analysis_chunks):
+                    if i == 0:
+                        await self._send_msg(chunk, parse_mode=ParseMode.HTML)
+                    else:
+                        await self._send_msg(
+                            f"(continued {i + 1}/{len(analysis_chunks)})\n\n{chunk}",
+                            parse_mode=ParseMode.HTML,
+                        )
+                # Send the processed JSON data
+                await self._send_msg(f"📋 Processed JSON data for {pair}:")
+                await self._send_msg(f"```json\n{json.dumps(processed_json, indent=2)}\n```")
+
+            # Close database connection if it exists
+            if conn:
+                conn.close()
 
         except Exception as e:
             logger.exception('Error during analysis: %s', str(e))
-            await self._send_msg(f"Error during analysis: {str(e)}")
+            await self._send_msg(f"❌ Error during analysis: {str(e)}")
+
+    @authorized_only
+    async def _add_pair(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /addpair <pair>.
+        添加交易对到白名单
+        """
+        if not context.args or len(context.args) == 0:
+            raise RPCException('使用方法: /addpair <币种/USDT>')
+
+        pair = context.args[0].upper()
+
+        # 获取当前白名单
+        current_whitelist = self._rpc._rpc_whitelist()['whitelist']
+
+        if pair in current_whitelist:
+            await self._send_msg(f'交易对 {pair} 已在当前白名单中')
+            return
+
+        import json
+
+        with open('/freqtrade/config_production.json', 'r') as f:
+            config = f.read()
+
+        config['exchange']['pair_whitelist'].append(pair)
+
+        with open('/freqtrade/config_production.json', 'w') as f:
+            json.dump(config, f, indent=4)
+
+        self._rpc._rpc_reload_config()
+        await self._send_msg(f'交易对 {pair} 已加入白名单')
+
+        # 获取最新分析作为参考
+        try:
+            conn = connect_to_db()
+            if conn:
+                analysis_result = get_todays_analysis(conn, pair)
+                conn.close()
+
+                if analysis_result:
+                    _, _, _, processed_json = analysis_result
+
+                    if isinstance(processed_json, str):
+                        processed_json = json.loads(processed_json)
+
+                    # 发送JSON供用户参考和修改
+                    await self._send_msg(f"📋 {pair} 的最新策略参数参考：")
+                    await self._send_msg(f"```json\n{json.dumps(processed_json, indent=2)}\n```")
+                    await self._send_msg('您可以复制上面的JSON，根据需要进行修改，然后通过 /setpairstrategy 命令设置。')
+        except Exception as e:
+            logger.error(f"获取参考数据时出错: {str(e)}")
+
+        await self._send_msg(f"👉 请使用 /setpairstrategy 命令，并发送 {pair} 的策略 JSON。")
+
+    @authorized_only
+    async def _del_pair(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /delpair <pair>.
+        从白名单移除交易对
+        """
+        if not context.args or len(context.args) == 0:
+            raise RPCException('使用方法: /delpair 币种/USDT')
+
+        pair = context.args[0].upper()
+
+        # 获取当前白名单
+        current_whitelist = self._rpc._rpc_whitelist()['whitelist']
+
+        if pair not in current_whitelist:
+            await self._send_msg(f'交易对 {pair} 不在当前白名单中')
+            return
+
+        # 获取当前白名单
+        current_whitelist = self._rpc._rpc_whitelist()['whitelist']
+
+        if pair in current_whitelist:
+            await self._send_msg(f'交易对 {pair} 已经在白名单中')
+            return
+        import json
+
+        with open('/freqtrade/config_production.json', 'r') as f:
+            config = f.read()
+
+        config['exchange']['pair_whitelist'].remove(pair)
+
+        with open('/freqtrade/config_production.json', 'w') as f:
+            json.dump(config, f, indent=4)
+
+        self._rpc._rpc_reload_config()
+        await self._send_msg(f'交易对 {pair} 已从白名单移除')
+
+    @authorized_only
+    async def _set_pair_strategy(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /setpairstrategy.
+        设置交易对的策略参数 - 从消息文本中获取JSON而不是命令参数
+        """
+        if not context.args or len(context.args) < 2:
+            raise RPCException('使用方法: /setpairstrategy 币种/USDT 交易策略')
+
+        pair = context.args[0].upper()
+
+        # 获取消息文本，删除命令本身
+        message_text = update.message.text
+        if message_text.startswith('/setpairstrategy'):
+            message_text = message_text[len(f'/setpairstrategy {pair}') :].strip()
+
+        # 检查是否有JSON内容
+        if not message_text:
+            await self._send_msg('❌ 未提供策略JSON。请在命令后发送JSON数据。')
+            return
+
+        # 尝试解析JSON内容
+        try:
+            # 尝试提取可能被包装在代码块中的JSON
+            if message_text.startswith('```json') and message_text.endswith('```'):
+                message_text = message_text[7:-3].strip()
+            elif message_text.startswith('```') and message_text.endswith('```'):
+                message_text = message_text[3:-3].strip()
+
+            strategy_json = json.loads(message_text)
+
+            with open('/freqtrade/user_data/strategy_state.json', 'r') as f:
+                strategy_state = json.load(f)
+
+            strategy_state['coin_monitoring'][pair] = strategy_json
+
+            with open('/freqtrade/user_data/strategy_state.json', 'w') as f:
+                json.dump(strategy_state, f, indent=4)
+
+            self._rpc._rpc_reload_config()
+
+            await self._send_msg(f"✅ 成功添加 {pair} 到交易对白名单，并设置了相应的策略参数。")
+
+        except json.JSONDecodeError as e:
+            await self._send_msg(f"❌ JSON格式无效: {str(e)}。请提供有效的JSON字符串。")
+        except Exception as e:
+            logger.exception('设置交易对策略时出错: %s', str(e))
+            await self._send_msg(f"❌ 设置交易对策略时出错: {str(e)}")
+
+    @authorized_only
+    async def _del_pair_strategy(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /delstrategy <pair>.
+        删除交易对的策略参数
+        """
+        if not context.args or len(context.args) < 1:
+            raise RPCException('使用方法: /delstrategy <币种/USDT>')
+
+        pair = context.args[0].upper()
+
+        try:
+            strategy_file = '/freqtrade/user_data/strategy_state.json'
+
+            # 读取当前策略状态
+            try:
+                with open(strategy_file, 'r') as f:
+                    strategy_state = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                await self._send_msg('❌ 未找到策略状态文件或文件格式无效。')
+                return
+
+            # 检查交易对是否存在
+            if (
+                'coin_monitoring' not in strategy_state
+                or pair not in strategy_state['coin_monitoring']
+            ):
+                await self._send_msg(f"❌ 未找到 {pair} 的策略参数。")
+                return
+
+            # 删除策略参数
+            removed_strategy = strategy_state['coin_monitoring'].pop(pair)  # noqa
+
+            # 保存更新后的策略状态
+            with open(strategy_file, 'w') as f:
+                json.dump(strategy_state, f, indent=4)
+
+            # 考虑是否从白名单中移除
+            config = self._rpc._freqtrade.config
+            if pair in config['exchange']['pair_whitelist']:
+                config['exchange']['pair_whitelist'].remove(pair)
+                self._rpc._freqtrade.config = config
+                await self._send_msg(f"✅ 已删除 {pair} 的策略参数并从白名单中移除。")
+            else:
+                await self._send_msg(f"✅ 已删除 {pair} 的策略参数。注意：该交易对不在白名单中。")
+            self._rpc._rpc_reload_config()
+
+        except Exception as e:
+            logger.exception('删除策略参数时出错: %s', str(e))
+            await self._send_msg(f"❌ 删除策略参数时出错: {str(e)}")
+
+    @authorized_only
+    async def _show_pair_strategy(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /showstrategy [pair].
+        显示交易对的策略参数和自动量化策略配置
+        """
+        try:
+            strategy_file = '/freqtrade/user_data/strategy_state.json'
+
+            # 读取当前策略状态
+            try:
+                with open(strategy_file, 'r') as f:
+                    strategy_state = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                await self._send_msg('❌ 未找到策略状态文件或文件格式无效。')
+                return
+
+            # 检查固定点位策略
+            has_coin_monitoring = (
+                'coin_monitoring' in strategy_state and strategy_state['coin_monitoring']
+            )
+
+            # 检查自动量化策略
+            has_pair_strategy_mode = (
+                'pair_strategy_mode' in strategy_state and strategy_state['pair_strategy_mode']
+            )
+
+            if not has_coin_monitoring and not has_pair_strategy_mode:
+                await self._send_msg('⚠️ 当前没有任何交易对的策略参数。')
+                return
+
+            # 如果指定了特定交易对
+            if context.args and len(context.args) > 0:
+                pair = context.args[0].upper()
+
+                # 检查固定点位策略
+                has_fixed_strategy = (
+                    has_coin_monitoring and pair in strategy_state['coin_monitoring']
+                )
+
+                # 检查自动量化策略
+                has_auto_strategy = (
+                    has_pair_strategy_mode and pair in strategy_state['pair_strategy_mode']
+                )
+
+                if not has_fixed_strategy and not has_auto_strategy:
+                    await self._send_msg(f"❌ 未找到 {pair} 的任何策略参数。")
+                    return
+
+                # 发送固定点位策略信息
+                if has_fixed_strategy:
+                    strategy_json = strategy_state['coin_monitoring'][pair]
+                    await self._send_msg(f"📋 {pair} 的固定点位策略参数：")
+                    await self._send_msg(f"```json\n{json.dumps(strategy_json, indent=2)}\n```")
+
+                # 发送自动量化策略信息
+                if has_auto_strategy:
+                    mode = strategy_state['pair_strategy_mode'][pair]
+                    await self._send_msg(f"🤖 {pair} 的自动量化策略：{mode}")
+            else:
+                # 显示所有交易对的策略参数摘要
+                summary = '📋 当前配置的交易对策略：\n\n'
+
+                # 合并两种策略的所有交易对
+                all_pairs = set()
+                if has_coin_monitoring:
+                    all_pairs.update(strategy_state['coin_monitoring'].keys())
+                if has_pair_strategy_mode:
+                    all_pairs.update(strategy_state['pair_strategy_mode'].keys())
+
+                # 按字母顺序排序
+                sorted_pairs = sorted(all_pairs)
+
+                # 创建摘要
+                for i, pair in enumerate(sorted_pairs, 1):
+                    summary_line = f"{i}. {pair} - "
+
+                    strategy_types = []
+
+                    # 检查是否有固定点位策略
+                    if has_coin_monitoring and pair in strategy_state['coin_monitoring']:
+                        strategy_types.append('固定点位')
+
+                    # 检查是否有自动量化策略
+                    if has_pair_strategy_mode and pair in strategy_state['pair_strategy_mode']:
+                        mode = strategy_state['pair_strategy_mode'][pair]
+                        strategy_types.append(f"自动量化({mode})")
+
+                    summary_line += ', '.join(strategy_types)
+                    summary += summary_line + '\n'
+
+                await self._send_msg(summary)
+                await self._send_msg('使用 /showstrategy <币种/USDT> 查看特定交易对的详细策略参数。')
+
+                # 如果有自动量化策略，单独显示一次
+                if has_pair_strategy_mode:
+                    auto_strategy_summary = '🤖 自动量化策略配置：\n```json\n'
+                    auto_strategy_summary += json.dumps(
+                        strategy_state['pair_strategy_mode'], indent=2
+                    )
+                    auto_strategy_summary += '\n```'
+                    await self._send_msg(auto_strategy_summary)
+
+        except Exception as e:
+            logger.exception('显示策略参数时出错: %s', str(e))
+            await self._send_msg(f"❌ 显示策略参数时出错: {str(e)}")

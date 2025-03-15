@@ -9,6 +9,7 @@ from strategy_selector import main as strategy_selector_main
 from update_strategy_state import main as update_strategy_state_main
 from remove_worse_pairs import main as remove_worse_pairs_main
 from remove_worse_pairs import data as good_pairs_data
+from daily_agent import main as daily_agent_main
 
 # 加载.env文件
 load_dotenv()
@@ -453,6 +454,10 @@ class FreqtradeScheduler:
 
             # 8. 重启机器人
             self.restart_bot()
+
+            pairs = daily_agent_main()
+
+            self.send_telegram_message(f"完成每日智能分析建议对：{','.join(pairs)}")
 
             print('每日任务执行完成')
         except Exception as e:

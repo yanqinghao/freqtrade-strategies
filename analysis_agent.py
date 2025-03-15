@@ -38,7 +38,7 @@ class CryptoTechnicalAnalyst:
         llm_base_url = os.environ['LLM_BASE_URL']
         llm_model_name = os.environ['LLM_MODEL_NAME']
         self.llm = ChatOpenAI(
-            temperature=0.2, model_name=llm_model_name, base_url=llm_base_url, api_key=llm_api_key
+            temperature=0.1, model_name=llm_model_name, base_url=llm_base_url, api_key=llm_api_key
         )
 
         # 定义要分析的时间周期
@@ -760,6 +760,7 @@ class CryptoTechnicalAnalyst:
         4. 入场建议: 最佳入场时机和价格水平，最好分时间周期提供明确的建议。
         5. 风险管理: 建议的止损位和目标盈利水平。
         6. 信号冲突解释: 如果不同时间周期之间存在冲突信号，解释可能的原因。
+        7. 根据以上信息，总结入场位置、出场位置、止损位、风险收益比，根据当前市场趋势给出最为稳健入场方向。
 
         最后，请总结当前{symbol}的整体交易观点，并用加粗的文本明确指出最终的交易建议。
         """
@@ -833,6 +834,291 @@ class CryptoTechnicalAnalyst:
         table = coin_info + f"{header}\n{separator}\n" + '\n'.join(rows)
 
         return table
+
+    def generate_formatted_table(self, symbol):
+        """
+        Format multi-timeframe data in a more readable way for Telegram
+
+        参数:
+        symbol: 交易对
+
+        返回:
+        str: 格式化的HTML表格
+        """
+        if symbol not in self.analysis_results:
+            self.analyze_crypto(symbol)
+
+        timeframe_results = self.analysis_results[symbol]
+
+        # Get listing time from any timeframe
+        listing_time = None
+        for _, results in timeframe_results.items():
+            if 'error' not in results and 'listing_time' in results:
+                listing_time = results['listing_time']
+                break
+
+        output = f"<b>🪙 {symbol} Technical Analysis</b>\n"
+        output += f"📅 Listed: {listing_time if listing_time else 'Unknown'}\n\n"
+
+        # Signal icons mapping with colored HTML
+        signal_map = {
+            'bullish': '🟢 <b>Bullish</b>',
+            'neutral': '⚪ Neutral',
+            'bearish': '🔴 <b>Bearish</b>',
+        }
+
+        # Process each timeframe
+        for timeframe in ['1d', '4h', '1h', '15m']:
+            if timeframe not in timeframe_results or 'error' in timeframe_results[timeframe]:
+                continue
+
+            results = timeframe_results[timeframe]
+            signals = results['signals']
+            price = results['last_price']
+
+            # Add timeframe header
+            output += f"<b>⏱️ {timeframe.upper()} Timeframe</b> | Price: <code>{price:.2f}</code>\n"
+
+            # Combined signal
+            combined = signals['combined']
+            output += (
+                f"Overall: {signal_map.get(combined['signal'], '?')} ({combined['confidence']}%)\n"
+            )
+
+            # Individual signal categories
+            categories = [
+                ('Trend', 'trend'),
+                ('Oscillators', 'oscillators'),
+                ('Momentum', 'momentum'),
+                ('Volatility', 'volatility'),
+                ('Volume', 'volume'),
+            ]
+
+            for label, key in categories:
+                signal_info = signals[key]
+                output += f"• {label}: {signal_map.get(signal_info['signal'], '?')} ({signal_info['confidence']}%)\n"
+
+            output += '\n'
+
+        return output
+
+    def format_llm_analysis(self, analysis_text):
+        """
+        Format LLM analysis to be more readable in Telegram with proper section formatting
+
+        参数:
+        analysis_text: LLM分析结果文本
+
+        返回:
+        str: 格式化的HTML分析文本
+        """
+        # Split the text into sections based on markdown headers and dividers
+        sections = []
+        current_section = ''
+
+        for line in analysis_text.split('\n'):
+            # Check for section dividers (--- or ##)
+            if line.startswith('---'):
+                if current_section:
+                    sections.append(current_section)
+                    current_section = ''
+                continue
+
+            # Process headers (## or ###)
+            if line.startswith('##'):
+                # If there's content in the current section, add it to sections
+                if current_section:
+                    sections.append(current_section)
+                    current_section = ''
+
+                # Process the header line
+                if line.startswith('###'):
+                    # Subheader (H3)
+                    header_text = line[3:].strip()
+                    current_section = f"<b>📌 {header_text}</b>\n"
+                else:
+                    # Main header (H2)
+                    header_text = line[2:].strip()
+                    current_section = f"<b>🔷 {header_text}</b>\n"
+            else:
+                # Regular content - add to current section
+                if current_section:
+                    current_section += line + '\n'
+                else:
+                    current_section = line + '\n'
+
+        # Add the last section if there's content
+        if current_section:
+            sections.append(current_section)
+
+        # Format list items
+        formatted_sections = []
+        for section in sections:
+            lines = section.split('\n')
+            formatted_lines = []
+
+            for line in lines:
+                # Format bullet points
+                if line.strip().startswith('- '):
+                    formatted_line = '• ' + line.strip()[2:]
+                    formatted_lines.append(formatted_line)
+                else:
+                    formatted_lines.append(line)
+
+            formatted_sections.append('\n'.join(formatted_lines))
+
+        # Join sections with clear separators
+        formatted_text = '\n\n' + '\n\n'.join(formatted_sections)
+
+        # Fix bold formatting
+        formatted_text = formatted_text.replace('**', '<b>')
+
+        # Ensure all bold tags are properly closed
+        bold_count = formatted_text.count('<b>')
+        close_bold_count = formatted_text.count('</b>')
+
+        # Fix any unclosed bold tags
+        if bold_count > close_bold_count:
+            parts = formatted_text.split('<b>')
+            formatted_text = parts[0]
+
+            for i in range(1, len(parts)):
+                part = parts[i]
+                if '</b>' not in part:
+                    formatted_text += '<b>' + part + '</b>'
+                else:
+                    formatted_text += '<b>' + part
+
+        # Add dividers between major sections
+        formatted_text = formatted_text.replace('\n\n<b>🔷', '\n\n' + '━' * 30 + '\n\n<b>🔷')
+
+        return formatted_text
+
+    def split_text(self, text, max_length=4000):
+        """
+        Split text into chunks of max_length, trying to split at paragraph boundaries
+
+        参数:
+        text: 要分割的文本
+        max_length: 每个块的最大长度（默认4000，适合Telegram的限制）
+
+        返回:
+        list: 文本块列表
+        """
+        if len(text) <= max_length:
+            return [text]
+
+        chunks = []
+        current_chunk = ''
+        paragraphs = text.split('\n\n')
+
+        for paragraph in paragraphs:
+            if len(current_chunk) + len(paragraph) + 2 <= max_length:
+                if current_chunk:
+                    current_chunk += '\n\n'
+                current_chunk += paragraph
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk)
+
+                # If a single paragraph is too long, split it further
+                if len(paragraph) > max_length:
+                    sentences = paragraph.split('. ')
+                    current_chunk = ''
+
+                    for sentence in sentences:
+                        if len(current_chunk) + len(sentence) + 2 <= max_length:
+                            if current_chunk and not current_chunk.endswith('. '):
+                                current_chunk += '. '
+                            current_chunk += sentence
+                        else:
+                            if current_chunk:
+                                chunks.append(current_chunk)
+                            current_chunk = sentence
+                else:
+                    current_chunk = paragraph
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    def get_formatted_llm_analysis(self, symbol):
+        """
+        获取格式化的LLM分析结果，适合在Telegram中显示
+
+        参数:
+        symbol: 交易对
+
+        返回:
+        list: 格式化的HTML分析文本块列表
+        """
+        # 确保已经有分析结果
+        if symbol not in self.analysis_results:
+            self.analyze_crypto(symbol)
+
+        # 获取LLM分析
+        analysis = self.get_llm_analysis(symbol)
+
+        # 检查分析结果是否符合特定格式（包含 ##1. 和 --- 标记）
+        if '##1.' in analysis and '---' in analysis:
+            # 使用特定格式化方法
+            formatted_analysis = self.format_specific_analysis(analysis)
+        else:
+            # 使用通用格式化方法
+            formatted_analysis = self.format_llm_analysis(analysis)
+
+        # 分割成适合Telegram的块
+        return self.split_text(formatted_analysis), analysis
+
+    def format_specific_analysis(self, analysis_text):
+        """
+        Format a specific analysis format with headers and sections
+        This is optimized for the specific analysis format you provided
+
+        参数:
+        analysis_text: LLM分析结果文本
+
+        返回:
+        str: 格式化的HTML分析文本
+        """
+        # Replace section headers with HTML formatting
+        formatted = analysis_text
+
+        # Process section headers (##)
+        formatted = formatted.replace('##1.', '<b>🔷 1.')
+        formatted = formatted.replace('##2.', '<b>🔷 2.')
+        formatted = formatted.replace('##3.', '<b>🔷 3.')
+        formatted = formatted.replace('##4.', '<b>🔷 4.')
+        formatted = formatted.replace('##5.', '<b>🔷 5.')
+        formatted = formatted.replace('##6.', '<b>🔷 6.')
+        formatted = formatted.replace('##总结', '<b>🔶 总结')
+
+        # Process subsection headers (###)
+        formatted = formatted.replace('###', '<b>📌')
+
+        # Close all header tags
+        formatted = formatted.replace('\n---', '</b>\n' + '━' * 30)
+
+        # Fix any section headers not followed by dividers
+        lines = formatted.split('\n')
+        for i in range(len(lines)):
+            if lines[i].startswith('<b>') and '</b>' not in lines[i]:
+                lines[i] += '</b>'
+
+        formatted = '\n'.join(lines)
+
+        # Format bullet points
+        formatted = formatted.replace('- ', '• ')
+
+        # Add spacing for readability
+        formatted = formatted.replace('</b>\n', '</b>\n\n')
+
+        # Fix any potential double spacing issues
+        while '\n\n\n' in formatted:
+            formatted = formatted.replace('\n\n\n', '\n\n')
+
+        return formatted
 
 
 # 使用示例

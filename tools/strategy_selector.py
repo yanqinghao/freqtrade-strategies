@@ -69,6 +69,10 @@ def main(threshold=-50):
     with open('short.csv', 'r') as f:
         short_data_str = f.read()
 
+    with open('deploy/strategy_state.json', 'r') as f:
+        strategy_state = json.load(f)
+
+    coin_monitoring = strategy_state['coin_monitoring']
     # Parse the data
     long_data = parse_data(long_data_str, 'long')
     short_data = parse_data(short_data_str, 'short')
@@ -81,16 +85,21 @@ def main(threshold=-50):
     # Build the output JSON
     output = {'pair_strategy_mode': strategies}
 
+    output_with_monitoring = {'pair_strategy_mode': strategies, 'coin_monitoring': coin_monitoring}
+
     # Print to console
     json_str = json.dumps(output, indent=2)
     print(json_str)
+
+    json_str_with_monitoring = json.dumps(output_with_monitoring, indent=2)
+    print(json_str_with_monitoring)
 
     # Write to file
     with open('user_data/strategy_state.json', 'w') as f:
         f.write(json_str)
 
     with open('deploy/strategy_state.json', 'w') as f:
-        f.write(json_str)
+        f.write(json_str_with_monitoring)
 
     with open('user_data/config.json', 'r') as f:
         config = json.load(f)
