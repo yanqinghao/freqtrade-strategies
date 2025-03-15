@@ -2659,26 +2659,8 @@ class Telegram(RPCHandler):
                 # Send the cached results
                 await self._send_msg(table_output, parse_mode=ParseMode.HTML)
 
-                # 检查分析结果是否符合特定格式（包含 ##1. 和 --- 标记）
-                if '##1.' in analysis_text and '---' in analysis_text:
-                    # 使用特定格式化方法
-                    formatted_analysis = analyst.format_specific_analysis(analysis_text)
-                else:
-                    # 使用通用格式化方法
-                    formatted_analysis = analyst.format_llm_analysis(analysis_text)
+                await self._send_msg(analysis_text, parse_mode=ParseMode.MARKDOWN)
 
-                # Split and send the analysis text
-                analysis_chunks = analyst.split_text(formatted_analysis)
-
-                await self._send_msg(f"🤖 Cached in-depth analysis for {pair}:")
-                for i, chunk in enumerate(analysis_chunks):
-                    if i == 0:
-                        await self._send_msg(chunk, parse_mode=ParseMode.HTML)
-                    else:
-                        await self._send_msg(
-                            f"(continued {i + 1}/{len(analysis_chunks)})\n\n{chunk}",
-                            parse_mode=ParseMode.HTML,
-                        )
                 # Send the processed JSON data
                 await self._send_msg(f"📋 Processed JSON data for {pair}:")
                 await self._send_msg(f"```json\n{json.dumps(processed_json, indent=2)}\n```")
@@ -2688,6 +2670,7 @@ class Telegram(RPCHandler):
 
                 # Generate formatted table
                 table_output = analyst.generate_formatted_table(pair)
+
                 await self._send_msg(table_output, parse_mode=ParseMode.HTML)
 
                 # Get deep analysis
@@ -2707,15 +2690,8 @@ class Telegram(RPCHandler):
                     )
                     logger.info(f"Analysis results stored in database for {pair}")
 
-                # Send the analysis results
-                for i, chunk in enumerate(analysis_chunks):
-                    if i == 0:
-                        await self._send_msg(chunk, parse_mode=ParseMode.HTML)
-                    else:
-                        await self._send_msg(
-                            f"(continued {i + 1}/{len(analysis_chunks)})\n\n{chunk}",
-                            parse_mode=ParseMode.HTML,
-                        )
+                await self._send_msg(analysis_text, parse_mode=ParseMode.MARKDOWN)
+
                 # Send the processed JSON data
                 await self._send_msg(f"📋 Processed JSON data for {pair}:")
                 await self._send_msg(f"```json\n{json.dumps(processed_json, indent=2)}\n```")
@@ -2746,10 +2722,8 @@ class Telegram(RPCHandler):
             await self._send_msg(f'交易对 {pair} 已在当前白名单中')
             return
 
-        import json
-
         with open('/freqtrade/config_production.json', 'r') as f:
-            config = f.read()
+            config = json.load(f)
 
         config['exchange']['pair_whitelist'].append(pair)
 
@@ -2805,10 +2779,9 @@ class Telegram(RPCHandler):
         if pair in current_whitelist:
             await self._send_msg(f'交易对 {pair} 已经在白名单中')
             return
-        import json
 
         with open('/freqtrade/config_production.json', 'r') as f:
-            config = f.read()
+            config = json.load(f)
 
         config['exchange']['pair_whitelist'].remove(pair)
 
@@ -3020,6 +2993,15 @@ class Telegram(RPCHandler):
                     )
                     auto_strategy_summary += '\n```'
                     await self._send_msg(auto_strategy_summary)
+
+                # 如果有自动量化策略，单独显示一次
+                if has_coin_monitoring:
+                    fixed_strategy_summary = '🤖 自动量化策略配置：\n```json\n'
+                    fixed_strategy_summary += json.dumps(
+                        strategy_state['coin_monitoring'], indent=2
+                    )
+                    fixed_strategy_summary += '\n```'
+                    await self._send_msg(fixed_strategy_summary)
 
         except Exception as e:
             logger.exception('显示策略参数时出错: %s', str(e))

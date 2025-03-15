@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import re
 import requests
 import ccxt
 from datetime import datetime
@@ -994,7 +995,7 @@ class CryptoTechnicalAnalyst:
 
         return formatted_text
 
-    def split_text(self, text, max_length=4000):
+    def split_text(self, text, max_length=2000):
         """
         Split text into chunks of max_length, trying to split at paragraph boundaries
 
@@ -1069,7 +1070,18 @@ class CryptoTechnicalAnalyst:
             formatted_analysis = self.format_llm_analysis(analysis)
 
         # 分割成适合Telegram的块
-        return self.split_text(formatted_analysis), analysis
+        chunks = self.split_text(formatted_analysis)
+
+        # 安全检查：转义所有可能导致HTML解析错误的内容
+        for i in range(len(chunks)):
+            # 转义所有数字后的箭头等符号，这些是常见的问题来源
+            chunks[i] = re.sub(r'<(\d[^<>]*[→→←↑↓]?[^<>]*)>', r'&lt;\1&gt;', chunks[i])
+
+            # 转义所有看起来不像HTML标签的<>内容
+            chunks[i] = re.sub(r'<([^a-zA-Z/][^<>]*)>', r'&lt;\1&gt;', chunks[i])
+
+        # 分割成适合Telegram的块
+        return chunks, analysis
 
     def format_specific_analysis(self, analysis_text):
         """

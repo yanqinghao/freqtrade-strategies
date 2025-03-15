@@ -268,7 +268,7 @@ class KamaFama_Dynamic(IStrategy):
         if (
             pair in self.coin_monitoring
             and self.coin_monitoring.get(pair)
-            and self.coin_monitoring[pair]['entry_points']
+            and list(itertools.chain(*[i['entry_points'] for i in self.coin_monitoring[pair]]))
         ):
             # 处理固定点位监控逻辑
             dataframe = self._populate_fixed_entry(dataframe, metadata)

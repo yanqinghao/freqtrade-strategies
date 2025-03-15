@@ -153,7 +153,7 @@ def main():
     with open('deploy/config.json', 'r') as f:
         config = json.load(f)
     analyzed_pairs = []
-    for pair in df['交易对'][:10]:
+    for pair in df['交易对'][:5]:
         print(f"Analyzing pair: {pair}")
 
         # Check if we already have today's analysis
