@@ -2675,7 +2675,7 @@ class Telegram(RPCHandler):
 
         message_text = update.message.text
         if message_text.startswith('/promptjson'):
-            message_text = message_text[len(f'/promptjson') :].strip()
+            message_text = message_text[len('/promptjson') :].strip()
 
         try:
 
@@ -2916,9 +2916,24 @@ class Telegram(RPCHandler):
             elif message_text.startswith('```') and message_text.endswith('```'):
                 message_text = message_text[3:-3].strip()
 
-            logger.info(message_text)
-
-            strategy_json = json.loads(message_text)
+            try:
+                strategy_json = json.loads(message_text)
+            except:
+                strategy_json = []
+                for i in message_text.split(';'):
+                    strategy_json.append(
+                        {
+                            'direction': i.split(',')[0],
+                            'entry_points': [float(i.split(',')[1])],
+                            'exit_points': [
+                                float(i.split(',')[2]),
+                                float(i.split(',')[3]),
+                                float(i.split(',')[4]),
+                            ],
+                            'stop_loss': float(i.split(',')[5]),
+                            'risk_reward': None,
+                        }
+                    )
 
             with open('/freqtrade/user_data/strategy_state.json', 'r') as f:
                 strategy_state = json.load(f)

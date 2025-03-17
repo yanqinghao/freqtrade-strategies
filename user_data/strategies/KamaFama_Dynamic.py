@@ -46,6 +46,7 @@ def williams_r(dataframe: DataFrame, period: int = 14) -> Series:
 class KamaFama_Dynamic(IStrategy):
     INTERFACE_VERSION = 2
     can_short = True
+    position_adjustment_enable = True
 
     @property
     def protections(self):
@@ -378,17 +379,29 @@ class KamaFama_Dynamic(IStrategy):
         dataframe.loc[:, 'exit_short'] = 0
         return dataframe
 
-    def custom_exit(
+    def adjust_trade_position(
         self,
-        pair: str,
-        trade: 'Trade',
-        current_time: 'datetime',
+        trade: Trade,
+        current_time: datetime,
         current_rate: float,
         current_profit: float,
+        min_stake: float | None,
+        max_stake: float,
+        current_entry_rate: float,
+        current_exit_rate: float,
+        current_entry_profit: float,
+        current_exit_profit: float,
         **kwargs,
-    ):
-        """根据交易类型选择合适的退出逻辑"""
+    ) -> float | None | tuple[float | None, str | None]:
+        """
+        使用持久化存储实现多级退出策略
+
+        根据退出点位实现分批退出，并动态调整止损位
+        """
+
+        pair = trade.pair
         direction = 'short' if trade.is_short else 'long'
+
         # 检查是否是固定点位监控的交易对
         if (
             pair in self.coin_monitoring
@@ -408,28 +421,186 @@ class KamaFama_Dynamic(IStrategy):
                 if config.get('direction') == direction:
                     exit_points = config.get('exit_points', [])
 
-                    # 如果有退出点位配置
-                    if exit_points:
-                        # 对于多头和空头使用不同的退出判断
-                        if direction == 'short':
-                            # 对于空头，当价格低于退出点时退出
-                            for exit_point in exit_points:
-                                if current_rate <= exit_point:
-                                    logger.info(
-                                        f"固定点位监控交易 {pair} 触发退出: 当前价格 {current_rate} <= 退出价格 {exit_point}"
-                                    )
-                                    return f"fixed_short_exit_{exit_point}"
-                        else:
-                            # 对于多头，当价格高于退出点时退出
-                            for exit_point in exit_points:
-                                if current_rate >= exit_point:
-                                    logger.info(
-                                        f"固定点位监控交易 {pair} 触发退出: 当前价格 {current_rate} >= 退出价格 {exit_point}"
-                                    )
-                                    return f"fixed_long_exit_{exit_point}"
-                    break
+                    # 确保有足够的退出点位
+                    if not exit_points or len(exit_points) < 1:
+                        break
+
+                    # 对退出点位进行排序：多头从小到大，空头从大到小
+                    if direction == 'long':
+                        sorted_exit_points = sorted(exit_points)
+                    else:  # short
+                        sorted_exit_points = sorted(exit_points, reverse=True)
+
+                    # 获取成本价
+                    cost_price = trade.open_rate
+
+                    # 使用持久化存储获取退出阶段
+                    exit_stage = trade.get_custom_data('exit_stage', default=0)
+
+                    # 初次遇到交易时，保存初始stake金额
+                    if exit_stage == 0 and trade.get_custom_data('initial_stake') is None:
+                        trade.set_custom_data('initial_stake', trade.stake_amount)
+
+                    initial_stake = trade.get_custom_data(
+                        'initial_stake', default=trade.stake_amount
+                    )
+
+                    # 确定当前价格处于哪个退出点位区间
+                    if direction == 'long':
+                        # 多头策略：检查是否达到各个退出点位
+                        if (
+                            exit_stage == 0
+                            and len(sorted_exit_points) > 0
+                            and current_rate >= sorted_exit_points[0]
+                        ):
+                            # 第一个点位：出30%，止损调整到成本价
+                            trade.set_custom_data('exit_stage', 1)
+                            self._adjust_stoploss(trade, cost_price)
+
+                            # 退出30%仓位
+                            logger.info(f"触发第一级退出点位 {pair}: 当前价格 {current_rate} - 出售30%仓位")
+                            return -(initial_stake * 0.3), f"long_tp1_{sorted_exit_points[0]}"
+
+                        elif (
+                            exit_stage == 1
+                            and len(sorted_exit_points) > 1
+                            and current_rate >= sorted_exit_points[1]
+                        ):
+                            # 第二个点位：出50%剩余仓位，止损调整到第一个点位
+                            trade.set_custom_data('exit_stage', 2)
+                            self._adjust_stoploss(trade, sorted_exit_points[0])
+
+                            # 退出50%剩余仓位
+                            remaining_stake = trade.stake_amount
+                            logger.info(f"触发第二级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余仓位的50%")
+                            return -(remaining_stake * 0.5), f"long_tp2_{sorted_exit_points[1]}"
+
+                        # 处理回撤情况 - 多头
+                        elif exit_stage == 1 and current_rate <= cost_price:
+                            # 第一阶段回撤到成本价，清仓
+                            logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
+                            return -trade.stake_amount, 'long_tp1_pullback_cost'
+
+                        elif exit_stage == 2 and current_rate <= sorted_exit_points[0]:
+                            # 第二阶段回撤到第一点位，清仓
+                            logger.info(f"{pair} 从第二点位回撤至第一点位 {sorted_exit_points[0]}，清仓")
+                            return -trade.stake_amount, 'long_tp2_pullback_tp1'
+
+                    else:  # short
+                        # 空头策略：检查是否达到各个退出点位
+                        if (
+                            exit_stage == 0
+                            and len(sorted_exit_points) > 0
+                            and current_rate <= sorted_exit_points[0]
+                        ):
+                            # 第一个点位：出30%，止损调整到成本价
+                            trade.set_custom_data('exit_stage', 1)
+                            self._adjust_stoploss(trade, cost_price)
+
+                            # 退出30%仓位
+                            logger.info(f"触发第一级退出点位 {pair}: 当前价格 {current_rate} - 出售30%仓位")
+                            return -(initial_stake * 0.3), f"short_tp1_{sorted_exit_points[0]}"
+
+                        elif (
+                            exit_stage == 1
+                            and len(sorted_exit_points) > 1
+                            and current_rate <= sorted_exit_points[1]
+                        ):
+                            # 第二个点位：出50%剩余仓位，止损调整到第一个点位
+                            trade.set_custom_data('exit_stage', 2)
+                            self._adjust_stoploss(trade, sorted_exit_points[0])
+
+                            # 退出50%剩余仓位
+                            remaining_stake = trade.stake_amount
+                            logger.info(f"触发第二级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余仓位的50%")
+                            return -(remaining_stake * 0.5), f"short_tp2_{sorted_exit_points[1]}"
+
+                        # 处理回撤情况 - 空头
+                        elif exit_stage == 1 and current_rate >= cost_price:
+                            # 第一阶段回撤到成本价，清仓
+                            logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
+                            return -trade.stake_amount, 'short_tp1_pullback_cost'
+
+                        elif exit_stage == 2 and current_rate >= sorted_exit_points[0]:
+                            # 第二阶段回撤到第一点位，清仓
+                            logger.info(f"{pair} 从第二点位回撤至第一点位 {sorted_exit_points[0]}，清仓")
+                            return -trade.stake_amount, 'short_tp2_pullback_tp1'
+
+        return None
+
+    def _adjust_stoploss(self, trade: Trade, new_stoploss_price: float):
+        """调整止损价格的辅助函数"""
+        if self.config['runmode'].value in ('live', 'dry_run'):
+            # 计算相对止损比例
+            if trade.is_short:
+                # 对于空头，止损价格高于入场价时为负值
+                stoploss_percent = (new_stoploss_price / trade.open_rate) - 1
+            else:
+                # 对于多头，止损价格低于入场价时为负值
+                stoploss_percent = (new_stoploss_price / trade.open_rate) - 1
+
+            # 使用Trade的API更新止损
+            trade.adjust_stop_loss(trade.open_rate, stoploss_percent)
+            logger.info(f"已调整 {trade.pair} 的止损到 {new_stoploss_price} (相对: {stoploss_percent:.2%})")
+
+    def custom_exit(
+        self,
+        pair: str,
+        trade: 'Trade',
+        current_time: 'datetime',
+        current_rate: float,
+        current_profit: float,
+        **kwargs,
+    ):
+        """
+        基于持久化存储处理最终(第三级)退出点位
+        """
+        direction = 'short' if trade.is_short else 'long'
+
+        # 检查是否是固定点位监控的交易对
+        if (
+            pair in self.coin_monitoring
+            and self.coin_monitoring.get(pair)
+            and list(
+                itertools.chain(
+                    *[
+                        i['exit_points']
+                        for i in self.coin_monitoring[pair]
+                        if i['direction'] == direction
+                    ]
+                )
+            )
+        ):
+            # 找到对应方向的监控配置
+            for config in self.coin_monitoring[pair]:
+                if config.get('direction') == direction:
+                    exit_points = config.get('exit_points', [])
+
+                    # 确保有足够的退出点位
+                    if not exit_points or len(exit_points) < 3:  # 需要至少3个点位
+                        break
+
+                    # 对退出点位进行排序：多头从小到大，空头从大到小
+                    if direction == 'long':
+                        sorted_exit_points = sorted(exit_points)
+                    else:  # short
+                        sorted_exit_points = sorted(exit_points, reverse=True)
+
+                    # 获取当前退出阶段
+                    exit_stage = trade.get_custom_data('exit_stage', default=0)
+
+                    # 只处理第三级退出点位
+                    if exit_stage == 2:
+                        if (direction == 'long' and current_rate >= sorted_exit_points[2]) or (
+                            direction == 'short' and current_rate <= sorted_exit_points[2]
+                        ):
+                            # 第三个点位：全部退出
+                            trade.set_custom_data('exit_stage', 3)
+                            logger.info(f"触发第三级退出点位 {pair}: 当前价格 {current_rate} - 出售所有剩余仓位")
+                            return f"{direction}_tp3_{sorted_exit_points[2]}"
         else:
-            # 根据trade的类型判断是多头还是空头
+
+            # 如果不满足固定点位监控的条件，使用原有退出逻辑
             if trade.is_short:
                 return self._custom_exit_short(
                     pair, trade, current_time, current_rate, current_profit, **kwargs
