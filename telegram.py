@@ -2901,7 +2901,7 @@ class Telegram(RPCHandler):
         # 获取消息文本，删除命令本身
         message_text = update.message.text
         if message_text.startswith('/setpairstrategy'):
-            message_text = message_text[len(f'/setpairstrategy {pair}') :].strip()
+            message_text = message_text[len(f'/setpairstrategy {context.args[0]}') :].strip()
 
         # 检查是否有JSON内容
         if not message_text:
@@ -2915,6 +2915,8 @@ class Telegram(RPCHandler):
                 message_text = message_text[7:-3].strip()
             elif message_text.startswith('```') and message_text.endswith('```'):
                 message_text = message_text[3:-3].strip()
+
+            logger.info(message_text)
 
             strategy_json = json.loads(message_text)
 
