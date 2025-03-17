@@ -24,3 +24,9 @@ echo "Task completed at $(date)" >> $LOG_FILE
 
 # 只保留最近7天的日志
 find $LOG_DIR -name "backtest_*.log" -mtime +7 -delete
+
+# 清理 backtest_results 文件夹，只保留最近两天的结果文件
+echo "Cleaning up backtest results files..." >> $LOG_FILE
+RESULTS_DIR="$SCRIPT_DIR/user_data/backtest_results"
+find "$RESULTS_DIR" -type f -name "backtest-result-*" -mtime +2 -delete
+echo "Cleanup completed at $(date)" >> $LOG_FILE
