@@ -308,18 +308,14 @@ class KamaFama_Dynamic(IStrategy):
                 # 对于多头
                 if direction == 'long':
                     # 如果当前价格在入场点附近（上下0.5%范围内）
-                    entry_condition = (dataframe['close'] >= entry_point * 0.995) & (
-                        dataframe['close'] <= entry_point * 1.005
-                    )
+                    entry_condition = dataframe['close'] <= entry_point
                     dataframe.loc[entry_condition, 'enter_long'] = 1
                     dataframe.loc[entry_condition, 'enter_tag'] = f'fixed_long_entry_{entry_point}'
 
                 # 对于空头
                 elif direction == 'short':
                     # 如果当前价格在入场点附近（上下0.5%范围内）
-                    entry_condition = (dataframe['close'] >= entry_point * 0.995) & (
-                        dataframe['close'] <= entry_point * 1.005
-                    )
+                    entry_condition = dataframe['close'] >= entry_point
                     dataframe.loc[entry_condition, 'enter_short'] = 1
                     dataframe.loc[entry_condition, 'enter_tag'] = f'fixed_short_entry_{entry_point}'
 

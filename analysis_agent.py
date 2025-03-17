@@ -778,6 +778,52 @@ class CryptoTechnicalAnalyst:
 
         return response
 
+    def gen_llm_prompt(self, symbol):
+        """
+        使用LLM分析多个时间周期的技术指标并提供入场建议
+
+        参数:
+        symbol: 交易对
+
+        返回:
+        str: LLM的分析和建议
+        """
+        # 确保已经有分析结果
+        if symbol not in self.analysis_results:
+            self.analyze_crypto(symbol)
+
+        timeframe_results = self.analysis_results[symbol]
+
+        # 格式化分析结果
+        formatted_analysis = self.format_technical_analysis(symbol, timeframe_results)
+        formatted_klines = self.format_data_for_llm_markdown()
+
+        # 创建LLM提示
+        prompt_template = """
+        作为加密货币交易专家，基于以下{symbol}的技术分析结果提供详细的多时间周期分析和交易入场建议:
+
+        {klines}
+
+        {analysis}
+
+        请提供以下内容:
+        1. 币种背景: 考虑币种的上线时间，简要分析其发展阶段和市场成熟度。
+        2. 多时间周期分析: 分析各个时间周期(1d, 4h, 1h, 15m)的技术指标，说明信号的一致性或冲突。
+        3. 交易机会评估: 是否有任何明显的做多或做空机会？在哪个时间周期上信号最强？
+        4. 入场建议: 最佳入场时机和价格水平，最好分时间周期提供明确的建议。
+        5. 风险管理: 建议的止损位和目标盈利水平。
+        6. 信号冲突解释: 如果不同时间周期之间存在冲突信号，解释可能的原因。
+        7. 根据以上信息，总结入场位置、出场位置、止损位、风险收益比，根据当前市场趋势给出最为稳健入场方向。
+
+        最后，请总结当前{symbol}的整体交易观点，并用加粗的文本明确指出最终的交易建议。
+        """
+
+        prompt = PromptTemplate(
+            input_variables=['symbol', 'analysis', 'klines'], template=prompt_template
+        )
+
+        return prompt.format(symbol=symbol, analysis=formatted_analysis, klines=formatted_klines)
+
     def generate_multi_timeframe_table(self, symbol):
         """
         生成多时间周期技术指标的ASCII表格

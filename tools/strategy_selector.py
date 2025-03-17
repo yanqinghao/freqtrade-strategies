@@ -73,6 +73,7 @@ def main(threshold=-50):
         strategy_state = json.load(f)
 
     coin_monitoring = strategy_state['coin_monitoring']
+
     # Parse the data
     long_data = parse_data(long_data_str, 'long')
     short_data = parse_data(short_data_str, 'short')
@@ -105,6 +106,10 @@ def main(threshold=-50):
         config = json.load(f)
 
     config['exchange']['pair_whitelist'] = pairs
+
+    for pair in coin_monitoring:
+        if pair not in config['exchange']['pair_whitelist']:
+            config['exchange']['pair_whitelist'].append(pair)
 
     with open('user_data/config.json', 'w') as f:
         json.dump(config, f, indent=2)

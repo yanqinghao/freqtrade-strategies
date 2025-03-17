@@ -65,30 +65,32 @@ class TradingSignalExtractor:
 
         # Define the extraction prompt template
         self.extraction_template = """
-        You are a trading signal extraction specialist. Extract the specific trading signals from the following analysis text:
-
-        ```
+        You are a trading signal extraction specialist. Extract ONLY the short-term and medium-term trading signals from the following analysis text:
+        <context>
         {text}
-        ```
+        </context>
 
         Output ONLY a JSON array in the following format:
         [
-          {{
-            "direction": "long" or "short",
-            "entry_points": [array of entry price numbers, sorted from low to high for long, high to low for short],
-            "exit_points": [array of target/exit price numbers, sorted from low to high for long, high to low for short],
-            "stop_loss": stop loss price number,
-            "risk_reward": risk/reward ratio number (optional)
-          }}
+            {{
+                "timeframe": "short" or "medium",
+                "direction": "long" or "short",
+                "entry_points": [array of entry price numbers, sorted from low to high for long, high to low for short],
+                "exit_points": [array of target/exit price numbers, sorted from low to high for long, high to low for short],
+                "stop_loss": stop loss price number,
+                "risk_reward": risk/reward ratio number (optional)
+            }}
         ]
 
         Rules:
-        1. If both long and short signals are present, include them as separate objects in the array
-        2. Entry points should include all mentioned entry prices as numbers
-        3. Exit points should include all target prices as numbers
-        4. For long positions: sort entry_points and exit_points from lowest to highest
-        5. For short positions: sort entry_points and exit_points from highest to lowest
-        6. Include risk_reward only if it's explicitly mentioned
+        1. ONLY include short-term and medium-term signals (ignore long-term signals)
+        2. For short-term signals: focus on 15-minute and 1-hour timeframes
+        3. For medium-term signals: focus on 4-hour timeframe
+        4. Entry points should include all mentioned entry prices as numbers
+        5. Exit points should include all target prices as numbers
+        6. For long positions: sort entry_points and exit_points from lowest to highest
+        7. For short positions: sort entry_points and exit_points from highest to lowest
+        8. Include risk_reward only if it's explicitly mentioned
 
         Parse all numbers as floating point values, not strings. Respond with ONLY the JSON array.
         """
@@ -97,6 +99,10 @@ class TradingSignalExtractor:
 
         # Create the extraction chain
         self.chain = LLMChain(llm=self.llm, prompt=self.prompt)
+
+    def gen_json_prompt(self, text: str) -> str:
+        """Generate the JSON prompt for the given text"""
+        return self.prompt.format(text=text)
 
     def extract_signals(self, text: str) -> List[Dict[str, Any]]:
         """

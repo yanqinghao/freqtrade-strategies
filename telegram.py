@@ -180,7 +180,7 @@ class Telegram(RPCHandler):
             ['/daily', '/profit', '/balance'],
             ['/status', '/status table', '/performance'],
             ['/count', '/start', '/stop', '/help'],
-            ['/chart', '/analysis'],
+            ['/chart', '/analysis', '/prompt', '/promptjson'],
             ['/addpair', '/delpair'],
             ['/setpairstrategy', '/delpairstrategy', '/showpairstrategy'],
         ]
@@ -234,6 +234,8 @@ class Telegram(RPCHandler):
             r'/marketdir$',
             r'/chart$',  # chart命令格式
             r'/analysis$',  # analysis命令格式
+            r'/prompt$',  # analysis命令格式
+            r'/promptjson$',  # analysis命令格式
             r'/addpair$',
             r'/delpair$',
             r'/setpairstrategy$',
@@ -327,6 +329,8 @@ class Telegram(RPCHandler):
             CommandHandler('tg_info', self._tg_info),
             CommandHandler('chart', self._chart),
             CommandHandler('analysis', self._analysis),
+            CommandHandler('prompt', self._prompt),
+            CommandHandler('promptjson', self._prompt_json),
             CommandHandler('addpair', self._add_pair),
             CommandHandler('delpair', self._del_pair),
             CommandHandler('setpairstrategy', self._set_pair_strategy),
@@ -2219,6 +2223,8 @@ class Telegram(RPCHandler):
             raise RPCException('Usage: /chart <pair> [timeframe]')
 
         pair = context.args[0].upper()  # 确保大写一致性
+        if not pair.endswith('/USDT:USDT'):
+            pair += '/USDT:USDT'
         timeframe = context.args[1] if len(context.args) > 1 else self._config['timeframe']
 
         try:
@@ -2603,6 +2609,88 @@ class Telegram(RPCHandler):
             await self._send_msg(f"生成图表时出错: {str(e)}")
 
     @authorized_only
+    async def _prompt(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /analysis <pair> [timeframe].
+        Uses LLM to analyze the given trading pair
+        :param update: message update
+        :return: None
+        """
+        if not context.args or len(context.args) == 0:
+            raise RPCException('Usage: /prompt <pair>')
+
+        pair = context.args[0].upper()
+        if not pair.endswith('/USDT:USDT'):
+            pair += '/USDT:USDT'
+
+        try:
+            # Perform new analysis
+            exchange_config = self._rpc._freqtrade.config.get('exchange', {})
+
+            # Initialize analyzer
+            analyst = CryptoTechnicalAnalyst(
+                api_key=exchange_config.get('key', ''),
+                api_secret=exchange_config.get('secret', ''),
+            )
+            prompt = analyst.gen_llm_prompt(pair)
+
+            if len(prompt) > 3000:
+                # 创建临时文本文件
+                import tempfile
+                import os
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w') as tmp_file:
+                    tmp_file.write(prompt)
+                    tmp_file_path = tmp_file.name
+
+                # 发送文件
+                with open(tmp_file_path, 'rb') as document:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=document,
+                        filename=f"{pair}_prompt.txt",
+                        caption=f"Generated prompt for {pair}",
+                    )
+
+                # 删除临时文件
+                os.unlink(tmp_file_path)
+            else:
+                # 如果内容不超过限制，直接发送文本消息
+                await self._send_msg(f"```{prompt}```")
+
+        except Exception as e:
+            logger.exception('Error during prompt gen: %s', str(e))
+            await self._send_msg(f"❌ Error during prompt gen: {str(e)}")
+
+    @authorized_only
+    async def _prompt_json(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /analysis <pair> [timeframe].
+        Uses LLM to analyze the given trading pair
+        :param update: message update
+        :return: None
+        """
+        if not context.args or len(context.args) == 0:
+            raise RPCException('Usage: /promptjson <text>')
+
+        message_text = update.message.text
+        if message_text.startswith('/promptjson'):
+            message_text = message_text[len(f'/promptjson') :].strip()
+
+        try:
+
+            # Perform new analysis
+            extractor = TradingSignalExtractor()
+            prompt = extractor.gen_json_prompt(message_text)
+
+            # Get deep analysis
+            await self._send_msg(f"```{prompt}```")
+
+        except Exception as e:
+            logger.exception('Error during prompt gen: %s', str(e))
+            await self._send_msg(f"❌ Error during prompt gen: {str(e)}")
+
+    @authorized_only
     async def _analysis(self, update: Update, context: CallbackContext) -> None:
         """
         Handler for /analysis <pair> [timeframe].
@@ -2614,6 +2702,8 @@ class Telegram(RPCHandler):
             raise RPCException('Usage: /analysis <pair> [timeframe]')
 
         pair = context.args[0].upper()
+        if not pair.endswith('/USDT:USDT'):
+            pair += '/USDT:USDT'
 
         try:
             # Show analysis in progress message
@@ -2714,6 +2804,8 @@ class Telegram(RPCHandler):
             raise RPCException('使用方法: /addpair <币种/USDT>')
 
         pair = context.args[0].upper()
+        if not pair.endswith('/USDT:USDT'):
+            pair += '/USDT:USDT'
 
         # 获取当前白名单
         current_whitelist = self._rpc._rpc_whitelist()['whitelist']
@@ -2765,6 +2857,8 @@ class Telegram(RPCHandler):
             raise RPCException('使用方法: /delpair 币种/USDT')
 
         pair = context.args[0].upper()
+        if not pair.endswith('/USDT:USDT'):
+            pair += '/USDT:USDT'
 
         # 获取当前白名单
         current_whitelist = self._rpc._rpc_whitelist()['whitelist']
@@ -2801,6 +2895,8 @@ class Telegram(RPCHandler):
             raise RPCException('使用方法: /setpairstrategy 币种/USDT 交易策略')
 
         pair = context.args[0].upper()
+        if not pair.endswith('/USDT:USDT'):
+            pair += '/USDT:USDT'
 
         # 获取消息文本，删除命令本身
         message_text = update.message.text
@@ -2850,6 +2946,8 @@ class Telegram(RPCHandler):
             raise RPCException('使用方法: /delstrategy <币种/USDT>')
 
         pair = context.args[0].upper()
+        if not pair.endswith('/USDT:USDT'):
+            pair += '/USDT:USDT'
 
         try:
             strategy_file = '/freqtrade/user_data/strategy_state.json'
@@ -2925,6 +3023,8 @@ class Telegram(RPCHandler):
             # 如果指定了特定交易对
             if context.args and len(context.args) > 0:
                 pair = context.args[0].upper()
+                if not pair.endswith('/USDT:USDT'):
+                    pair += '/USDT:USDT'
 
                 # 检查固定点位策略
                 has_fixed_strategy = (
