@@ -1,6 +1,32 @@
 import json
 
 
+stable_pairs = [
+    'BTC/USDT:USDT',
+    'ETH/USDT:USDT',
+    'BNB/USDT:USDT',
+    'LTC/USDT:USDT',
+    'ADA/USDT:USDT',
+    'XRP/USDT:USDT',
+    'XLM/USDT:USDT',
+    'TRX/USDT:USDT',
+    'USDC/USDT:USDT',
+    'LINK/USDT:USDT',
+    'USDS/USDT:USDT',
+    'DOGE/USDT:USDT',
+    'HBAR/USDT:USDT',
+    'BCH/USDT:USDT',
+    'SOL/USDT:USDT',
+    'DOT/USDT:USDT',
+    'AVAX/USDT:USDT',
+    'OM/USDT:USDT',
+    'SHIB/USDT:USDT',
+    'WBTC/USDT:USDT',
+    'SUI/USDT:USDT',
+    'TON/USDT:USDT',
+]
+
+
 def parse_data(data_str, strategy_type):
     """Parse the CSV-like data string and return a dictionary of pairs to profit values"""
     result = {}
@@ -108,7 +134,7 @@ def main(threshold=-50):
     config['exchange']['pair_whitelist'] = pairs
 
     for pair in coin_monitoring:
-        if pair not in config['exchange']['pair_whitelist']:
+        if pair not in config['exchange']['pair_whitelist'] and pair in stable_pairs:
             config['exchange']['pair_whitelist'].append(pair)
 
     with open('user_data/config.json', 'w') as f:
