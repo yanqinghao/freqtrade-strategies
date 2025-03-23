@@ -99,6 +99,7 @@ def main(threshold=-50):
         strategy_state = json.load(f)
 
     coin_monitoring = strategy_state['coin_monitoring']
+    price_range_thresholds = strategy_state['price_range_thresholds']
 
     # Parse the data
     long_data = parse_data(long_data_str, 'long')
@@ -112,7 +113,11 @@ def main(threshold=-50):
     # Build the output JSON
     output = {'pair_strategy_mode': strategies}
 
-    output_with_monitoring = {'pair_strategy_mode': strategies, 'coin_monitoring': coin_monitoring}
+    output_with_monitoring = {
+        'pair_strategy_mode': strategies,
+        'coin_monitoring': coin_monitoring,
+        'price_range_thresholds': price_range_thresholds,
+    }
 
     # Print to console
     json_str = json.dumps(output, indent=2)

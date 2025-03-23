@@ -3103,11 +3103,42 @@ class Telegram(RPCHandler):
                 # 如果有固定点位策略，单独显示一次
                 if has_coin_monitoring:
                     fixed_strategy_summary = '📊 固定点位策略配置：\n```json\n'
-                    fixed_strategy_summary += json.dumps(
-                        strategy_state['coin_monitoring'], indent=2
-                    )
+                    # fixed_strategy_summary += json.dumps(
+                    #     strategy_state['coin_monitoring'], indent=2
+                    # )
+                    for key, strategies in strategy_state['coin_monitoring'].items():
+                        strategy_summaries = []
+                        for strategy in strategies:
+                            strategy_summaries.append(f"{strategy['direction']},{strategy['entry_points'][0]},{','.join([str(i) for i in strategy['exit_points']])},{strategy['stop_loss']}")
+                        fixed_strategy_summary += f'/setpairstrategy {key} {';'.join(strategy_summaries)}\n'
+
                     fixed_strategy_summary += '\n```'
-                    await self._send_msg(fixed_strategy_summary)
+
+                    # await self._send_msg(fixed_strategy_summary)
+
+                    if len(fixed_strategy_summary) > 3000:
+                        # 创建临时文本文件
+                        import tempfile
+                        import os
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w') as tmp_file:
+                            tmp_file.write(fixed_strategy_summary)
+                            tmp_file_path = tmp_file.name
+
+                        # 发送文件
+                        with open(tmp_file_path, 'rb') as document:
+                            await context.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=document,
+                                filename=f"{pair}_strategies.txt",
+                                caption=f"Generated prompt for {pair}",
+                            )
+
+                        # 删除临时文件
+                        os.unlink(tmp_file_path)
+                    else:
+                        # 如果内容不超过限制，直接发送文本消息
+                        await self._send_msg(fixed_strategy_summary)
 
             # 处理特定交易对参数
             else:
