@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+import io
 import ccxt
 
 # Generate chart image
@@ -33,6 +34,8 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
+    InputMediaPhoto,
+    InputMediaDocument,
 )
 from telegram.constants import MessageLimit, ParseMode
 from telegram.error import BadRequest, NetworkError, TelegramError
@@ -339,6 +342,7 @@ class Telegram(RPCHandler):
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern='update_status_table'),
+            CallbackQueryHandler(self._chart, pattern=r'update_chart(?::(.+))?'),
             CallbackQueryHandler(self._daily, pattern='update_daily'),
             CallbackQueryHandler(self._weekly, pattern='update_weekly'),
             CallbackQueryHandler(self._monthly, pattern='update_monthly'),
@@ -2045,6 +2049,9 @@ class Telegram(RPCHandler):
         callback_path: str = '',
         reload_able: bool = False,
         parse_mode: str = ParseMode.MARKDOWN,
+        photo: BytesIO | None = None,
+        document: io.BufferedReader | None = None,
+        filename: str | None = None,
     ) -> None:
         if reload_able:
             reply_markup = InlineKeyboardMarkup(
@@ -2059,9 +2066,20 @@ class Telegram(RPCHandler):
             return
 
         try:
-            await query.edit_message_text(
-                text=msg, parse_mode=parse_mode, reply_markup=reply_markup
-            )
+            if photo:
+                await query.edit_message_media(
+                    InputMediaPhoto(photo, caption=msg, parse_mode=parse_mode),
+                    reply_markup=reply_markup,
+                )
+            elif document and filename:
+                await query.edit_message_media(
+                    InputMediaDocument(document, filename=filename, caption=msg, parse_mode=parse_mode),
+                    reply_markup=reply_markup,
+                )
+            else:
+                await query.edit_message_text(
+                    text=msg, parse_mode=parse_mode, reply_markup=reply_markup
+                )
         except BadRequest as e:
             if 'not modified' in e.message.lower():
                 pass
@@ -2069,6 +2087,7 @@ class Telegram(RPCHandler):
                 logger.warning('TelegramError: %s', e.message)
         except TelegramError as telegram_err:
             logger.warning('TelegramError: %s! Giving up on that message.', telegram_err.message)
+
 
     async def _send_msg(
         self,
@@ -2079,6 +2098,9 @@ class Telegram(RPCHandler):
         callback_path: str = '',
         reload_able: bool = False,
         query: CallbackQuery | None = None,
+        photo: BytesIO | None = None,
+        document: io.BufferedReader | None = None,
+        filename: str | None = None,
     ) -> None:
         """
         Send given markdown message
@@ -2095,6 +2117,9 @@ class Telegram(RPCHandler):
                 parse_mode=parse_mode,
                 callback_path=callback_path,
                 reload_able=reload_able,
+                photo=photo,
+                document=document,
+                filename=filename,
             )
             return
         if reload_able and self._config['telegram'].get('reload', True):
@@ -2108,28 +2133,70 @@ class Telegram(RPCHandler):
                 reply_markup = ReplyKeyboardMarkup(self._keyboard, resize_keyboard=True)
         try:
             try:
-                await self._app.bot.send_message(
-                    self._config['telegram']['chat_id'],
-                    text=msg,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup,
-                    disable_notification=disable_notification,
-                    message_thread_id=self._config['telegram'].get('topic_id'),
-                )
+                if photo:
+                    await self._app.bot.send_photo(
+                        self._config['telegram']['chat_id'],
+                        photo=photo,
+                        caption=msg,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        disable_notification=disable_notification,
+                        message_thread_id=self._config['telegram'].get('topic_id'),
+                    )
+                elif document and filename:
+                    await self._app.bot.send_message(
+                        self._config['telegram']['chat_id'],
+                        document=document,
+                        filename=filename,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        disable_notification=disable_notification,
+                        message_thread_id=self._config['telegram'].get('topic_id'),
+                    )
+                else:
+                    await self._app.bot.send_message(
+                        self._config['telegram']['chat_id'],
+                        text=msg,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        disable_notification=disable_notification,
+                        message_thread_id=self._config['telegram'].get('topic_id'),
+                    )
             except NetworkError as network_err:
                 # Sometimes the telegram server resets the current connection,
                 # if this is the case we send the message again.
                 logger.warning(
                     'Telegram NetworkError: %s! Trying one more time.', network_err.message
                 )
-                await self._app.bot.send_message(
-                    self._config['telegram']['chat_id'],
-                    text=msg,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup,
-                    disable_notification=disable_notification,
-                    message_thread_id=self._config['telegram'].get('topic_id'),
-                )
+                if photo:
+                    await self._app.bot.send_photo(
+                        self._config['telegram']['chat_id'],
+                        photo=photo,
+                        caption=msg,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        disable_notification=disable_notification,
+                        message_thread_id=self._config['telegram'].get('topic_id'),
+                    )
+                elif document and filename:
+                    await self._app.bot.send_message(
+                        self._config['telegram']['chat_id'],
+                        document=document,
+                        filename=filename,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        disable_notification=disable_notification,
+                        message_thread_id=self._config['telegram'].get('topic_id'),
+                    )
+                else:
+                    await self._app.bot.send_message(
+                        self._config['telegram']['chat_id'],
+                        text=msg,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                        disable_notification=disable_notification,
+                        message_thread_id=self._config['telegram'].get('topic_id'),
+                    )
         except TelegramError as telegram_err:
             logger.warning('TelegramError: %s! Giving up on that message.', telegram_err.message)
 
@@ -2219,6 +2286,35 @@ class Telegram(RPCHandler):
         :param context: callback context
         :return: None
         """
+        query = update.callback_query
+
+        # Initialize context.args if needed
+        if not hasattr(context, 'args'):
+            context.args = []
+
+        # Check if we have parameters
+        if query and ':' in query.data:
+            try:
+                # Parse parameters
+                base, params_str = query.data.split(':', 1)
+                params = {}
+
+                # Simple parsing: param1=value1,param2=value2
+                for item in params_str.split(','):
+                    if '=' in item:
+                        key, value = item.split('=', 1)
+                        params[key] = value
+
+                # Extract parameters
+                if 'pair' in params:
+                    # Make sure context.args is a list
+                    context.args = [params['pair']]
+                    # Add timeframe if available
+                    if 'timeframe' in params:
+                        context.args.append(params['timeframe'])
+            except Exception as e:
+                logger.error(f"Error parsing callback parameters: {e}")
+
         if not context.args or len(context.args) == 0:
             raise RPCException('Usage: /chart <pair> [timeframe]')
 
@@ -2596,12 +2692,45 @@ class Telegram(RPCHandler):
                 f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
-            # 发送图表图像
-            await self._app.bot.send_photo(
-                chat_id=update.effective_chat.id,
+            # # 发送图表图像
+            # await self._app.bot.send_photo(
+            #     chat_id=update.effective_chat.id,
+            #     photo=buf,
+            #     caption=analysis_text,
+            #     message_thread_id=self._config['telegram'].get('topic_id'),
+            # )
+            # Example for chart with parameters
+            def create_callback_data(base_pattern, **params):
+                """Create compact callback data"""
+                if not params:
+                    return base_pattern
+
+                # Create a compact representation
+                # Format: base_pattern:param1=value1,param2=value2
+                params_str = ','.join(f"{k}={v}" for k, v in params.items())
+
+                # Make sure we're under the 64 byte limit
+                if len(f"{base_pattern}:{params_str}") > 60:  # Leave some margin
+                    # If too long, just include the most important params
+                    if 'pair' in params:
+                        return f"{base_pattern}:pair={params['pair']}"
+                    # Or use the first param only
+                    first_key = list(params.keys())[0]
+                    return f"{base_pattern}:{first_key}={params[first_key]}"
+
+                return f"{base_pattern}:{params_str}"
+
+            # Usage:
+            callback_data = create_callback_data('update_chart', pair=pair, timeframe=timeframe)
+
+            logger.info(f'callback data: {callback_data}')
+
+            await self._send_msg(
+                analysis_text,
                 photo=buf,
-                caption=analysis_text,
-                message_thread_id=self._config['telegram'].get('topic_id'),
+                reload_able=True,
+                callback_path=callback_data,
+                query=update.callback_query,
             )
 
         except Exception as e:
@@ -3015,7 +3144,7 @@ class Telegram(RPCHandler):
     @authorized_only
     async def _show_pair_strategy(self, update: Update, context: CallbackContext) -> None:
         """
-        Handler for /showstrategy [pair or all].
+        Handler for /showpairstrategy [pair or all].
         显示交易对的策略参数和自动量化策略配置
         必须传入参数, 要么是 'all' 或者特定交易对
         """
@@ -3023,7 +3152,7 @@ class Telegram(RPCHandler):
             # 检查是否有参数
             if not context.args or len(context.args) == 0:
                 usage_msg = (
-                    '⚠️ 使用方法:\n/showstrategy all - 显示所有交易对策略\n/showstrategy <币种> - 显示特定交易对策略'
+                    '⚠️ 使用方法:\n/showpairstrategy all - 显示所有交易对策略\n/showpairstrategy <币种> - 显示特定交易对策略'
                 )
                 await self._send_msg(usage_msg)
                 return
@@ -3089,7 +3218,7 @@ class Telegram(RPCHandler):
                     summary += summary_line + '\n'
 
                 await self._send_msg(summary)
-                await self._send_msg('使用 /showstrategy <币种> 查看特定交易对的详细策略参数。')
+                await self._send_msg('使用 /showpairstrategy <币种> 查看特定交易对的详细策略参数。')
 
                 # 如果有自动量化策略，单独显示一次
                 if has_pair_strategy_mode:
