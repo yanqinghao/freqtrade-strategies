@@ -343,6 +343,7 @@ class Telegram(RPCHandler):
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern='update_status_table'),
             CallbackQueryHandler(self._chart, pattern=r'update_chart(?::(.+))?'),
+            CallbackQueryHandler(self._prompt, pattern=r'update_prompt(?::(.+))?'),
             CallbackQueryHandler(self._daily, pattern='update_daily'),
             CallbackQueryHandler(self._weekly, pattern='update_weekly'),
             CallbackQueryHandler(self._monthly, pattern='update_monthly'),
@@ -2144,7 +2145,7 @@ class Telegram(RPCHandler):
                         message_thread_id=self._config['telegram'].get('topic_id'),
                     )
                 elif document and filename:
-                    await self._app.bot.send_message(
+                    await self._app.bot.send_document(
                         self._config['telegram']['chat_id'],
                         document=document,
                         filename=filename,
@@ -2723,8 +2724,6 @@ class Telegram(RPCHandler):
             # Usage:
             callback_data = create_callback_data('update_chart', pair=pair, timeframe=timeframe)
 
-            logger.info(f'callback data: {callback_data}')
-
             await self._send_msg(
                 analysis_text,
                 photo=buf,
@@ -2745,6 +2744,33 @@ class Telegram(RPCHandler):
         :param update: message update
         :return: None
         """
+
+        query = update.callback_query
+
+        # Initialize context.args if needed
+        if not hasattr(context, 'args'):
+            context.args = []
+
+        # Check if we have parameters
+        if query and ':' in query.data:
+            try:
+                # Parse parameters
+                base, params_str = query.data.split(':', 1)
+                params = {}
+
+                # Simple parsing: param1=value1,param2=value2
+                for item in params_str.split(','):
+                    if '=' in item:
+                        key, value = item.split('=', 1)
+                        params[key] = value
+
+                # Extract parameters
+                if 'pair' in params:
+                    # Make sure context.args is a list
+                    context.args = [params['pair']]
+            except Exception as e:
+                logger.error(f"Error parsing callback parameters: {e}")
+
         if not context.args or len(context.args) == 0:
             raise RPCException('Usage: /prompt <pair>')
 
@@ -2774,18 +2800,44 @@ class Telegram(RPCHandler):
 
                 # 发送文件
                 with open(tmp_file_path, 'rb') as document:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
+                    def create_callback_data(base_pattern, **params):
+                        """Create compact callback data"""
+                        if not params:
+                            return base_pattern
+
+                        # Create a compact representation
+                        # Format: base_pattern:param1=value1,param2=value2
+                        params_str = ','.join(f"{k}={v}" for k, v in params.items())
+
+                        # Make sure we're under the 64 byte limit
+                        if len(f"{base_pattern}:{params_str}") > 60:  # Leave some margin
+                            # If too long, just include the most important params
+                            if 'pair' in params:
+                                return f"{base_pattern}:pair={params['pair']}"
+                            # Or use the first param only
+                            first_key = list(params.keys())[0]
+                            return f"{base_pattern}:{first_key}={params[first_key]}"
+
+                        return f"{base_pattern}:{params_str}"
+
+                    # Usage:
+                    callback_data = create_callback_data('update_prompt', pair=pair)
+                    await self._send_msg(
+                        f"Generated prompt for {pair}",
                         document=document,
-                        filename=f"{pair}_prompt.txt",
-                        caption=f"Generated prompt for {pair}",
+                        filename=f"{pair.split('/')[0]}_prompt.txt",
+                        reload_able=True,
+                        callback_path=callback_data,
+                        query=update.callback_query,
                     )
 
                 # 删除临时文件
                 os.unlink(tmp_file_path)
             else:
                 # 如果内容不超过限制，直接发送文本消息
-                await self._send_msg(f"```{prompt}```")
+                await self._send_msg(f"```{prompt}```",reload_able=True,
+                        callback_path=callback_data,
+                        query=update.callback_query,)
 
         except Exception as e:
             logger.exception('Error during prompt gen: %s', str(e))
