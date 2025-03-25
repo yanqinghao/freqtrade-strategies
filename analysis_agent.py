@@ -112,7 +112,7 @@ class CryptoTechnicalAnalyst:
                 if hasattr(timestamp, 'strftime'):
                     timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S')
 
-                table_row = f"| {timestamp} | {row['open']:.2f} | {row['high']:.2f} | {row['low']:.2f} | {row['close']:.2f} | {row['volume']:.2f} |"
+                table_row = f"| {timestamp} | {row['open']} | {row['high']} | {row['low']} | {row['close']} | {row['volume']} |"
                 table_rows.append(table_row)
 
             # Combine table parts
@@ -871,7 +871,7 @@ class CryptoTechnicalAnalyst:
             signal_map = {'bullish': '🔼', 'bearish': '🔽', 'neutral': '◀▶'}
 
             # 创建表格行
-            row = f"| {timeframe} | {price:.2f} | {signal_map.get(combined['signal'], '?')} | {combined['confidence']}% | "
+            row = f"| {timeframe} | {price} | {signal_map.get(combined['signal'], '?')} | {combined['confidence']}% | "
             row += f"{signal_map.get(trend, '?')} | {signal_map.get(oscillators, '?')} | "
             row += f"{signal_map.get(momentum, '?')} | {signal_map.get(volatility, '?')} | {signal_map.get(volume, '?')} |"
 
@@ -924,7 +924,7 @@ class CryptoTechnicalAnalyst:
             price = results['last_price']
 
             # Add timeframe header
-            output += f"<b>⏱️ {timeframe.upper()} Timeframe</b> | Price: <code>{price:.2f}</code>\n"
+            output += f"<b>⏱️ {timeframe.upper()} Timeframe</b> | Price: <code>{price}</code>\n"
 
             # Combined signal
             combined = signals['combined']
