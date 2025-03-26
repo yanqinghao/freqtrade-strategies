@@ -61,7 +61,7 @@ class KamaFama_Dynamic(IStrategy):
             {'method': 'CooldownPeriod', 'stop_duration_candles': 5},
         ]
 
-    minimal_roi = {'0': 0.087, '372': 0.058, '861': 0.029}
+    minimal_roi = {'0': 0.087, '372': 0.068, '861': 0.045}
     cc_long = {}
     cc_short = {}
 
