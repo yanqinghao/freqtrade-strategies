@@ -463,6 +463,86 @@ class KamaFama_Dynamic(IStrategy):
         pair = trade.pair
         direction = 'short' if trade.is_short else 'long'
 
+        # 初次遇到交易时，保存初始stake金额
+        if trade.get_custom_data('initial_stake') is None:
+            trade.set_custom_data('initial_stake', trade.stake_amount)
+
+        # 先检查是否需要补仓
+        if current_profit < 0:
+            # 计算亏损百分比（确保为正数）
+            loss_percentage = abs(current_profit)
+
+            # 检查当前仓位金额是否已超过最大限制
+            if trade.stake_amount >= 400:
+                logger.info(f"{pair}: 当前仓位金额 {trade.stake_amount} 已超过最大限制 400，不再补仓")
+            else:
+                # 根据亏损百分比动态计算补仓金额
+                dca_amount = 0
+                dca_tag = ''
+
+                # 亏损20%以上，补仓50%
+                if loss_percentage >= 0.20:
+                    dca_amount = trade.stake_amount * 0.5
+                    dca_tag = f"{direction}_dca_loss_20pct"
+                # 亏损15%以上，补仓40%
+                elif loss_percentage >= 0.15:
+                    dca_amount = trade.stake_amount * 0.4
+                    dca_tag = f"{direction}_dca_loss_15pct"
+                # 亏损10%以上，补仓30%
+                elif loss_percentage >= 0.10:
+                    dca_amount = trade.stake_amount * 0.3
+                    dca_tag = f"{direction}_dca_loss_10pct"
+
+                # 如果需要补仓
+                if dca_amount > 0:
+                    # 确保补仓后总金额不超过400
+                    if trade.stake_amount + dca_amount > 400:
+                        dca_amount = 400 - trade.stake_amount
+
+                    # 确保补仓金额在min_stake和max_stake之间
+                    if min_stake and dca_amount < min_stake:
+                        # 如果最小补仓金额会导致总金额超过400，则不补仓
+                        if trade.stake_amount + min_stake > 400:
+                            logger.info(f"{pair}: 最小补仓金额 {min_stake} 会导致总金额超过 400，不补仓")
+                            dca_amount = 0
+                        else:
+                            dca_amount = min_stake
+
+                    if dca_amount > max_stake:
+                        dca_amount = max_stake
+
+                    # 如果计算出有效的补仓金额，则执行补仓
+                    if dca_amount > 0:
+                        logger.info(
+                            f"{pair} 触发补仓: 亏损 {loss_percentage:.2%}, "
+                            f"当前仓位 {trade.stake_amount}, 补仓金额 {dca_amount}"
+                        )
+                        # 记录本次补仓信息
+                        last_dca_time = current_time.timestamp()
+                        trade.set_custom_data('last_dca_time', last_dca_time)
+
+                        # 在补仓之前做好准备更新initial_stake
+                        # 注意：trade.stake_amount会在freqtrade内部处理补仓后自动更新
+                        # 我们需要在下一次调用时检测并更新initial_stake
+                        trade.set_custom_data('last_stake_amount', trade.stake_amount)
+                        trade.set_custom_data('pending_dca_amount', dca_amount)
+
+                        return dca_amount, dca_tag
+
+        # 检查并更新补仓后的initial_stake
+        last_stake_amount = trade.get_custom_data('last_stake_amount')
+        pending_dca_amount = trade.get_custom_data('pending_dca_amount')
+
+        if last_stake_amount is not None and pending_dca_amount is not None:
+            # 如果确认补仓已经执行（stake_amount已增加）
+            if trade.stake_amount > last_stake_amount:
+                # 更新initial_stake为当前的总stake金额
+                trade.set_custom_data('initial_stake', trade.stake_amount)
+                # 清除临时变量
+                trade.set_custom_data('last_stake_amount', None)
+                trade.set_custom_data('pending_dca_amount', None)
+                logger.info(f"{pair}: 补仓后更新initial_stake为 {trade.stake_amount}")
+
         # 检查是否是固定点位监控的交易对
         if (
             pair in self.coin_monitoring
