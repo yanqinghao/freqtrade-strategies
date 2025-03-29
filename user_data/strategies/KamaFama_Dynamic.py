@@ -479,17 +479,41 @@ class KamaFama_Dynamic(IStrategy):
                 # 根据亏损百分比动态计算补仓金额
                 dca_amount = 0
                 dca_tag = ''
+                # 获取当前RSI值
+                dataframe, _ = self.dp.get_analyzed_dataframe(
+                    pair=trade.pair, timeframe=self.timeframe
+                )
+                current_candle = dataframe.iloc[-1].squeeze()
+                # 获取当前和前几个周期的RSI值用于判断趋势变化
+                current_rsi_84 = current_candle['rsi_84']
+                previous_rsi_84 = dataframe.iloc[-2]['rsi_84']  # 前一个周期的RSI
 
                 # 亏损20%以上，补仓50%
                 if loss_percentage >= 0.20:
                     dca_amount = trade.stake_amount * 0.5
                     dca_tag = f"{direction}_dca_loss_20pct"
                 # 亏损15%以上，补仓40%
-                elif loss_percentage >= 0.15:
+                elif loss_percentage >= 0.15 and (
+                    (direction == 'long' and current_rsi_84 > previous_rsi_84)
+                    or (  # 多头RSI开始上升
+                        direction == 'short' and current_rsi_84 < previous_rsi_84
+                    )  # 空头RSI开始下降
+                ):
                     dca_amount = trade.stake_amount * 0.4
                     dca_tag = f"{direction}_dca_loss_15pct"
                 # 亏损10%以上，补仓30%
-                elif loss_percentage >= 0.10:
+                elif loss_percentage >= 0.10 and (
+                    (
+                        direction == 'long'
+                        and current_rsi_84 > previous_rsi_84
+                        and current_rsi_84 > 30
+                    )
+                    or (
+                        direction == 'short'
+                        and current_rsi_84 < previous_rsi_84
+                        and current_rsi_84 < 70
+                    )
+                ):
                     dca_amount = trade.stake_amount * 0.3
                     dca_tag = f"{direction}_dca_loss_10pct"
 
@@ -533,14 +557,19 @@ class KamaFama_Dynamic(IStrategy):
         last_stake_amount = trade.get_custom_data('last_stake_amount')
         pending_dca_amount = trade.get_custom_data('pending_dca_amount')
 
-        if last_stake_amount is not None and pending_dca_amount is not None:
+        if (
+            last_stake_amount != 0
+            and pending_dca_amount != 0
+            and last_stake_amount is not None
+            and pending_dca_amount is not None
+        ):
             # 如果确认补仓已经执行（stake_amount已增加）
             if trade.stake_amount > last_stake_amount:
                 # 更新initial_stake为当前的总stake金额
                 trade.set_custom_data('initial_stake', trade.stake_amount)
                 # 清除临时变量
-                trade.set_custom_data('last_stake_amount', None)
-                trade.set_custom_data('pending_dca_amount', None)
+                trade.set_custom_data('last_stake_amount', 0)
+                trade.set_custom_data('pending_dca_amount', 0)
                 logger.info(f"{pair}: 补仓后更新initial_stake为 {trade.stake_amount}")
 
         # 检查是否是固定点位监控的交易对
