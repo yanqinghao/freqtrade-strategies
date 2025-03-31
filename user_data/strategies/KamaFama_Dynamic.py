@@ -298,7 +298,7 @@ class KamaFama_Dynamic(IStrategy):
                 )
                 return True
 
-        return False
+        return True
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
