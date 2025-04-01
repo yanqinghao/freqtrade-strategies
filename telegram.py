@@ -185,7 +185,7 @@ class Telegram(RPCHandler):
             ['/count', '/start', '/stop', '/help'],
             ['/chart', '/analysis', '/prompt', '/promptjson'],
             ['/addpair', '/delpair'],
-            ['/setpairstrategy', '/delpairstrategy', '/showpairstrategy'],
+            ['/setpairstrategy', '/delpairstrategy', '/showpairstrategy', '/setpairstrategyauto'],
         ]
         # do not allow commands with mandatory arguments and critical cmds
         # TODO: DRY! - its not good to list all valid cmds here. But otherwise
@@ -242,6 +242,7 @@ class Telegram(RPCHandler):
             r'/addpair$',
             r'/delpair$',
             r'/setpairstrategy$',
+            r'/setpairstrategyauto$',
             r'/delpairstrategy$',
             r'/showpairstrategy$',
         ]
@@ -337,6 +338,7 @@ class Telegram(RPCHandler):
             CommandHandler('addpair', self._add_pair),
             CommandHandler('delpair', self._del_pair),
             CommandHandler('setpairstrategy', self._set_pair_strategy),
+            CommandHandler('setpairstrategyauto', self._set_pair_strategy_auto),
             CommandHandler('delpairstrategy', self._del_pair_strategy),
             CommandHandler('showpairstrategy', self._show_pair_strategy),
         ]
@@ -3072,6 +3074,82 @@ class Telegram(RPCHandler):
             self._rpc._rpc_reload_config()
             await self._send_msg(f'交易对 {', '.join(pair)} 已从白名单移除')
 
+
+    @authorized_only
+    async def _set_pair_strategy_auto(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /setpairstrategyauto.
+        设置交易对的策略参数 - 从消息文本中获取JSON而不是命令参数
+        """
+        if not context.args or len(context.args) == 0:
+            raise RPCException('使用方法: /setpairstrategyauto 币种1/USDT,long;币种2/USDT,short')
+
+        # 获取消息文本，删除命令本身
+        message_text = update.message.text
+        if message_text.startswith('/setpairstrategyauto'):
+            message_text = message_text[len(f'/setpairstrategyauto') :].strip()
+
+        # 检查是否有JSON内容
+        if not message_text:
+            await self._send_msg('❌ 未提供策略交易对。请在命令后发送交易对数据。')
+            return
+
+        # 尝试解析JSON内容
+        try:
+            with open('/freqtrade/user_data/strategy_state.json', 'r') as f:
+                strategy_state = json.load(f)
+
+            for pair_str in message_text.split(';'):
+                parts = pair_str.split(',')
+                pair = parts[0].upper()
+                if not pair.endswith('/USDT:USDT'):
+                    pair += '/USDT:USDT'
+
+                new_direction = parts[1].lower()  # 获取新的 direction
+
+                config = self._rpc._freqtrade.strategy.calculate_coin_points(pair, new_direction)
+                if not config:
+                    self._send_msg(f'❌ 无法为 {pair} 计算策略参数。')
+                    continue
+
+                if pair in strategy_state['coin_monitoring']:
+                    # 如果 pair 存在，过滤掉与新 direction 相同的策略
+                    strategy_state['coin_monitoring'][pair] = [
+                        strategy for strategy in strategy_state['coin_monitoring'][pair]
+                        if strategy['direction'] != new_direction
+                    ]
+                    # 如果列表变空，则删除该 pair 的键（可选）
+                    if not strategy_state['coin_monitoring'][pair]:
+                        del strategy_state['coin_monitoring'][pair]
+
+                # 如果 pair 已删除或原本不存在，直接 append 新策略
+                if pair not in strategy_state['coin_monitoring']:
+                    strategy_state['coin_monitoring'][pair] = []
+
+                strategy_state['coin_monitoring'][pair].append(
+                    {
+                        'direction': new_direction,
+                        'auto': True,
+                        **config
+                    }
+                )
+
+            self._rpc._freqtrade.strategy.coin_monitoring = strategy_state['coin_monitoring']
+
+            # strategy_state['coin_monitoring'][pair] = strategy_json
+
+            with open('/freqtrade/user_data/strategy_state.json', 'w') as f:
+                json.dump(strategy_state, f, indent=4)
+
+            await self._send_msg(f"✅ 成功添加 {pair} 到交易对白名单，并设置了相应的策略参数。")
+
+        except json.JSONDecodeError as e:
+            await self._send_msg(f"❌ JSON格式无效: {str(e)}。请提供有效的JSON字符串。")
+        except Exception as e:
+            logger.exception('设置交易对策略时出错: %s', str(e))
+            await self._send_msg(f"❌ 设置交易对策略时出错: {str(e)}")
+
+
     @authorized_only
     async def _set_pair_strategy(self, update: Update, context: CallbackContext) -> None:
         """
@@ -3108,17 +3186,19 @@ class Telegram(RPCHandler):
             except:
                 strategy_json = []
                 for i in message_text.split(';'):
+                    parts = i.split(',')  # 先将字符串按逗号分割成列表
+                    direction = parts[0]  # 第一个元素是 direction
+                    entry_point = float(parts[1])  # 第二个元素是 entry_point
+                    stop_loss = float(parts[-1])  # 最后一个元素是 stop_loss
+                    # 中间的部分（除了 direction, entry_point 和 stop_loss）作为 exit_points
+                    exit_points = [float(x) for x in parts[2:-1]]  # 动态提取退出点
+
                     strategy_json.append(
                         {
-                            'direction': i.split(',')[0],
-                            'entry_points': [float(i.split(',')[1])],
-                            'exit_points': [
-                                float(i.split(',')[2]),
-                                float(i.split(',')[3]),
-                                float(i.split(',')[4]),
-                            ],
-                            'stop_loss': float(i.split(',')[5]),
-                            'risk_reward': None,
+                            'direction': direction,
+                            'entry_points': [entry_point],
+                            'exit_points': exit_points,  # 动态数量的退出点
+                            'stop_loss': stop_loss,
                         }
                     )
 
@@ -3127,10 +3207,9 @@ class Telegram(RPCHandler):
 
             strategy_state['coin_monitoring'][pair] = strategy_json
 
+            self._rpc._freqtrade.strategy.coin_monitoring = strategy_state['coin_monitoring']
             with open('/freqtrade/user_data/strategy_state.json', 'w') as f:
                 json.dump(strategy_state, f, indent=4)
-
-            self._rpc._rpc_reload_config()
 
             await self._send_msg(f"✅ 成功添加 {pair} 到交易对白名单，并设置了相应的策略参数。")
 
@@ -3143,11 +3222,11 @@ class Telegram(RPCHandler):
     @authorized_only
     async def _del_pair_strategy(self, update: Update, context: CallbackContext) -> None:
         """
-        Handler for /delstrategy <pair>.
+        Handler for /delpairstrategy <pair>.
         删除交易对的策略参数
         """
         if not context.args or len(context.args) < 1:
-            raise RPCException('使用方法: /delstrategy <币种/USDT>')
+            raise RPCException('使用方法: /delpairstrategy <币种/USDT>')
 
         pair = context.args[0].upper()
         if not pair.endswith('/USDT:USDT'):
@@ -3179,15 +3258,9 @@ class Telegram(RPCHandler):
             with open(strategy_file, 'w') as f:
                 json.dump(strategy_state, f, indent=4)
 
-            # 考虑是否从白名单中移除
-            config = self._rpc._freqtrade.config
-            if pair in config['exchange']['pair_whitelist']:
-                config['exchange']['pair_whitelist'].remove(pair)
-                self._rpc._freqtrade.config = config
-                await self._send_msg(f"✅ 已删除 {pair} 的策略参数并从白名单中移除。")
-            else:
-                await self._send_msg(f"✅ 已删除 {pair} 的策略参数。注意：该交易对不在白名单中。")
-            self._rpc._rpc_reload_config()
+            self._rpc._freqtrade.strategy.coin_monitoring.pop(pair)
+
+            await self._send_msg(f"✅ 成功删除 {pair} 的策略参数。")
 
         except Exception as e:
             logger.exception('删除策略参数时出错: %s', str(e))
@@ -3209,25 +3282,11 @@ class Telegram(RPCHandler):
                 await self._send_msg(usage_msg)
                 return
 
-            strategy_file = '/freqtrade/user_data/strategy_state.json'
-
-            # 读取当前策略状态
-            try:
-                with open(strategy_file, 'r') as f:
-                    strategy_state = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                await self._send_msg('❌ 未找到策略状态文件或文件格式无效。')
-                return
-
             # 检查固定点位策略
-            has_coin_monitoring = (
-                'coin_monitoring' in strategy_state and strategy_state['coin_monitoring']
-            )
+            has_coin_monitoring = len(self._rpc._freqtrade.strategy.coin_monitoring) > 0
 
             # 检查自动量化策略
-            has_pair_strategy_mode = (
-                'pair_strategy_mode' in strategy_state and strategy_state['pair_strategy_mode']
-            )
+            has_pair_strategy_mode = len(self._rpc._freqtrade.strategy.pair_strategy_mode) > 0
 
             if not has_coin_monitoring and not has_pair_strategy_mode:
                 await self._send_msg('⚠️ 当前没有任何交易对的策略参数。')
@@ -3235,6 +3294,9 @@ class Telegram(RPCHandler):
 
             # 处理特定参数
             param = context.args[0].upper()
+
+            coin_monitoring = self._rpc._freqtrade.strategy.coin_monitoring
+            pair_strategy_mode = self._rpc._freqtrade.strategy.pair_strategy_mode
 
             # 处理 'all' 参数 - 显示所有交易对
             if param == 'ALL':
@@ -3244,9 +3306,9 @@ class Telegram(RPCHandler):
                 # 合并两种策略的所有交易对
                 all_pairs = set()
                 if has_coin_monitoring:
-                    all_pairs.update(strategy_state['coin_monitoring'].keys())
+                    all_pairs.update(coin_monitoring.keys())
                 if has_pair_strategy_mode:
-                    all_pairs.update(strategy_state['pair_strategy_mode'].keys())
+                    all_pairs.update(pair_strategy_mode.keys())
 
                 # 按字母顺序排序
                 sorted_pairs = sorted(all_pairs)
@@ -3258,12 +3320,12 @@ class Telegram(RPCHandler):
                     strategy_types = []
 
                     # 检查是否有固定点位策略
-                    if has_coin_monitoring and pair in strategy_state['coin_monitoring']:
+                    if has_coin_monitoring and pair in coin_monitoring:
                         strategy_types.append('固定点位')
 
                     # 检查是否有自动量化策略
-                    if has_pair_strategy_mode and pair in strategy_state['pair_strategy_mode']:
-                        mode = strategy_state['pair_strategy_mode'][pair]
+                    if has_pair_strategy_mode and pair in pair_strategy_mode:
+                        mode = pair_strategy_mode[pair]
                         strategy_types.append(f"自动量化({mode})")
 
                     summary_line += ', '.join(strategy_types)
@@ -3276,7 +3338,7 @@ class Telegram(RPCHandler):
                 if has_pair_strategy_mode:
                     auto_strategy_summary = '🤖 自动量化策略配置：\n```json\n'
                     auto_strategy_summary += json.dumps(
-                        strategy_state['pair_strategy_mode'], indent=2
+                        pair_strategy_mode, indent=2
                     )
                     auto_strategy_summary += '\n```'
                     await self._send_msg(auto_strategy_summary)
@@ -3287,7 +3349,7 @@ class Telegram(RPCHandler):
                     # fixed_strategy_summary += json.dumps(
                     #     strategy_state['coin_monitoring'], indent=2
                     # )
-                    for key, strategies in strategy_state['coin_monitoring'].items():
+                    for key, strategies in coin_monitoring.items():
                         strategy_summaries = []
                         for strategy in strategies:
                             strategy_summaries.append(f"{strategy['direction']},{strategy['entry_points'][0]},{','.join([str(i) for i in strategy['exit_points']])},{strategy['stop_loss']}")
@@ -3329,12 +3391,12 @@ class Telegram(RPCHandler):
 
                 # 检查固定点位策略
                 has_fixed_strategy = (
-                    has_coin_monitoring and pair in strategy_state['coin_monitoring']
+                    has_coin_monitoring and pair in coin_monitoring
                 )
 
                 # 检查自动量化策略
                 has_auto_strategy = (
-                    has_pair_strategy_mode and pair in strategy_state['pair_strategy_mode']
+                    has_pair_strategy_mode and pair in pair_strategy_mode
                 )
 
                 if not has_fixed_strategy and not has_auto_strategy:
@@ -3343,7 +3405,7 @@ class Telegram(RPCHandler):
 
                 # 发送固定点位策略信息 - 以便于复制修改的格式
                 if has_fixed_strategy:
-                    strategy_json = strategy_state['coin_monitoring'][pair]
+                    strategy_json = coin_monitoring[pair]
                     await self._send_msg(f"📋 {pair} 的固定点位策略参数：")
 
                     # 从JSON提取币种名称(移除'/USDT:USDT')
@@ -3352,46 +3414,34 @@ class Telegram(RPCHandler):
                     # 检查策略格式类型并提取相应参数
                     if isinstance(strategy_json, list) and len(strategy_json) > 0:
                         # 新格式: 列表格式
-                        strategy_data = strategy_json[0]  # 取第一个元素
+                        strs = []
+                        for strategy_data in strategy_json:  # 取第一个元素
 
-                        # 提取方向和价格点位
-                        direction = strategy_data.get('direction', 'long').lower()
+                            # 提取方向和价格点位
+                            direction = strategy_data.get('direction', 'long').lower()
 
-                        # 收集所有价格点位
-                        price_points = []
+                            # 收集所有价格点位
+                            price_points = []
 
-                        # 添加入场点位
-                        if 'entry_points' in strategy_data:
-                            for price in strategy_data['entry_points']:
-                                price_points.append(str(price))
+                            # 添加入场点位
+                            if 'entry_points' in strategy_data:
+                                for price in strategy_data['entry_points']:
+                                    price_points.append(str(price))
 
-                        # 添加出场点位
-                        if 'exit_points' in strategy_data:
-                            for price in strategy_data['exit_points']:
-                                price_points.append(str(price))
+                            # 添加出场点位
+                            if 'exit_points' in strategy_data:
+                                for price in strategy_data['exit_points']:
+                                    price_points.append(str(price))
 
-                        # 添加止损
-                        if 'stop_loss' in strategy_data and strategy_data['stop_loss'] is not None:
-                            price_points.append(str(strategy_data['stop_loss']))
-                    else:
-                        # 旧格式: 字典格式
-                        direction = strategy_json.get('position_side', 'long').lower()
-                        price_points = []
+                            # 添加止损
+                            if 'stop_loss' in strategy_data and strategy_data['stop_loss'] is not None:
+                                price_points.append(str(strategy_data['stop_loss']))
 
-                        # 提取价格点位
-                        if 'levels' in strategy_json:
-                            for level in strategy_json['levels']:
-                                if 'price' in level:
-                                    price_points.append(str(level['price']))
-
-                        # 提取止损价格
-                        stop_loss = str(strategy_json.get('sl_price', ''))
-                        if stop_loss and stop_loss != 'null':
-                            price_points.append(stop_loss)
+                            strs.append(f"{direction},{','.join(price_points)}")
 
                     # 格式化成便于复制的命令格式
                     formatted_command = (
-                        f"/setpairstrategy {coin_name} {direction},{','.join(price_points)}"
+                        f"/setpairstrategy {coin_name} {';'.join(strs)}"
                     )
                     await self._send_msg(f"```\n{formatted_command}\n```")
 
@@ -3402,7 +3452,7 @@ class Telegram(RPCHandler):
 
                 # 发送自动量化策略信息
                 if has_auto_strategy:
-                    mode = strategy_state['pair_strategy_mode'][pair]
+                    mode = pair_strategy_mode[pair]
                     await self._send_msg(f"🤖 {pair} 的自动量化策略：{mode}")
 
         except Exception as e:

@@ -165,49 +165,29 @@ class KamaFama_Dynamic(IStrategy):
 
     def load_strategy_mode_config(self):
         """
-        从外部JSON文件加载策略模式配置
+        从外部JSON文件加载策略模式配置，不处理auto逻辑
         """
-
-        # 获取策略切换状态文件路径
         state_file = 'user_data/strategy_state.json'
 
-        # 检查文件是否存在
         if not os.path.exists(state_file):
-            if getattr(self, 'dp', None) and hasattr(self.dp, 'send_msg'):
-                self.dp.send_msg(f"警告: 策略模式配置文件 {state_file} 不存在，将使用默认多头策略")
-                logger.info(f"警告: 策略模式配置文件 {state_file} 不存在，将使用默认多头策略")
-            else:
-                logger.info(f"警告: 策略模式配置文件 {state_file} 不存在，将使用默认多头策略")
+            logger.info(f"警告: 策略模式配置文件 {state_file} 不存在，将使用默认多头策略")
             return
 
         try:
-            # 读取JSON文件
             with open(state_file, 'r') as f:
                 state_data = json.load(f)
 
-            # 获取策略模式配置
             if 'pair_strategy_mode' in state_data:
                 self.pair_strategy_mode = state_data['pair_strategy_mode']
-
-            # 获取固定点位监控配置
             if 'coin_monitoring' in state_data:
                 self.coin_monitoring = state_data['coin_monitoring']
-
             if 'price_range_thresholds' in state_data:
                 self.price_range_thresholds = state_data['price_range_thresholds']
 
-            if getattr(self, 'dp', None) and hasattr(self.dp, 'send_msg'):
-                self.dp.send_msg(f"成功加载策略模式文件: {self.pair_strategy_mode}")
-                logger.info(f"成功加载策略模式文件: {self.pair_strategy_mode}")
-            else:
-                logger.info(f"成功加载策略模式文件: {self.pair_strategy_mode}")
+            logger.info(f"成功加载策略模式文件: {self.pair_strategy_mode}")
 
         except Exception as e:
-            if getattr(self, 'dp', None) and hasattr(self.dp, 'send_msg'):
-                self.dp.send_msg(f"加载策略模式配置时出错: {e}")
-                logger.info(f"加载策略模式配置时出错: {e}")
-            else:
-                logger.info(f"加载策略模式配置时出错: {e}")
+            logger.info(f"加载策略模式配置时出错: {e}")
 
     def custom_stoploss(
         self,
@@ -226,6 +206,105 @@ class KamaFama_Dynamic(IStrategy):
         # 止损后的处理逻辑应该放在 exit_positions 里处理
         return None
 
+    def calculate_coin_points(self, pair: str, direction: str):
+        df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+        if df is None or df.empty:
+            logger.warning(f"无法获取 {pair} 的5m数据，跳过自动设置")
+            return
+
+        # 取最近288根K线（相当于24小时的5m数据）
+        candles_to_use = 288  # 24小时 × 12根/小时
+        if len(df) < candles_to_use:
+            logger.warning(f"{pair} 数据不足 {candles_to_use} 根K线，仅有 {len(df)} 根，跳过自动设置")
+            return
+
+        recent_df = df.tail(candles_to_use)  # 取最后288根K线
+
+        # 计算最近288根K线的最高价和最低价
+        recent_high = recent_df['high'].max()
+        recent_low = recent_df['low'].min()
+        # price_range = recent_high - recent_low
+
+        config = {}
+        if direction == 'long':
+            config['entry_points'] = [recent_low * 1.005]  # 略高于最低价
+            config['exit_points'] = [
+                recent_low * 1.005 * 1.02,  # 第一目标
+                recent_low * 1.005 * 1.04,  # 第二目标
+                recent_low * 1.005 * 1.06,  # 接近最高价
+            ]
+            config['stop_loss'] = recent_low * 0.95  # 略低于最低价
+
+        elif direction == 'short':
+            config['entry_points'] = [recent_high * 0.995]  # 略低于最高价
+            config['exit_points'] = [
+                recent_high * 0.995 * 0.98,  # 第一目标
+                recent_high * 0.995 * 0.96,  # 第二目标
+                recent_high * 0.995 * 0.94,  # 接近最低价
+            ]
+            config['stop_loss'] = recent_low * 1.05
+
+        return config
+
+    def reload_coin_monitoring(self, pair: str):
+        # 处理coin_monitoring的auto设置（仅在live或dry_run模式下）
+        if (
+            self.config.get('runmode', None) in ('live', 'dry_run')
+            and pair in self.coin_monitoring
+            and hasattr(self, 'dp')
+        ):
+            for config in self.coin_monitoring[pair]:
+                if config.get('auto', False) and not config.get(
+                    'auto_initialized', False
+                ):  # 检查auto且未初始化
+                    # 获取5m数据
+                    df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+                    if df is None or df.empty:
+                        logger.warning(f"无法获取 {pair} 的5m数据，跳过自动设置")
+                        continue
+
+                    # 取最近288根K线（相当于24小时的5m数据）
+                    candles_to_use = 288  # 24小时 × 12根/小时
+                    if len(df) < candles_to_use:
+                        logger.warning(f"{pair} 数据不足 {candles_to_use} 根K线，仅有 {len(df)} 根，跳过自动设置")
+                        continue
+
+                    recent_df = df.tail(candles_to_use)  # 取最后288根K线
+
+                    # 计算最近288根K线的最高价和最低价
+                    recent_high = recent_df['high'].max()
+                    recent_low = recent_df['low'].min()
+                    # price_range = recent_high - recent_low
+
+                    # 根据方向设置入场和退出点位
+                    direction = config.get('direction', 'long')
+                    if direction == 'long':
+                        config['entry_points'] = [recent_low * 1.005]  # 略高于最低价
+                        config['exit_points'] = [
+                            recent_low * 1.005 * 1.02,  # 第一目标
+                            recent_low * 1.005 * 1.04,  # 第二目标
+                            recent_low * 1.005 * 1.06,  # 接近最高价
+                        ]
+                    elif direction == 'short':
+                        config['entry_points'] = [recent_high * 0.995]  # 略低于最高价
+                        config['exit_points'] = [
+                            recent_high * 0.995 * 0.98,  # 第一目标
+                            recent_high * 0.995 * 0.96,  # 第二目标
+                            recent_high * 0.995 * 0.94,  # 接近最低价
+                        ]
+                    # 标记为已初始化
+                    config['auto_initialized'] = True
+                    logger.info(
+                        f"自动设置 {pair} ({direction}) 使用最近 {candles_to_use} 根5m数据: "
+                        f"entry_points={config['entry_points']}, "
+                        f"exit_points={config['exit_points']}"
+                    )
+                    self.dp.send_msg(
+                        f"自动设置 {pair} ({direction}) 使用最近 {candles_to_use} 根5m数据: "
+                        f"entry_points={config['entry_points']}, "
+                        f"exit_points={config['exit_points']}"
+                    )
+
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # 获取当前pair
         pair = metadata['pair']
@@ -233,6 +312,8 @@ class KamaFama_Dynamic(IStrategy):
         # 更新当前candle的时间（用于回测模式下的时间判断）
         if len(dataframe) > 0:
             self.current_candle_date[pair] = dataframe.iloc[-1]['date']
+
+        self.reload_coin_monitoring(pair)
 
         # PCT CHANGE
         dataframe['change'] = 100 / dataframe['open'] * dataframe['close'] - 100
