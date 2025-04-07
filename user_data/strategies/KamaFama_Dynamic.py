@@ -181,6 +181,12 @@ class KamaFama_Dynamic(IStrategy):
                 self.pair_strategy_mode = state_data['pair_strategy_mode']
             if 'coin_monitoring' in state_data:
                 self.coin_monitoring = state_data['coin_monitoring']
+                for pair in self.coin_monitoring.keys():
+                    for i in range(len(self.coin_monitoring[pair])):
+                        self.coin_monitoring[pair][i] = {
+                            **self.coin_monitoring[pair][i],
+                            'auto_initialized': False,
+                        }
             if 'price_range_thresholds' in state_data:
                 self.price_range_thresholds = state_data['price_range_thresholds']
 
@@ -253,6 +259,7 @@ class KamaFama_Dynamic(IStrategy):
             and pair in self.coin_monitoring
             and hasattr(self, 'dp')
         ):
+            has_data = False
             for config in self.coin_monitoring[pair]:
                 if config.get('auto', False) and not config.get(
                     'auto_initialized', False
@@ -292,17 +299,30 @@ class KamaFama_Dynamic(IStrategy):
                             recent_high * 0.995 * 0.96,  # 第二目标
                             recent_high * 0.995 * 0.94,  # 接近最低价
                         ]
+                    has_data = True
+
+            if has_data:
+                with open('/freqtrade/user_data/strategy_state.json', 'r') as f:
+                    strategy_state = json.load(f)
+                strategy_state['coin_monitoring'] = self.coin_monitoring
+                with open('/freqtrade/user_data/strategy_state.json', 'w') as f:
+                    json.dump(strategy_state, f, indent=4)
+
+                for config in self.coin_monitoring[pair]:
                     # 标记为已初始化
                     config['auto_initialized'] = True
+                    direction = config['direction']
+                    entry_point = config['entry_points'][0]
+                    exit_points = ','.join([str(i) for i in config['exit_points']])
                     logger.info(
                         f"自动设置 {pair} ({direction}) 使用最近 {candles_to_use} 根5m数据: "
-                        f"entry_points={config['entry_points']}, "
-                        f"exit_points={config['exit_points']}"
+                        f"entry_points={entry_point}, "
+                        f"exit_points={exit_points}"
                     )
                     self.dp.send_msg(
                         f"自动设置 {pair} ({direction}) 使用最近 {candles_to_use} 根5m数据: "
-                        f"entry_points={config['entry_points']}, "
-                        f"exit_points={config['exit_points']}"
+                        f"entry_points={entry_point}, "
+                        f"exit_points={exit_points}"
                     )
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -574,7 +594,7 @@ class KamaFama_Dynamic(IStrategy):
                     dca_amount = trade.stake_amount * 0.5
                     dca_tag = f"{direction}_dca_loss_20pct"
                 # 亏损15%以上，补仓40%
-                elif loss_percentage >= 0.15 and (
+                elif loss_percentage >= 0.125 and (
                     (direction == 'long' and current_rsi_84 > previous_rsi_84)
                     or (  # 多头RSI开始上升
                         direction == 'short' and current_rsi_84 < previous_rsi_84
@@ -583,7 +603,7 @@ class KamaFama_Dynamic(IStrategy):
                     dca_amount = trade.stake_amount * 0.4
                     dca_tag = f"{direction}_dca_loss_15pct"
                 # 亏损10%以上，补仓30%
-                elif loss_percentage >= 0.10 and (
+                elif loss_percentage >= 0.075 and (
                     (
                         direction == 'long'
                         and current_rsi_84 > previous_rsi_84
