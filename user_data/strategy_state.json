@@ -1,15 +1,15 @@
 {
   "pair_strategy_mode": {
-    "NEO/USDT:USDT": "short",
-    "TAO/USDT:USDT": "short",
-    "BIGTIME/USDT:USDT": "short",
-    "RARE/USDT:USDT": "long",
-    "ENA/USDT:USDT": "long",
-    "TON/USDT:USDT": "short",
-    "1000PEPE/USDT:USDT": "short",
-    "EOS/USDT:USDT": "short",
-    "ZRO/USDT:USDT": "short",
-    "NEAR/USDT:USDT": "short",
-    "ARK/USDT:USDT": "long"
+    "POPCAT/USDT:USDT": "long",
+    "NKN/USDT:USDT": "short",
+    "NEIROETH/USDT:USDT": "long",
+    "1000BONK/USDT:USDT": "short",
+    "LPT/USDT:USDT": "long",
+    "ENJ/USDT:USDT": "short",
+    "XRP/USDT:USDT": "long",
+    "MAGIC/USDT:USDT": "short",
+    "TURBO/USDT:USDT": "short",
+    "GOAT/USDT:USDT": "long",
+    "VOXEL/USDT:USDT": "long"
   }
 }

@@ -16,6 +16,7 @@ import itertools
 import logging
 import os
 import json
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +415,19 @@ class KamaFama_Dynamic(IStrategy):
 
         # 增加活跃交易检查，如果在回测模式下，则不进行检查
         if self.config.get('runmode', None) in ('live', 'dry_run'):
+
+            # 检查是否有活跃交易
+            active_trades = Trade.get_trades_proxy(is_open=True, pair=pair)
+
+            # 如果有活跃交易，并且pair在监控配置中，需要关闭自动计算
+            if active_trades and pair in self.coin_monitoring:
+                for trade in active_trades:
+                    direction = 'short' if trade.is_short else 'long'
+                    current_time = datetime.now(trade.open_date_utc.tzinfo)
+                    # 如果刚开仓成功（5分钟内的交易），关闭自动计算
+                    if (current_time - trade.open_date_utc).total_seconds() < 300:  # 5分钟内
+                        self.disable_auto_calculation(pair, direction)
+
             # 根据最后一行数据的收盘价进行检查
             if len(dataframe) > 0:
                 current_price = dataframe.iloc[-1]['close']
@@ -537,6 +551,96 @@ class KamaFama_Dynamic(IStrategy):
         dataframe.loc[:, 'exit_long'] = 0
         dataframe.loc[:, 'exit_short'] = 0
         return dataframe
+
+    # 1. 补仓后重新计算止盈点位的函数
+    def recalculate_exit_points_after_dca(self, trade, direction):
+        pair = trade.pair
+
+        # 查找该交易对的监控配置
+        if pair in self.coin_monitoring:
+            for config in self.coin_monitoring[pair]:
+                if config.get('direction') == direction:
+                    # 保存原始入场点位
+                    entry_points = config.get('entry_points', [])
+                    if not entry_points:
+                        continue
+
+                    # 获取当前价格作为新的成本价
+                    cost_price = trade.open_rate
+
+                    # 根据方向重新计算止盈点位
+                    if direction == 'long':
+                        config['exit_points'] = [
+                            cost_price * 1.005,  # 第一目标 +2%
+                            cost_price * 1.02,  # 第二目标 +4%
+                            cost_price * 1.04,  # 第三目标 +6%
+                        ]
+                    elif direction == 'short':
+                        config['exit_points'] = [
+                            cost_price * 0.995,  # 第一目标 -2%
+                            cost_price * 0.98,  # 第二目标 -4%
+                            cost_price * 0.96,  # 第三目标 -6%
+                        ]
+
+                    # 关闭自动计算
+                    config['auto'] = False
+
+                    # 更新持久化文件
+                    self.update_strategy_state_file()
+
+                    # 记录日志
+                    logger.info(f"补仓后重新计算 {pair} 的止盈点位: {config['exit_points']}")
+                    if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                        self.dp.send_msg(f"补仓后重新计算 {pair} 的止盈点位: {config['exit_points']}")
+
+                    break
+
+    # 2. 开单后关闭自动计算
+    def disable_auto_calculation(self, pair, direction):
+        if pair in self.coin_monitoring:
+            for config in self.coin_monitoring[pair]:
+                if config.get('direction') == direction and config.get('auto', False):
+                    config['auto'] = False
+                    logger.info(f"已关闭 {pair} 的自动计算功能")
+                    self.update_strategy_state_file()
+                    break
+
+    # 3. 更新持久化文件的函数
+    def update_strategy_state_file(self):
+        try:
+            file_path = '/freqtrade/user_data/strategy_state.json'
+            # 简单的文件锁机制
+            lock_file = f"{file_path}.lock"
+
+            # 尝试创建锁文件
+            try:
+                with open(lock_file, 'x') as f:
+                    pass
+            except FileExistsError:
+                # 如果锁文件已存在，等待然后重试
+                time.sleep(0.1)
+                return self.update_strategy_state_file()
+
+            try:
+                # 读取当前内容
+                with open(file_path, 'r') as f:
+                    strategy_state = json.load(f)
+
+                # 更新内容
+                strategy_state['coin_monitoring'] = self.coin_monitoring
+                strategy_state['pair_strategy_mode'] = self.pair_strategy_mode
+                strategy_state['price_range_thresholds'] = self.price_range_thresholds
+
+                # 写入更新后的内容
+                with open(file_path, 'w') as f:
+                    json.dump(strategy_state, f, indent=4)
+
+            finally:
+                # 无论如何都要删除锁文件
+                os.remove(lock_file)
+
+        except Exception as e:
+            logger.error(f"更新策略状态文件失败: {e}")
 
     def adjust_trade_position(
         self,
@@ -672,6 +776,13 @@ class KamaFama_Dynamic(IStrategy):
                 trade.set_custom_data('last_stake_amount', 0)
                 trade.set_custom_data('pending_dca_amount', 0)
                 logger.info(f"{pair}: 补仓后更新initial_stake为 {trade.stake_amount}")
+
+                # 新增: 补仓成功后，重新计算止盈点位
+                direction = 'short' if trade.is_short else 'long'
+                self.recalculate_exit_points_after_dca(trade, direction)
+
+                # 重置退出阶段，从第一阶段开始计算
+                trade.set_custom_data('exit_stage', 0)
 
         # 检查是否是固定点位监控的交易对
         if (
