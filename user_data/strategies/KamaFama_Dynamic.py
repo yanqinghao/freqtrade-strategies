@@ -690,7 +690,9 @@ class KamaFama_Dynamic(IStrategy):
             last_dca_time = trade.get_custom_data('last_dca_time')
             if last_dca_time is not None:
                 cooldown_minutes = 60  # 30分钟冷却期 (可根据交易对波动性调整)
-                last_dca_datetime = datetime.fromtimestamp(last_dca_time)
+                last_dca_datetime = datetime.fromtimestamp(
+                    last_dca_time, trade.open_date_utc.tzinfo
+                )
                 if current_time < last_dca_datetime + timedelta(minutes=cooldown_minutes):
                     logger.info(f"{pair}: 补仓冷却期未结束，上次补仓时间: {last_dca_datetime}")
                     return None
