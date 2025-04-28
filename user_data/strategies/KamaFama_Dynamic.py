@@ -605,6 +605,17 @@ class KamaFama_Dynamic(IStrategy):
                     self.update_strategy_state_file()
                     break
 
+    # 2. 开单后关闭自动计算
+    def enable_auto_calculation(self, pair, direction):
+        if pair in self.coin_monitoring:
+            for config in self.coin_monitoring[pair]:
+                if config.get('direction') == direction:
+                    config['auto'] = True
+                    logger.info(f"已开启 {pair} 的自动计算功能")
+                    self.reload_coin_monitoring(pair)
+                    self.update_strategy_state_file()
+                    break
+
     # 3. 更新持久化文件的函数
     def update_strategy_state_file(self):
         try:
@@ -674,20 +685,49 @@ class KamaFama_Dynamic(IStrategy):
 
         # 先检查是否需要补仓
         if current_profit < 0:
+
+            # 检查补仓冷却期
+            last_dca_time = trade.get_custom_data('last_dca_time')
+            if last_dca_time is not None:
+                cooldown_minutes = 60  # 30分钟冷却期 (可根据交易对波动性调整)
+                last_dca_datetime = datetime.fromtimestamp(last_dca_time)
+                if current_time < last_dca_datetime + timedelta(minutes=cooldown_minutes):
+                    logger.info(f"{pair}: 补仓冷却期未结束，上次补仓时间: {last_dca_datetime}")
+                    return None
+
+            # 检查当前波动性 - 为当前交易对获取适合的数据
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair=trade.pair, timeframe=self.timeframe)
+
+            if dataframe is None or len(dataframe) < 20:  # 需要至少20根K线
+                return None
+
+            # 计算最近20根K线的波动性 (标准差)
+            recent_df = dataframe.tail(20)
+            volatility = recent_df['close'].pct_change().std() * 100  # 转为百分比
+
+            # 设置波动性阈值：波动性太大时不补仓
+            max_volatility_threshold = 3.0  # 3%，可根据交易对特性调整
+            if volatility > max_volatility_threshold:
+                logger.info(
+                    f"{pair}: 当前波动性 ({volatility:.2f}%) 高于阈值 ({max_volatility_threshold}%)，暂不补仓"
+                )
+                return None
+
             # 计算亏损百分比（确保为正数）
             loss_percentage = abs(current_profit)
 
             # 检查当前仓位金额是否已超过最大限制
             if trade.stake_amount >= 400:
                 logger.info(f"{pair}: 当前仓位金额 {trade.stake_amount} 已超过最大限制 400，不再补仓")
+                return None
             else:
                 # 根据亏损百分比动态计算补仓金额
                 dca_amount = 0
                 dca_tag = ''
                 # 获取当前RSI值
-                dataframe, _ = self.dp.get_analyzed_dataframe(
-                    pair=trade.pair, timeframe=self.timeframe
-                )
+                # dataframe, _ = self.dp.get_analyzed_dataframe(
+                #     pair=trade.pair, timeframe=self.timeframe
+                # )
                 current_candle = dataframe.iloc[-1].squeeze()
                 # 获取当前和前几个周期的RSI值用于判断趋势变化
                 current_rsi_84 = current_candle['rsi_84']
@@ -837,6 +877,7 @@ class KamaFama_Dynamic(IStrategy):
                             direction == 'short' and current_rate <= sorted_exit_points[0]
                         ):
                             logger.info(f"触发唯一退出点位 {pair}: 当前价格 {current_rate} - 全部退出")
+                            self.enable_auto_calculation(pair, direction)
                             return (
                                 -trade.stake_amount,
                                 f"{direction}_single_tp_{sorted_exit_points[0]}",
@@ -866,6 +907,7 @@ class KamaFama_Dynamic(IStrategy):
                             ):
                                 trade.set_custom_data('exit_stage', 2)
                                 logger.info(f"触发第二级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余全部仓位")
+                                self.enable_auto_calculation(pair, direction)
                                 return (
                                     -trade.stake_amount,
                                     f"{direction}_tp2_of2_{sorted_exit_points[1]}",
@@ -877,6 +919,7 @@ class KamaFama_Dynamic(IStrategy):
                             ):
                                 # 从第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
+                                self.enable_auto_calculation(pair, direction)
                                 return -trade.stake_amount, f'{direction}_tp1_pullback_cost'
 
                     # 3个或更多点位的情况 - 原有的30%/50%/全部逻辑
@@ -898,15 +941,22 @@ class KamaFama_Dynamic(IStrategy):
                                 logger.info(f"触发第二级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余仓位的50%")
                                 return -(remaining_stake * 0.5), f"long_tp2_{sorted_exit_points[1]}"
 
+                            elif exit_stage == 2 and current_rate >= sorted_exit_points[2]:
+                                logger.info(f"触发第三级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余全部仓位")
+                                self.enable_auto_calculation(pair, direction)
+                                return -trade.stake_amount, f"long_tp3_{sorted_exit_points[2]}"
+
                             # 处理回撤情况 - 多头
                             elif exit_stage == 1 and current_rate <= cost_price:
                                 # 第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
+                                self.enable_auto_calculation(pair, direction)
                                 return -trade.stake_amount, 'long_tp1_pullback_cost'
 
                             elif exit_stage == 2 and current_rate <= sorted_exit_points[0]:
                                 # 第二阶段回撤到第一点位，清仓
                                 logger.info(f"{pair} 从第二点位回撤至第一点位 {sorted_exit_points[0]}，清仓")
+                                self.enable_auto_calculation(pair, direction)
                                 return -trade.stake_amount, 'long_tp2_pullback_tp1'
 
                         # 空头策略
@@ -929,15 +979,22 @@ class KamaFama_Dynamic(IStrategy):
                                     f"short_tp2_{sorted_exit_points[1]}",
                                 )
 
+                            elif exit_stage == 2 and current_rate <= sorted_exit_points[2]:
+                                logger.info(f"触发第三级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余全部仓位")
+                                self.enable_auto_calculation(pair, direction)
+                                return -trade.stake_amount, f"short_tp3_{sorted_exit_points[2]}"
+
                             # 处理回撤情况 - 空头
                             elif exit_stage == 1 and current_rate >= cost_price:
                                 # 第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
+                                self.enable_auto_calculation(pair, direction)
                                 return -trade.stake_amount, 'short_tp1_pullback_cost'
 
                             elif exit_stage == 2 and current_rate >= sorted_exit_points[0]:
                                 # 第二阶段回撤到第一点位，清仓
                                 logger.info(f"{pair} 从第二点位回撤至第一点位 {sorted_exit_points[0]}，清仓")
+                                self.enable_auto_calculation(pair, direction)
                                 return -trade.stake_amount, 'short_tp2_pullback_tp1'
 
         return None
