@@ -741,22 +741,20 @@ class KamaFama_Dynamic(IStrategy):
                 logger.info(f"{pair}: 当前仓位金额 {trade.stake_amount} 已超过最大限制 400，不再补仓")
                 return None
             else:
-                # 根据亏损百分比动态计算补仓金额
-                dca_amount = 0
-                dca_tag = ''
-                # 获取当前RSI值
-                # dataframe, _ = self.dp.get_analyzed_dataframe(
-                #     pair=trade.pair, timeframe=self.timeframe
-                # )
-                current_candle = dataframe.iloc[-1].squeeze()
+                # 方法1: 基于亏损百分比的补仓策略 (原有逻辑)
+                dca_amount_1 = 0
+                dca_tag_1 = ''
+
                 # 获取当前和前几个周期的RSI值用于判断趋势变化
+                current_candle = dataframe.iloc[-1].squeeze()
                 current_rsi_84 = current_candle['rsi_84']
                 previous_rsi_84 = dataframe.iloc[-2]['rsi_84']  # 前一个周期的RSI
+                available_length = len(dataframe)
 
                 # 亏损20%以上，补仓50%
                 if loss_percentage >= 0.20:
-                    dca_amount = trade.stake_amount * 0.5
-                    dca_tag = f"{direction}_dca_loss_20pct"
+                    dca_amount_1 = trade.stake_amount * 0.5
+                    dca_tag_1 = f"{direction}_dca_loss_20pct"
                 # 亏损15%以上，补仓40%
                 elif loss_percentage >= 0.125 and (
                     (direction == 'long' and current_rsi_84 > previous_rsi_84)
@@ -764,8 +762,8 @@ class KamaFama_Dynamic(IStrategy):
                         direction == 'short' and current_rsi_84 < previous_rsi_84
                     )  # 空头RSI开始下降
                 ):
-                    dca_amount = trade.stake_amount * 0.4
-                    dca_tag = f"{direction}_dca_loss_15pct"
+                    dca_amount_1 = trade.stake_amount * 0.4
+                    dca_tag_1 = f"{direction}_dca_loss_15pct"
                 # 亏损10%以上，补仓30%
                 elif loss_percentage >= 0.075 and (
                     (
@@ -779,8 +777,85 @@ class KamaFama_Dynamic(IStrategy):
                         and current_rsi_84 < 70
                     )
                 ):
-                    dca_amount = trade.stake_amount * 0.3
-                    dca_tag = f"{direction}_dca_loss_10pct"
+                    dca_amount_1 = trade.stake_amount * 0.3
+                    dca_tag_1 = f"{direction}_dca_loss_10pct"
+
+                # 方法2: 基于技术指标的补仓策略 (新增逻辑)
+                dca_amount_2 = 0
+                dca_tag_2 = ''
+
+                # 检查当前K线是否满足入场条件
+                if direction == 'long':
+                    # 使用与多头入场相同的技术指标条件
+                    if available_length >= 288:
+                        indicator_condition = (
+                            (current_candle['kama'] > current_candle['fama'])
+                            & (current_candle['fama'] > current_candle['mama'] * 0.981)
+                            & (current_candle['r_14'] < -61.3)
+                            & (current_candle['mama_diff'] < -0.025)
+                            & (current_candle['cti'] < -0.715)
+                            & (
+                                dataframe['close'].rolling(48).max().iloc[-1]
+                                >= current_candle['close'] * 1.05
+                            )
+                            & (
+                                dataframe['close'].rolling(288).max().iloc[-1]
+                                >= current_candle['close'] * 1.125
+                            )
+                            & (current_candle['rsi_84'] < 60)
+                            & (current_candle['rsi_112'] < 60)
+                        )
+                        if indicator_condition:
+                            # 指标条件满足，根据亏损程度决定补仓比例
+                            if loss_percentage >= 0.15:
+                                dca_amount_2 = trade.stake_amount * 0.5  # 大亏损时补仓更多
+                                dca_tag_2 = f"{direction}_dca_indicator_high_loss"
+                            elif loss_percentage >= 0.075:
+                                dca_amount_2 = trade.stake_amount * 0.3  # 中等亏损
+                                dca_tag_2 = f"{direction}_dca_indicator_med_loss"
+                            elif loss_percentage >= 0.03:
+                                dca_amount_2 = trade.stake_amount * 0.2  # 小额亏损
+                                dca_tag_2 = f"{direction}_dca_indicator_small_loss"
+
+                else:  # short
+                    # 使用与空头入场相同的技术指标条件
+                    if available_length >= 288:
+                        indicator_condition = (
+                            (current_candle['kama'] < current_candle['fama'])
+                            & (current_candle['fama'] < current_candle['mama'] * 1.019)
+                            & (current_candle['r_14'] > -38.7)
+                            & (current_candle['mama_diff'] > 0.025)
+                            & (current_candle['cti'] > 0.715)
+                            & (
+                                dataframe['close'].rolling(48).min().iloc[-1]
+                                <= current_candle['close'] * 0.95
+                            )
+                            & (
+                                dataframe['close'].rolling(288).min().iloc[-1]
+                                <= current_candle['close'] * 0.875
+                            )
+                            & (current_candle['rsi_84'] > 40)
+                            & (current_candle['rsi_112'] > 40)
+                        )
+                        if indicator_condition:
+                            # 指标条件满足，根据亏损程度决定补仓比例
+                            if loss_percentage >= 0.15:
+                                dca_amount_2 = trade.stake_amount * 0.5  # 大亏损时补仓更多
+                                dca_tag_2 = f"{direction}_dca_indicator_high_loss"
+                            elif loss_percentage >= 0.075:
+                                dca_amount_2 = trade.stake_amount * 0.3  # 中等亏损
+                                dca_tag_2 = f"{direction}_dca_indicator_med_loss"
+                            elif loss_percentage >= 0.03:
+                                dca_amount_2 = trade.stake_amount * 0.2  # 小额亏损
+                                dca_tag_2 = f"{direction}_dca_indicator_small_loss"
+
+                # 选择两种方法中补仓金额较大的那个
+                if dca_amount_1 >= dca_amount_2:
+                    dca_amount = dca_amount_1
+                    dca_tag = dca_tag_1
+                else:
+                    dca_amount = dca_amount_2
+                    dca_tag = dca_tag_2
 
                 # 如果需要补仓
                 if dca_amount > 0:
@@ -804,15 +879,14 @@ class KamaFama_Dynamic(IStrategy):
                     if dca_amount > 0:
                         logger.info(
                             f"{pair} 触发补仓: 亏损 {loss_percentage:.2%}, "
-                            f"当前仓位 {trade.stake_amount}, 补仓金额 {dca_amount}"
+                            f"当前仓位 {trade.stake_amount}, 补仓金额 {dca_amount}, "
+                            f"触发原因: {dca_tag}"
                         )
                         # 记录本次补仓信息
                         last_dca_time = current_time.timestamp()
                         trade.set_custom_data('last_dca_time', last_dca_time)
 
                         # 在补仓之前做好准备更新initial_stake
-                        # 注意：trade.stake_amount会在freqtrade内部处理补仓后自动更新
-                        # 我们需要在下一次调用时检测并更新initial_stake
                         trade.set_custom_data('last_stake_amount', trade.stake_amount)
                         trade.set_custom_data('pending_dca_amount', dca_amount)
 
