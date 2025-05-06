@@ -260,6 +260,24 @@ class KamaFama_Dynamic(IStrategy):
             and pair in self.coin_monitoring
             and hasattr(self, 'dp')
         ):
+            if pair in self.pair_strategy_mode:
+                strategies = [
+                    config
+                    for config in self.coin_monitoring[pair]
+                    if (config['direction'] == self.pair_strategy_mode[pair])
+                    or (not config.get('auto', False))
+                ]
+                if self.pair_strategy_mode[pair] not in [
+                    strategy['direction'] for strategy in strategies
+                ]:
+                    self.coin_monitoring[pair] = [
+                        {
+                            'direction': self.pair_strategy_mode[pair],
+                            'auto': True,
+                            'entry_points': [],
+                            'exit_points': [],
+                        }
+                    ]
             has_data = False
             for config in self.coin_monitoring[pair]:
                 if config.get('auto', False) and not config.get(
@@ -571,15 +589,15 @@ class KamaFama_Dynamic(IStrategy):
                     # 根据方向重新计算止盈点位
                     if direction == 'long':
                         config['exit_points'] = [
-                            cost_price * 1.005,  # 第一目标 +2%
-                            cost_price * 1.02,  # 第二目标 +4%
-                            cost_price * 1.04,  # 第三目标 +6%
+                            cost_price * 1.02,  # 第一目标 +2%
+                            cost_price * 1.04,  # 第二目标 +4%
+                            cost_price * 1.06,  # 第三目标 +6%
                         ]
                     elif direction == 'short':
                         config['exit_points'] = [
-                            cost_price * 0.995,  # 第一目标 -2%
-                            cost_price * 0.98,  # 第二目标 -4%
-                            cost_price * 0.96,  # 第三目标 -6%
+                            cost_price * 0.98,  # 第一目标 -2%
+                            cost_price * 0.96,  # 第二目标 -4%
+                            cost_price * 0.94,  # 第三目标 -6%
                         ]
 
                     # 关闭自动计算
