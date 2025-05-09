@@ -4,8 +4,9 @@ import pandas as pd
 from typing import List, Dict
 import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
+# Load blacklist
 with open('./tools/black_list.json', 'r') as f:
     BLACKLIST_PAIRS = json.load(f)
 
@@ -24,6 +25,29 @@ def get_24h_ticker() -> List[Dict]:
     return response.json()
 
 
+def get_top_coins_by_market_cap(limit: int = 100) -> Dict:
+    """从CoinGecko获取市值排名前N的加密货币"""
+    coins_per_page = 250  # CoinGecko API限制每页最多250个
+    pages_needed = (limit + coins_per_page - 1) // coins_per_page
+
+    all_coins = []
+    for page in range(1, pages_needed + 1):
+        url = f'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={coins_per_page}&page={page}'
+        print(f'获取CoinGecko市值数据，页面 {page}/{pages_needed}...')
+
+        try:
+            response = requests.get(url)
+            response.raise_for_status()  # 如果请求失败则抛出异常
+            coins = response.json()
+            all_coins.extend(coins)
+        except Exception as e:
+            print(f"获取CoinGecko数据时出错: {e}")
+            break
+
+    # 确保我们只返回限制数量的币种
+    return all_coins[:limit]
+
+
 def format_pair(symbol: str) -> str:
     """格式化交易对名称"""
     if symbol.endswith('USDT'):
@@ -32,15 +56,33 @@ def format_pair(symbol: str) -> str:
     return symbol
 
 
+def create_market_cap_dict(coins: List[Dict]) -> Dict[str, float]:
+    """创建从币种符号到市值的映射字典"""
+    market_cap_dict = {}
+    for coin in coins:
+        # 将符号转换为大写，以匹配Binance格式
+        symbol = coin['symbol'].upper()
+        market_cap = coin.get('market_cap', 0)
+        market_cap_dict[symbol] = market_cap
+    return market_cap_dict
+
+
 def filter_and_sort_pairs(
-    min_volume: float = 100000000, min_listing_days: int = 180
+    top_coins, min_volume: float = 100000000, min_listing_days: int = 180
 ) -> pd.DataFrame:
-    """筛选并排序交易对，过滤掉上线时间少于指定天数的币种"""
+    """筛选并排序交易对，基于交易量、上线时间和市值"""
     print('获取交易所基本信息...')
     exchange_info = get_futures_exchange_info()
 
     print('获取24小时行情...')
     tickers = get_24h_ticker()
+
+    print('获取市值排名前100的币种...')
+    # top_coins = get_top_coins_by_market_cap(limit=market_cap_limit)
+    market_cap_dict = create_market_cap_dict(top_coins)
+
+    # 创建顶级市值币种符号列表（用于过滤）
+    top_market_cap_symbols = [coin['symbol'].upper() for coin in top_coins]
 
     # 创建DataFrame
     df = pd.DataFrame(tickers)
@@ -91,8 +133,18 @@ def filter_and_sort_pairs(
 
     df['status'] = df['symbol'].map(lambda x: symbols_info.get(x, {}).get('status', 'UNKNOWN'))
 
-    # 筛选条件
-    df = df[(df['quoteVolume'] > min_volume) & (df['status'] == 'TRADING')]  # 交易量筛选  # 状态筛选
+    # 添加基础币种符号列（不带USDT后缀）
+    df['base_symbol'] = df['symbol'].apply(lambda x: x[:-4] if x.endswith('USDT') else x)
+
+    # 添加市值列
+    df['market_cap'] = df['base_symbol'].map(lambda x: market_cap_dict.get(x, 0))
+
+    # 筛选条件: 交易量、状态和在前100市值列表中
+    df = df[(df['quoteVolume'] > min_volume) & (df['status'] == 'TRADING')]
+
+    # 筛选市值前100的币种（如果在CoinGecko列表中）
+    # 注意：不是所有币种都能在CoinGecko找到对应的市值数据
+    df = df[df['base_symbol'].isin(top_market_cap_symbols) | (df['market_cap'] > 0)]
 
     # 添加格式化的交易对名称
     df['formatted_symbol'] = df['symbol'].apply(format_pair)
@@ -100,18 +152,21 @@ def filter_and_sort_pairs(
     # 排除黑名单中的交易对
     df = df[~df['formatted_symbol'].isin(temp_blacklist)]
 
-    # 排序并选择列
-    df = df.sort_values('quoteVolume', ascending=False)
+    # 首先按市值排序，然后按交易量排序
+    df = df.sort_values(['market_cap', 'quoteVolume'], ascending=[False, False])
 
     result_df = df[
-        ['symbol', 'formatted_symbol', 'quoteVolume', 'priceChangePercent', 'status']
+        ['symbol', 'formatted_symbol', 'quoteVolume', 'market_cap', 'priceChangePercent', 'status']
     ].copy()
 
     # 转换交易量为百万USDT
     result_df['quoteVolume'] = result_df['quoteVolume'] / 1_000_000
 
+    # 转换市值为百万USDT
+    result_df['market_cap'] = result_df['market_cap'] / 1_000_000
+
     # 重命名列
-    result_df.columns = ['原始交易对', '交易对', '24h交易量(百万USDT)', '24h涨跌幅(%)', '状态']
+    result_df.columns = ['原始交易对', '交易对', '24h交易量(百万USDT)', '市值(百万USDT)', '24h涨跌幅(%)', '状态']
 
     return result_df
 
@@ -141,21 +196,30 @@ def main():
     MIN_VOLUME = 100000000  # 1亿USDT
     TARGET_COUNT = 50  # 目标交易对数量
     MIN_LISTING_DAYS = 180  # 币种上线至少180天（约半年）
+    MARKET_CAP_LIMIT = 100  # 市值排名前100名
 
     # 获取并筛选交易对数据
     print('分析交易对...')
-    df = filter_and_sort_pairs(min_volume=MIN_VOLUME, min_listing_days=MIN_LISTING_DAYS)
+
+    top_coins = get_top_coins_by_market_cap(limit=MARKET_CAP_LIMIT)
+
+    df = filter_and_sort_pairs(
+        min_volume=MIN_VOLUME, min_listing_days=MIN_LISTING_DAYS, top_coins=top_coins
+    )
 
     # 如果交易对数量不足，减少交易量要求
-    while len(df) < TARGET_COUNT and MIN_VOLUME > 1000000:  # 最低限制为100万USDT
+    while len(df) < TARGET_COUNT and MIN_VOLUME > 100000000 * 0.3:  # 最低限制为100万USDT
         MIN_VOLUME = MIN_VOLUME * 0.8  # 每次减少20%
-        print(f"\n交易对数量不足，降低交易量要求至: {MIN_VOLUME/1_000_000:.1f}M USDT")
-        df = filter_and_sort_pairs(min_volume=MIN_VOLUME, min_listing_days=MIN_LISTING_DAYS)
+        print(f"\n交易对数量不足，降低交易量要求至: {MIN_VOLUME / 1_000_000:.1f}M USDT")
+        df = filter_and_sort_pairs(
+            min_volume=MIN_VOLUME, min_listing_days=MIN_LISTING_DAYS, top_coins=top_coins
+        )
 
     # 显示结果
     print('\n=== 交易对分析结果 ===')
-    print(f"\n筛选条件:")
-    print(f"- 最小24h交易量: {MIN_VOLUME/1_000_000:,.1f} 百万USDT")
+    print('\n筛选条件:')
+    print(f"- 最小24h交易量: {MIN_VOLUME / 1_000_000:,.1f} 百万USDT")
+    print(f"- 市值排名限制: 前 {MARKET_CAP_LIMIT}")
     print(f"- 目标数量: {TARGET_COUNT}")
     print(f"- 已排除的交易对: {len(BLACKLIST_PAIRS)}个")
     print(f"- 最短上线时间: {MIN_LISTING_DAYS}天")
