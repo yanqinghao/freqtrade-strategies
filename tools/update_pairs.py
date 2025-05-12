@@ -194,9 +194,9 @@ def main():
     # 配置
     CONFIG_PATH = 'user_data/config.json'
     MIN_VOLUME = 100000000  # 1亿USDT
-    TARGET_COUNT = 50  # 目标交易对数量
+    TARGET_COUNT = 80  # 目标交易对数量
     MIN_LISTING_DAYS = 180  # 币种上线至少180天（约半年）
-    MARKET_CAP_LIMIT = 100  # 市值排名前100名
+    MARKET_CAP_LIMIT = 200  # 市值排名前100名
 
     # 获取并筛选交易对数据
     print('分析交易对...')

@@ -78,7 +78,7 @@ class KamaFama_Dynamic(IStrategy):
     current_candle_date = {}
 
     # Stoploss:
-    stoploss = -0.345
+    stoploss = -1
 
     # Sell Params
     sell_fastx = IntParameter(50, 100, default=84, space='sell', optimize=True)
@@ -91,6 +91,7 @@ class KamaFama_Dynamic(IStrategy):
     trailing_stop_positive = 0.002
     trailing_stop_positive_offset = 0.05
     trailing_only_offset_is_reached = True
+    max_entry_position_adjustment = 0
 
     use_custom_stoploss = True
 
@@ -475,6 +476,32 @@ class KamaFama_Dynamic(IStrategy):
                 dataframe = self._populate_short_entry(dataframe, metadata)
 
         return dataframe
+
+    def confirm_trade_exit(
+        self,
+        pair: str,
+        trade: Trade,
+        order_type: str,
+        amount: float,
+        rate: float,
+        time_in_force: str,
+        exit_reason: str,
+        current_time: datetime,
+        **kwargs,
+    ) -> bool:
+        """
+        Called right before executing a trade exit order.
+        This method checks if the exit is due to ROI and re-enables auto calculation if needed.
+        """
+        direction = 'short' if trade.is_short else 'long'
+
+        # Check if this is a ROI exit
+        if exit_reason.upper().startswith('ROI'):
+            logger.info(f"{pair}: Exit triggered by ROI - re-enabling auto calculation")
+            self.enable_auto_calculation(pair, direction)
+
+        # Always confirm the exit
+        return True
 
     def _populate_fixed_entry(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
