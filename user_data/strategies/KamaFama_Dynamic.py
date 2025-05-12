@@ -1192,6 +1192,7 @@ class KamaFama_Dynamic(IStrategy):
                             # 第三个点位：全部退出
                             trade.set_custom_data('exit_stage', 3)
                             logger.info(f"触发第三级退出点位 {pair}: 当前价格 {current_rate} - 出售所有剩余仓位")
+                            self.enable_auto_calculation(pair, direction)
                             return f"{direction}_tp3_{sorted_exit_points[2]}"
         else:
             # 如果不满足固定点位监控的条件，使用原有退出逻辑
