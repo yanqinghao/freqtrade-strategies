@@ -2,6 +2,7 @@
 from freqtrade.strategy.interface import IStrategy
 from functools import reduce
 from pandas import DataFrame, Series
+import numpy as np
 
 # --------------------------------
 import talib.abstract as ta
@@ -17,6 +18,7 @@ import logging
 import os
 import json
 import time
+import ccxt
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +169,10 @@ class KamaFama_Dynamic(IStrategy):
 
     def load_strategy_mode_config(self):
         """
-        从外部JSON文件加载策略模式配置，不处理auto逻辑
+        从外部JSON文件加载策略模式配置并处理策略转换情况：
+        - 删除不再推荐做空的交易对的空头逻辑
+        - 确保策略模式与监控配置保持一致
+        - 默认使用多头策略
         """
         state_file = 'user_data/strategy_state.json'
 
@@ -179,20 +184,102 @@ class KamaFama_Dynamic(IStrategy):
             with open(state_file, 'r') as f:
                 state_data = json.load(f)
 
+            # 加载策略模式配置
             if 'pair_strategy_mode' in state_data:
                 self.pair_strategy_mode = state_data['pair_strategy_mode']
-            if 'coin_monitoring' in state_data:
-                self.coin_monitoring = state_data['coin_monitoring']
-                for pair in self.coin_monitoring.keys():
-                    for i in range(len(self.coin_monitoring[pair])):
-                        self.coin_monitoring[pair][i] = {
-                            **self.coin_monitoring[pair][i],
-                            'auto_initialized': False,
-                        }
+
+            # 加载价格范围阈值
             if 'price_range_thresholds' in state_data:
                 self.price_range_thresholds = state_data['price_range_thresholds']
 
+            # 加载并处理固定点位监控配置
+            if 'coin_monitoring' in state_data:
+                self.coin_monitoring = state_data['coin_monitoring']
+                updated_configs = False
+
+                # 处理每个交易对的监控配置
+                for pair in list(self.coin_monitoring.keys()):
+                    # 获取该交易对的当前策略模式(默认为'long')
+                    current_mode = self.pair_strategy_mode.get(pair, 'long')
+
+                    # 删除与当前策略模式不匹配的监控配置
+                    has_matching_config = False
+                    valid_configs = []
+
+                    for config in self.coin_monitoring[pair]:
+                        direction = config.get('direction', 'long')
+
+                        # 关键逻辑：如果当前模式是long，删除所有short配置
+                        if current_mode == 'long' and direction == 'short':
+                            logger.info(f"交易对 {pair} 不再推荐做空，移除空头监控配置")
+                            updated_configs = True
+                            continue
+
+                        # 如果当前模式是short，仅保留short配置
+                        if current_mode == 'short' and direction == 'short':
+                            valid_configs.append({**config, 'auto_initialized': False})
+                            has_matching_config = True
+
+                        # 多头配置总是被保留
+                        if direction == 'long':
+                            valid_configs.append({**config, 'auto_initialized': False})
+                            has_long_config = True
+                            if current_mode == 'long':
+                                has_matching_config = True
+
+                    # 如果没有与当前策略模式匹配的配置，添加一个默认配置
+                    if not has_matching_config:
+                        logger.info(f"交易对 {pair} 没有与策略模式 '{current_mode}' 匹配的监控配置，添加默认配置")
+                        valid_configs.append(
+                            {
+                                'direction': current_mode,
+                                'auto': True,
+                                'entry_points': [],
+                                'exit_points': [],
+                                'auto_initialized': False,
+                            }
+                        )
+                        updated_configs = True
+
+                    # 更新或删除交易对的监控配置
+                    if valid_configs:
+                        # 如果原始配置和过滤后的配置数量不同，记录日志
+                        if len(valid_configs) != len(self.coin_monitoring[pair]):
+                            logger.info(f"交易对 {pair} 监控配置已更新，移除了不匹配的策略配置")
+                            updated_configs = True
+
+                        self.coin_monitoring[pair] = valid_configs
+                    else:
+                        # 如果没有有效配置，删除该交易对的监控
+                        logger.info(f"交易对 {pair} 没有有效监控配置，从监控列表中移除")
+                        del self.coin_monitoring[pair]
+                        updated_configs = True
+
+                # 如果有配置更新，保存到策略状态文件
+                if updated_configs and self.config.get('runmode', None) in ('live', 'dry_run'):
+                    self.update_strategy_state_file()
+                    logger.info('监控配置已更新并保存到策略状态文件')
+
             logger.info(f"成功加载策略模式文件: {self.pair_strategy_mode}")
+
+            # 统计并输出配置信息
+            if self.coin_monitoring:
+                pairs_count = len(self.coin_monitoring)
+                long_configs = sum(
+                    1
+                    for pair in self.coin_monitoring
+                    for config in self.coin_monitoring[pair]
+                    if config.get('direction') == 'long'
+                )
+                short_configs = sum(
+                    1
+                    for pair in self.coin_monitoring
+                    for config in self.coin_monitoring[pair]
+                    if config.get('direction') == 'short'
+                )
+                logger.info(
+                    f"固定点位监控配置: {pairs_count}个交易对 (多头: {long_configs}, 空头: {short_configs})"
+                )
 
         except Exception as e:
             logger.info(f"加载策略模式配置时出错: {e}")
@@ -214,43 +301,422 @@ class KamaFama_Dynamic(IStrategy):
         # 止损后的处理逻辑应该放在 exit_positions 里处理
         return None
 
+    # def calculate_coin_points(self, pair: str, direction: str):
+    #     df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+    #     if df is None or df.empty:
+    #         logger.warning(f"无法获取 {pair} 的5m数据，跳过自动设置")
+    #         return
+
+    #     # 取最近288根K线（相当于24小时的5m数据）
+    #     candles_to_use = 288  # 24小时 × 12根/小时
+    #     if len(df) < candles_to_use:
+    #         logger.warning(f"{pair} 数据不足 {candles_to_use} 根K线，仅有 {len(df)} 根，跳过自动设置")
+    #         return
+
+    #     recent_df = df.tail(candles_to_use)  # 取最后288根K线
+
+    #     # 计算最近288根K线的最高价和最低价
+    #     recent_high = recent_df['high'].max()
+    #     recent_low = recent_df['low'].min()
+    #     # price_range = recent_high - recent_low
+
+    #     config = {}
+    #     if direction == 'long':
+    #         config['entry_points'] = [recent_low * 1.005]  # 略高于最低价
+    #         config['exit_points'] = [
+    #             recent_low * 1.005 * 1.02,  # 第一目标
+    #             recent_low * 1.005 * 1.04,  # 第二目标
+    #             recent_low * 1.005 * 1.06,  # 接近最高价
+    #         ]
+    #         config['stop_loss'] = recent_low * 0.95  # 略低于最低价
+
+    #     elif direction == 'short':
+    #         config['entry_points'] = [recent_high * 0.995]  # 略低于最高价
+    #         config['exit_points'] = [
+    #             recent_high * 0.995 * 0.98,  # 第一目标
+    #             recent_high * 0.995 * 0.96,  # 第二目标
+    #             recent_high * 0.995 * 0.94,  # 接近最低价
+    #         ]
+    #         config['stop_loss'] = recent_low * 1.05
+
+    #     return config
+
+    def find_support_resistance_levels(self, dataframe, n_levels=3):
+        """
+        识别主要支撑位和阻力位
+
+        参数:
+            dataframe: 价格数据框架
+            n_levels: 返回的支撑/阻力位数量
+
+        返回:
+            支撑位和阻力位列表
+        """
+        # 计算价格变动的标准差，用于判断显著价格水平
+        price_std = dataframe['close'].pct_change().std()
+
+        # 创建价格区间，将连续价格分组
+        price_range = dataframe['high'].max() - dataframe['low'].min()
+        n_bins = 100  # 将价格范围分成100个区间
+        bin_size = price_range / n_bins
+
+        # 创建价格区间直方图
+        price_bins = [[] for _ in range(n_bins)]
+        volume_bins = [0] * n_bins
+
+        # 填充价格和交易量数据到区间
+        min_price = dataframe['low'].min()
+        for i, row in dataframe.iterrows():
+            # 考虑每根K线的高低点范围
+            low_bin = int((row['low'] - min_price) / bin_size)
+            high_bin = int((row['high'] - min_price) / bin_size)
+
+            # 确保区间索引在有效范围内
+            low_bin = max(0, min(low_bin, n_bins - 1))
+            high_bin = max(0, min(high_bin, n_bins - 1))
+
+            # 将价格点添加到相应区间
+            for b in range(low_bin, high_bin + 1):
+                price_bins[b].append(row['close'])
+                volume_bins[b] += row['volume']
+
+        # 分析每个区间的"停留时间"和交易量
+        resistance_scores = []
+        support_scores = []
+
+        for i in range(n_bins):
+            if len(price_bins[i]) > 0:
+                bin_price = min_price + (i + 0.5) * bin_size
+                # 计算该价格区间的得分 (基于价格点数量和交易量)
+                score = len(price_bins[i]) * (
+                    1 + volume_bins[i] / max(volume_bins) if max(volume_bins) > 0 else 1
+                )
+
+                # 分析价格在该区间的行为来判断是支撑还是阻力
+                price_before = [
+                    p
+                    for j in range(max(0, i - 3), i)
+                    for p in price_bins[j]
+                    if len(price_bins[j]) > 0
+                ]
+                price_after = [
+                    p
+                    for j in range(i + 1, min(n_bins, i + 4))
+                    for p in price_bins[j]
+                    if len(price_bins[j]) > 0
+                ]
+
+                # 如果价格通常从该水平向上反弹，则可能是支撑位
+                if (
+                    price_before
+                    and price_after
+                    and np.mean(price_before) > bin_price
+                    and np.mean(price_after) > bin_price
+                ):
+                    support_scores.append((bin_price, score))
+                # 如果价格通常从该水平向下反转，则可能是阻力位
+                elif (
+                    price_before
+                    and price_after
+                    and np.mean(price_before) < bin_price
+                    and np.mean(price_after) < bin_price
+                ):
+                    resistance_scores.append((bin_price, score))
+
+        # 根据得分排序
+        support_scores.sort(key=lambda x: x[1], reverse=True)
+        resistance_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # 返回得分最高的n_levels个支撑位和阻力位
+        supports = [price for price, _ in support_scores[:n_levels]]
+        resistances = [price for price, _ in resistance_scores[:n_levels]]
+
+        return supports, resistances
+
+    def zigzag_points(self, dataframe, deviation=5):
+        """
+        使用ZigZag算法找出重要的转折点
+
+        参数:
+            dataframe: 价格数据框架
+            deviation: 最小偏差百分比
+
+        返回:
+            高点和低点列表
+        """
+        highs = []
+        lows = []
+
+        # 转换为百分比
+        dev = deviation / 100
+
+        # 初始化
+        last_high = dataframe['high'].iloc[0]
+        last_low = dataframe['low'].iloc[0]
+        high_idx = 0
+        low_idx = 0
+        trend = None  # None for initial, 1 for up, -1 for down
+
+        for i in range(1, len(dataframe)):
+            curr_high = dataframe['high'].iloc[i]
+            curr_low = dataframe['low'].iloc[i]
+
+            # 初始趋势判断
+            if trend is None:
+                if curr_high > last_high:
+                    trend = 1  # 上升趋势
+                elif curr_low < last_low:
+                    trend = -1  # 下降趋势
+
+            # 上升趋势中
+            if trend == 1:
+                # 如果找到更高点，更新最高点
+                if curr_high > last_high:
+                    last_high = curr_high
+                    high_idx = i
+                # 如果下降超过偏差，记录高点并转为下降趋势
+                elif curr_low < last_high * (1 - dev):
+                    highs.append((high_idx, last_high))
+                    last_low = curr_low
+                    low_idx = i
+                    trend = -1
+
+            # 下降趋势中
+            elif trend == -1:
+                # 如果找到更低点，更新最低点
+                if curr_low < last_low:
+                    last_low = curr_low
+                    low_idx = i
+                # 如果上升超过偏差，记录低点并转为上升趋势
+                elif curr_high > last_low * (1 + dev):
+                    lows.append((low_idx, last_low))
+                    last_high = curr_high
+                    high_idx = i
+                    trend = 1
+
+        # 添加最后一个点
+        if trend == 1:
+            highs.append((high_idx, last_high))
+        else:
+            lows.append((low_idx, last_low))
+
+        # 提取价格值
+        high_points = [price for _, price in highs]
+        low_points = [price for _, price in lows]
+
+        return high_points, low_points
+
+    def get_ohlcv_history(self, pair: str, timeframe: str = '1h', limit: int = 150):
+        """
+        使用CCXT直接从交易所获取历史K线数据
+
+        参数:
+            pair: 交易对名称，直接使用传入的格式
+            timeframe: 时间周期，例如 '1h', '4h', '1d'
+            limit: 获取的K线数量
+
+        返回:
+            pandas DataFrame包含OHLCV数据，如果失败则返回None
+        """
+        try:
+            # 获取交易所名称
+            exchange_name = self.config['exchange']['name'].lower()
+
+            # 创建交易所实例
+            exchange_class = getattr(ccxt, exchange_name)
+
+            # 获取API凭证
+            api_config = {
+                'apiKey': self.config['exchange'].get('key', ''),
+                'secret': self.config['exchange'].get('secret', ''),
+                'enableRateLimit': True,
+            }
+
+            # 过滤空值
+            api_config = {k: v for k, v in api_config.items() if v}
+
+            # 实例化交易所
+            exchange = exchange_class(api_config)
+
+            # 设置市场类型 (针对Binance等交易所)
+            if hasattr(exchange, 'options'):
+                if exchange_name == 'binance':
+                    exchange.options['defaultType'] = 'spot'
+
+            logger.info(f"使用CCXT获取 {pair} {timeframe} 数据")
+
+            # 加载市场
+            exchange.load_markets()
+
+            # 获取OHLCV数据 - 不使用since参数，让交易所返回最近的数据
+            ohlcv = exchange.fetch_ohlcv(symbol=pair, timeframe=timeframe, limit=limit)
+
+            if ohlcv and len(ohlcv) > 0:
+                # 转换为DataFrame
+                df = pd.DataFrame(ohlcv, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+
+                # 转换时间戳为日期时间
+                df['date'] = pd.to_datetime(df['date'], unit='ms')
+
+                logger.info(f"成功获取 {pair} {timeframe} 数据，共 {len(df)} 条")
+                return df
+            else:
+                logger.error(f"未获取到 {pair} 的 {timeframe} 数据")
+                return None
+
+        except Exception as e:
+            logger.error(f"获取历史数据时出错: {str(e)}")
+            return None
+
     def calculate_coin_points(self, pair: str, direction: str):
-        df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-        if df is None or df.empty:
-            logger.warning(f"无法获取 {pair} 的5m数据，跳过自动设置")
-            return
+        # 获取1小时K线数据用于支撑/阻力位识别
+        df_1h = self.get_ohlcv_history(pair, timeframe='1h', limit=150)
 
-        # 取最近288根K线（相当于24小时的5m数据）
-        candles_to_use = 288  # 24小时 × 12根/小时
-        if len(df) < candles_to_use:
-            logger.warning(f"{pair} 数据不足 {candles_to_use} 根K线，仅有 {len(df)} 根，跳过自动设置")
-            return
+        if df_1h is None or df_1h.empty:
+            logger.warning(f"无法获取 {pair} 的1h数据，跳过计算支撑/阻力位")
+            return None
 
-        recent_df = df.tail(candles_to_use)  # 取最后288根K线
+        # 获取5分钟数据用于更精确的进场点
+        df_5m = self.get_ohlcv_history(pair, timeframe='5m', limit=350)
 
-        # 计算最近288根K线的最高价和最低价
-        recent_high = recent_df['high'].max()
-        recent_low = recent_df['low'].min()
-        # price_range = recent_high - recent_low
+        if df_5m is None or df_5m.empty:
+            df_5m, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+            if df_5m is None or df_5m.empty:
+                logger.warning(f"无法获取 {pair} 的5m数据，跳过自动设置")
+                return None
 
-        config = {}
+        # 1. 从1小时图表识别主要支撑位和阻力位
+        supports_1h, resistances_1h = self.find_support_resistance_levels(
+            df_1h, n_levels=5
+        )  # 增加到5个点位以获取更多候选位置
+
+        # 2. 使用ZigZag过滤1小时图表上的噪音，找到重要转折点
+        highs_1h, lows_1h = self.zigzag_points(df_1h, deviation=5)
+
+        # 3. 分析近期5分钟数据的波动情况
+        recent_5m = df_5m.tail(288)  # 最近24小时
+        volatility = recent_5m['close'].pct_change().std() * 100  # 波动率百分比
+
+        # 当前价格
+        current_price = df_5m.iloc[-1]['close']
+
+        # 设置基于预期利润的过滤参数
+        expected_profit_pct = 4.0  # 预期利润百分比
+        max_distance_pct = expected_profit_pct * 1.5  # 允许的最大距离百分比，稍大于预期利润
+
+        logger.info(
+            f"{pair} 当前价格: {current_price}, 24小时波动率: {volatility:.2f}%, 最大允许距离: {max_distance_pct:.2f}%"
+        )
+
+        # 4. 整合不同时间周期的结果并基于预期利润过滤点位
         if direction == 'long':
-            config['entry_points'] = [recent_low * 1.005]  # 略高于最低价
-            config['exit_points'] = [
-                recent_low * 1.005 * 1.02,  # 第一目标
-                recent_low * 1.005 * 1.04,  # 第二目标
-                recent_low * 1.005 * 1.06,  # 接近最高价
-            ]
-            config['stop_loss'] = recent_low * 0.95  # 略低于最低价
+            # 对于多头，我们关注支撑位
+            valid_supports = []
+
+            # 添加1小时图表的支撑位
+            for support in supports_1h:
+                # 计算支撑位与当前价格的距离百分比
+                distance_pct = (current_price - support) / current_price * 100
+                if 0 < distance_pct <= max_distance_pct:
+                    valid_supports.append(support)
+                    logger.info(f"有效支撑位: {support}, 距离当前价格: {distance_pct:.2f}%")
+
+            # 添加ZigZag低点
+            for low in lows_1h:
+                distance_pct = (current_price - low) / current_price * 100
+                if 0 < distance_pct <= max_distance_pct:
+                    valid_supports.append(low)
+                    logger.info(f"有效ZigZag低点: {low}, 距离当前价格: {distance_pct:.2f}%")
+
+            # 如果没有找到有效支撑位，则基于预期利润计算入场点
+            if not valid_supports:
+                valid_supports = [df_5m['low'].min()]
+                logger.info(f"{pair}没有找到合适距离内的支撑位，使用当日最低: {valid_supports[0]}")
+
+            # 根据接近当前价格的程度排序
+            valid_supports.sort(key=lambda x: abs(current_price - x))
+
+            # 选择最接近但低于当前价格的支撑位作为入场点
+            entry_point = min(valid_supports) * 1.005  # 略高于支撑位
+
+            # 根据波动率和预期利润动态调整止盈点位
+            # 如果波动率低，使用更接近预期利润的目标位
+            # 如果波动率高，允许更大的利润目标
+            volatility_factor = min(max(volatility / 10, 0.8), 1.5)  # 将波动率影响控制在0.8-1.5之间
+
+            tp1_pct = expected_profit_pct * 0.4 * volatility_factor  # 第一目标位
+            tp2_pct = expected_profit_pct * 0.8 * volatility_factor  # 第二目标位
+            tp3_pct = expected_profit_pct * 1.2 * volatility_factor  # 第三目标位
+
+            logger.info(
+                f"波动率因子: {volatility_factor:.2f}, TP1: {tp1_pct:.2f}%, TP2: {tp2_pct:.2f}%, TP3: {tp3_pct:.2f}%"
+            )
+
+            config = {
+                'entry_points': [entry_point],
+                'exit_points': [
+                    entry_point * (1 + tp1_pct / 100),  # 第一目标
+                    entry_point * (1 + tp2_pct / 100),  # 第二目标
+                    entry_point * (1 + tp3_pct / 100),  # 第三目标
+                ],
+                'stop_loss': entry_point * (1 - expected_profit_pct * 0.4 / 100),  # 止损位，预期利润的40%
+            }
 
         elif direction == 'short':
-            config['entry_points'] = [recent_high * 0.995]  # 略低于最高价
-            config['exit_points'] = [
-                recent_high * 0.995 * 0.98,  # 第一目标
-                recent_high * 0.995 * 0.96,  # 第二目标
-                recent_high * 0.995 * 0.94,  # 接近最低价
-            ]
-            config['stop_loss'] = recent_low * 1.05
+            # 对于空头，我们关注阻力位
+            valid_resistances = []
+
+            # 添加1小时图表的阻力位
+            for resistance in resistances_1h:
+                # 计算阻力位与当前价格的距离百分比
+                distance_pct = (resistance - current_price) / current_price * 100
+                if 0 < distance_pct <= max_distance_pct:
+                    valid_resistances.append(resistance)
+                    logger.info(f"有效阻力位: {resistance}, 距离当前价格: {distance_pct:.2f}%")
+
+            # 添加ZigZag高点
+            for high in highs_1h:
+                distance_pct = (high - current_price) / current_price * 100
+                if 0 < distance_pct <= max_distance_pct:
+                    valid_resistances.append(high)
+                    logger.info(f"有效ZigZag高点: {high}, 距离当前价格: {distance_pct:.2f}%")
+
+            # 如果没有找到有效阻力位，则基于预期利润计算入场点
+            if not valid_resistances:
+                valid_supports = [df_5m['high'].max()]
+                logger.info(f"{pair}没有找到合适距离内的阻力位，使用当日最高: {valid_supports[0]}")
+
+            # 根据接近当前价格的程度排序
+            valid_resistances.sort(key=lambda x: abs(current_price - x))
+
+            # 选择最接近但高于当前价格的阻力位作为入场点
+            entry_point = max(valid_resistances) * 0.995  # 略低于阻力位
+
+            # 同样基于波动率和预期利润动态调整止盈点位
+            volatility_factor = min(max(volatility / 10, 0.8), 1.5)
+
+            tp1_pct = expected_profit_pct * 0.4 * volatility_factor
+            tp2_pct = expected_profit_pct * 0.8 * volatility_factor
+            tp3_pct = expected_profit_pct * 1.2 * volatility_factor
+
+            logger.info(
+                f"波动率因子: {volatility_factor:.2f}, TP1: {tp1_pct:.2f}%, TP2: {tp2_pct:.2f}%, TP3: {tp3_pct:.2f}%"
+            )
+
+            config = {
+                'entry_points': [entry_point],
+                'exit_points': [
+                    entry_point * (1 - tp1_pct / 100),  # 第一目标
+                    entry_point * (1 - tp2_pct / 100),  # 第二目标
+                    entry_point * (1 - tp3_pct / 100),  # 第三目标
+                ],
+                'stop_loss': entry_point * (1 + expected_profit_pct * 0.4 / 100),  # 止损位，预期利润的40%
+            }
+
+        # 修复空头模式可能存在的错误
+        if direction == 'short' and 'valid_supports' in locals() and not 'entry_point' in locals():
+            logger.warning(f"{pair} 空头模式中错误使用了支撑位，重新计算...")
+            entry_point = valid_resistances[0] * 0.995  # 使用阻力位重新计算
 
         return config
 
@@ -284,42 +750,16 @@ class KamaFama_Dynamic(IStrategy):
                 if config.get('auto', False) and not config.get(
                     'auto_initialized', False
                 ):  # 检查auto且未初始化
-                    # 获取5m数据
-                    df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
-                    if df is None or df.empty:
-                        logger.warning(f"无法获取 {pair} 的5m数据，跳过自动设置")
-                        continue
-
-                    # 取最近288根K线（相当于24小时的5m数据）
-                    candles_to_use = 288  # 24小时 × 12根/小时
-                    if len(df) < candles_to_use:
-                        logger.warning(f"{pair} 数据不足 {candles_to_use} 根K线，仅有 {len(df)} 根，跳过自动设置")
-                        continue
-
-                    recent_df = df.tail(candles_to_use)  # 取最后288根K线
-
-                    # 计算最近288根K线的最高价和最低价
-                    recent_high = recent_df['high'].max()
-                    recent_low = recent_df['low'].min()
-                    # price_range = recent_high - recent_low
-
-                    # 根据方向设置入场和退出点位
+                    # 计算点位配置
                     direction = config.get('direction', 'long')
-                    if direction == 'long':
-                        config['entry_points'] = [recent_low * 1.005]  # 略高于最低价
-                        config['exit_points'] = [
-                            recent_low * 1.005 * 1.02,  # 第一目标
-                            recent_low * 1.005 * 1.04,  # 第二目标
-                            recent_low * 1.005 * 1.06,  # 接近最高价
-                        ]
-                    elif direction == 'short':
-                        config['entry_points'] = [recent_high * 0.995]  # 略低于最高价
-                        config['exit_points'] = [
-                            recent_high * 0.995 * 0.98,  # 第一目标
-                            recent_high * 0.995 * 0.96,  # 第二目标
-                            recent_high * 0.995 * 0.94,  # 接近最低价
-                        ]
-                    has_data = True
+                    point_config = self.calculate_coin_points(pair, direction)
+
+                    if point_config:
+                        # 更新配置
+                        config['entry_points'] = point_config['entry_points']
+                        config['exit_points'] = point_config['exit_points']
+                        config['stop_loss'] = point_config.get('stop_loss', None)
+                        has_data = True
 
             if has_data:
                 with open('/freqtrade/user_data/strategy_state.json', 'r') as f:
@@ -335,12 +775,12 @@ class KamaFama_Dynamic(IStrategy):
                     entry_point = config['entry_points'][0]
                     exit_points = ','.join([str(i) for i in config['exit_points']])
                     logger.info(
-                        f"自动设置 {pair} ({direction}) 使用最近 {candles_to_use} 根5m数据: "
+                        f"自动设置 {pair} ({direction}) 使用多时间周期分析: "
                         f"entry_points={entry_point}, "
                         f"exit_points={exit_points}"
                     )
                     self.dp.send_msg(
-                        f"自动设置 {pair} ({direction}) 使用最近 {candles_to_use} 根5m数据: "
+                        f"自动设置 {pair} ({direction}) 使用多时间周期分析: "
                         f"entry_points={entry_point}, "
                         f"exit_points={exit_points}"
                     )
