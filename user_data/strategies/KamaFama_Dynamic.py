@@ -174,14 +174,17 @@ class KamaFama_Dynamic(IStrategy):
         - 确保策略模式与监控配置保持一致
         - 默认使用多头策略
         """
-        state_file = 'user_data/strategy_state.json'
+        if self.config.get('runmode', None) in ('live', 'dry_run'):
+            self.state_file = 'user_data/strategy_state_production.json'
+        else:
+            self.state_file = 'user_data/strategy_state.json'
 
-        if not os.path.exists(state_file):
-            logger.info(f"警告: 策略模式配置文件 {state_file} 不存在，将使用默认多头策略")
+        if not os.path.exists(self.state_file):
+            logger.info(f"警告: 策略模式配置文件 {self.state_file} 不存在，将使用默认多头策略")
             return
 
         try:
-            with open(state_file, 'r') as f:
+            with open(self.state_file, 'r') as f:
                 state_data = json.load(f)
 
             # 加载策略模式配置
@@ -765,10 +768,10 @@ class KamaFama_Dynamic(IStrategy):
                         has_data = True
 
             if has_data:
-                with open('/freqtrade/user_data/strategy_state.json', 'r') as f:
+                with open(self.state_file, 'r') as f:
                     strategy_state = json.load(f)
                 strategy_state['coin_monitoring'] = self.coin_monitoring
-                with open('/freqtrade/user_data/strategy_state.json', 'w') as f:
+                with open(self.state_file, 'w') as f:
                     json.dump(strategy_state, f, indent=4)
 
                 for config in self.coin_monitoring[pair]:
@@ -1107,7 +1110,7 @@ class KamaFama_Dynamic(IStrategy):
     # 3. 更新持久化文件的函数
     def update_strategy_state_file(self):
         try:
-            file_path = '/freqtrade/user_data/strategy_state.json'
+            file_path = self.state_file
             # 简单的文件锁机制
             lock_file = f"{file_path}.lock"
 
