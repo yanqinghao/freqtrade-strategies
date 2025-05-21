@@ -221,11 +221,14 @@ class KamaFama_Dynamic(IStrategy):
                             has_matching_config = True
 
                         # 多头配置总是被保留
-                        if direction == 'long':
+                        if direction == 'long' and current_mode == 'long':
                             valid_configs.append({**config, 'auto_initialized': False})
-                            has_long_config = True
-                            if current_mode == 'long':
-                                has_matching_config = True
+                            has_matching_config = True
+
+                        if direction == 'long' and current_mode == 'short':
+                            logger.info(f"交易对 {pair} 不再推荐做多，移除多头监控配置")
+                            updated_configs = True
+                            continue
 
                     # 如果没有与当前策略模式匹配的配置，添加一个默认配置
                     if not has_matching_config:
@@ -353,7 +356,7 @@ class KamaFama_Dynamic(IStrategy):
             支撑位和阻力位列表
         """
         # 计算价格变动的标准差，用于判断显著价格水平
-        price_std = dataframe['close'].pct_change().std()
+        # price_std = dataframe['close'].pct_change().std()
 
         # 创建价格区间，将连续价格分组
         price_range = dataframe['high'].max() - dataframe['low'].min()
@@ -714,7 +717,7 @@ class KamaFama_Dynamic(IStrategy):
             }
 
         # 修复空头模式可能存在的错误
-        if direction == 'short' and 'valid_supports' in locals() and not 'entry_point' in locals():
+        if direction == 'short' and 'valid_supports' in locals() and 'entry_point' not in locals():
             logger.warning(f"{pair} 空头模式中错误使用了支撑位，重新计算...")
             entry_point = valid_resistances[0] * 0.995  # 使用阻力位重新计算
 
