@@ -211,6 +211,11 @@ class KamaFama_Dynamic(IStrategy):
 
                     for config in self.coin_monitoring[pair]:
                         direction = config.get('direction', 'long')
+                        auto = config.get('auto', True)
+                        if not auto:
+                            logger.info(f"交易对 {pair}({direction}) 已关闭自动更新，")
+                            valid_configs.append({**config, 'auto_initialized': True})
+                            continue
 
                         # 关键逻辑：如果当前模式是long，删除所有short配置
                         if current_mode == 'long' and direction == 'short':
@@ -749,9 +754,12 @@ class KamaFama_Dynamic(IStrategy):
                             'auto': True,
                             'entry_points': [],
                             'exit_points': [],
+                            'auto_initialized': False,  # 确保新配置未初始化
                         }
                     ]
             has_data = False
+            configs_to_update = []  # 记录需要更新的配置
+
             for config in self.coin_monitoring[pair]:
                 if config.get('auto', False) and not config.get(
                     'auto_initialized', False
@@ -765,6 +773,8 @@ class KamaFama_Dynamic(IStrategy):
                         config['entry_points'] = point_config['entry_points']
                         config['exit_points'] = point_config['exit_points']
                         config['stop_loss'] = point_config.get('stop_loss', None)
+                        config['auto_initialized'] = True  # 标记为已初始化
+                        configs_to_update.append((direction, config))
                         has_data = True
 
             if has_data:
@@ -774,22 +784,28 @@ class KamaFama_Dynamic(IStrategy):
                 with open(self.state_file, 'w') as f:
                     json.dump(strategy_state, f, indent=4)
 
-                for config in self.coin_monitoring[pair]:
-                    # 标记为已初始化
-                    config['auto_initialized'] = True
-                    direction = config['direction']
-                    entry_point = config['entry_points'][0]
-                    exit_points = ','.join([str(i) for i in config['exit_points']])
+                # 发送通知消息
+                for direction, config in configs_to_update:
+                    entry_point = config['entry_points'][0] if config['entry_points'] else 'N/A'
+                    exit_points = (
+                        ','.join([str(i) for i in config['exit_points']])
+                        if config['exit_points']
+                        else 'N/A'
+                    )
+
                     logger.info(
                         f"自动设置 {pair} ({direction}) 使用多时间周期分析: "
                         f"entry_points={entry_point}, "
                         f"exit_points={exit_points}"
                     )
-                    self.dp.send_msg(
-                        f"自动设置 {pair} ({direction}) 使用多时间周期分析: "
-                        f"entry_points={entry_point}, "
-                        f"exit_points={exit_points}"
-                    )
+                    if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                        self.dp.send_msg(
+                            f"自动设置 {pair} ({direction}) 使用多时间周期分析: "
+                            f"entry_points={entry_point}, "
+                            f"exit_points={exit_points}"
+                        )
+
+                logger.info(f"成功更新 {pair} 的监控配置并保存到文件")
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # 获取当前pair
@@ -1102,6 +1118,7 @@ class KamaFama_Dynamic(IStrategy):
             for config in self.coin_monitoring[pair]:
                 if config.get('direction') == direction:
                     config['auto'] = True
+                    config['auto_initialized'] = False
                     logger.info(f"已开启 {pair} 的自动计算功能")
                     self.reload_coin_monitoring(pair)
                     self.update_strategy_state_file()
