@@ -215,6 +215,7 @@ class KamaFama_Dynamic(IStrategy):
                         if not auto:
                             logger.info(f"交易对 {pair}({direction}) 已关闭自动更新，")
                             valid_configs.append({**config, 'auto_initialized': True})
+                            has_matching_config = True
                             continue
 
                         # 关键逻辑：如果当前模式是long，删除所有short配置
