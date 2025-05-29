@@ -93,7 +93,7 @@ class KamaFama_Dynamic(IStrategy):
     trailing_stop_positive = 0.002
     trailing_stop_positive_offset = 0.05
     trailing_only_offset_is_reached = True
-    max_entry_position_adjustment = 0
+    max_entry_position_adjustment = 5
 
     use_custom_stoploss = True
 
@@ -695,8 +695,8 @@ class KamaFama_Dynamic(IStrategy):
 
             # 如果没有找到有效阻力位，则基于预期利润计算入场点
             if not valid_resistances:
-                valid_supports = [df_5m['high'].max()]
-                logger.info(f"{pair}没有找到合适距离内的阻力位，使用当日最高: {valid_supports[0]}")
+                valid_resistances = [df_5m['high'].max()]
+                logger.info(f"{pair}没有找到合适距离内的阻力位，使用当日最高: {valid_resistances[0]}")
 
             # 根据接近当前价格的程度排序
             valid_resistances.sort(key=lambda x: abs(current_price - x))
