@@ -732,7 +732,49 @@ class KamaFama_Dynamic(IStrategy):
 
         return config
 
-    def reload_coin_monitoring(self, pair: str):
+    def _check_exit_points_deviation(self, pair: str, config: dict) -> bool:
+        """
+        检查退出点位偏差是否大于2%
+        """
+        try:
+            exit_points = config.get('exit_points', [])
+            if not exit_points:
+                return False
+
+            # 获取当前价格
+            df_5m, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+            if df_5m is None or df_5m.empty:
+                return False
+
+            current_price = df_5m.iloc[-1]['close']
+            first_exit_point = exit_points[0]
+            direction = config.get('direction', 'long')
+
+            # 根据方向计算偏差
+            if direction == 'long':
+                # 多头：当前价格应该低于退出点位
+                if current_price >= first_exit_point:
+                    return False  # 价格已经超过退出点位，不需要检查偏差
+            else:  # short
+                # 空头：当前价格应该高于退出点位
+                if current_price <= first_exit_point:
+                    return False  # 价格已经低于退出点位，不需要检查偏差
+
+            deviation_pct = abs(current_price - first_exit_point) / first_exit_point * 100
+
+            if deviation_pct > 2.0:
+                logger.info(
+                    f"{pair} 偏差检查 - 当前价格 {current_price} 与退出点位 {first_exit_point} 偏差 {deviation_pct:.2f}% > 2%"
+                )
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"检查 {pair} 退出点位偏差时出错: {e}")
+            return False
+
+    def reload_coin_monitoring(self, pair: str, check_deviation: bool = False):
         # 处理coin_monitoring的auto设置（仅在live或dry_run模式下）
         if (
             self.config.get('runmode', None) in ('live', 'dry_run')
@@ -762,9 +804,18 @@ class KamaFama_Dynamic(IStrategy):
             configs_to_update = []  # 记录需要更新的配置
 
             for config in self.coin_monitoring[pair]:
-                if config.get('auto', False) and not config.get(
-                    'auto_initialized', False
-                ):  # 检查auto且未初始化
+                should_recalculate = False
+
+                # 检查是否需要重新计算
+                if config.get('auto', False):
+                    # 如果未初始化，需要重新计算
+                    if not config.get('auto_initialized', False):
+                        should_recalculate = True
+                    # 如果启用偏差检查，检查偏差是否大于2%
+                    elif check_deviation:
+                        should_recalculate = self._check_exit_points_deviation(pair, config)
+
+                if should_recalculate:
                     # 计算点位配置
                     direction = config.get('direction', 'long')
                     point_config = self.calculate_coin_points(pair, direction)
@@ -926,6 +977,9 @@ class KamaFama_Dynamic(IStrategy):
             and self.coin_monitoring.get(pair)
             and list(itertools.chain(*[i['entry_points'] for i in self.coin_monitoring[pair]]))
         ):
+            # 在进入交易前检查偏差并重新计算点位（仅对未持有交易的交易对）
+            self.reload_coin_monitoring(pair, check_deviation=True)
+
             # 处理固定点位监控逻辑
             dataframe = self._populate_fixed_entry(dataframe, metadata)
         else:
@@ -962,6 +1016,8 @@ class KamaFama_Dynamic(IStrategy):
         if exit_reason.upper().startswith('ROI'):
             logger.info(f"{pair}: Exit triggered by ROI - re-enabling auto calculation")
             self.enable_auto_calculation(pair, direction)
+            # 重新计算所有自动点位监控的交易对
+            self.recalculate_all_auto_monitoring_pairs()
 
         # Always confirm the exit
         return True
@@ -1125,7 +1181,85 @@ class KamaFama_Dynamic(IStrategy):
                     self.update_strategy_state_file()
                     break
 
+    def recalculate_all_auto_monitoring_pairs(self):
+        """
+        重新计算所有自动点位监控的交易对
+        仅对没有活跃交易的交易对进行重新计算，避免影响正在进行的交易
+        """
+        if not hasattr(self, 'coin_monitoring') or not self.coin_monitoring:
+            return
+
+        updated_pairs = []
+
+        for pair in self.coin_monitoring:
+            # 检查是否有活跃交易，如果有则跳过
+            if self.config.get('runmode', None) in ('live', 'dry_run'):
+                from freqtrade.persistence import Trade
+
+                active_trades = Trade.get_trades_proxy(is_open=True, pair=pair)
+                if active_trades:
+                    logger.info(f"跳过 {pair}：存在活跃交易，不重新计算点位")
+                    continue  # 有活跃交易，跳过这个交易对
+
+            for config in self.coin_monitoring[pair]:
+                if config.get('auto', False):
+                    # 重置自动初始化状态，强制重新计算
+                    config['auto_initialized'] = False
+                    updated_pairs.append(pair)
+
+        # 重新加载所有需要更新的交易对
+        for pair in set(updated_pairs):  # 使用set去重
+            self.reload_coin_monitoring(pair)
+
+        if updated_pairs:
+            logger.info(f"已重新计算无活跃交易的自动监控交易对: {set(updated_pairs)}")
+            if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                self.dp.send_msg(f"已重新计算无活跃交易的自动监控交易对: {set(updated_pairs)}")
+
+            self.update_strategy_state_file()
+
     # 3. 更新持久化文件的函数
+    def _datetime_to_timestamp(self, dt: datetime) -> float:
+        """
+        将datetime对象转换为时间戳，兼容不同版本的Python
+
+        Args:
+            dt: datetime对象
+
+        Returns:
+            float: 时间戳
+        """
+        try:
+            if hasattr(dt, 'timestamp'):
+                return dt.timestamp()
+            else:
+                # 兼容性处理：如果没有timestamp方法，手动转换
+                import calendar
+
+                return calendar.timegm(dt.timetuple())
+        except Exception as e:
+            logger.error(f"转换datetime到时间戳时出错: {e}, datetime: {dt}")
+            # 返回当前时间戳作为fallback
+            return datetime.now().timestamp()
+
+    def _timestamp_to_datetime(self, timestamp: float, timezone=None) -> datetime:
+        """
+        将时间戳转换为datetime对象
+
+        Args:
+            timestamp: 时间戳
+            timezone: 时区信息，默认为None
+
+        Returns:
+            datetime: datetime对象
+        """
+        try:
+            return datetime.fromtimestamp(timestamp, timezone)
+        except Exception as e:
+            logger.error(f"转换时间戳到datetime时出错: {e}, timestamp: {timestamp}")
+            # 返回当前时间作为fallback
+            return datetime.now(timezone) if timezone else datetime.now()
+
     def update_strategy_state_file(self):
         try:
             file_path = self.state_file
@@ -1197,14 +1331,57 @@ class KamaFama_Dynamic(IStrategy):
 
             # 检查补仓冷却期
             last_dca_time = trade.get_custom_data('last_dca_time')
-            if last_dca_time is not None:
-                cooldown_minutes = 60  # 30分钟冷却期 (可根据交易对波动性调整)
-                last_dca_datetime = datetime.fromtimestamp(
-                    last_dca_time, trade.open_date_utc.tzinfo
+
+            # 如果没有last_dca_time，使用开仓时间作为参考时间
+            if last_dca_time is None:
+                last_dca_time = self._datetime_to_timestamp(trade.open_date_utc)
+                logger.info(
+                    f"{pair}: 首次检查补仓冷却期，使用开仓时间: {trade.open_date_utc} (时间戳: {last_dca_time})"
                 )
-                if current_time < last_dca_datetime + timedelta(minutes=cooldown_minutes):
-                    logger.info(f"{pair}: 补仓冷却期未结束，上次补仓时间: {last_dca_datetime}")
-                    return None
+
+            if last_dca_time is not None:
+                cooldown_minutes = 60 * 24 * 7  # 30分钟冷却期 (可根据交易对波动性调整)
+
+                # 确保last_dca_time是时间戳格式
+                if isinstance(last_dca_time, datetime):
+                    last_dca_timestamp = self._datetime_to_timestamp(last_dca_time)
+                    logger.warning(
+                        f"{pair}: last_dca_time是datetime格式，已转换为时间戳: {last_dca_timestamp}"
+                    )
+                else:
+                    last_dca_timestamp = last_dca_time
+
+                # 验证时间戳的合理性
+                try:
+                    # 转换为datetime对象进行比较
+                    last_dca_datetime = self._timestamp_to_datetime(
+                        last_dca_timestamp, trade.open_date_utc.tzinfo
+                    )
+
+                    # 检查时间戳是否合理（不能早于开仓时间，不能晚于当前时间太多）
+                    if last_dca_datetime < trade.open_date_utc:
+                        logger.warning(
+                            f"{pair}: last_dca_time ({last_dca_datetime}) 早于开仓时间 ({trade.open_date_utc})，使用开仓时间"
+                        )
+                        last_dca_datetime = trade.open_date_utc
+                    elif last_dca_datetime > current_time + timedelta(minutes=5):
+                        logger.warning(
+                            f"{pair}: last_dca_time ({last_dca_datetime}) 晚于当前时间太多，使用当前时间"
+                        )
+                        last_dca_datetime = current_time
+
+                    if current_time < last_dca_datetime + timedelta(minutes=cooldown_minutes):
+                        time_remaining = (
+                            last_dca_datetime + timedelta(minutes=cooldown_minutes) - current_time
+                        ).total_seconds() / 60
+                        logger.info(
+                            f"{pair}: 补仓冷却期未结束，上次补仓/开仓时间: {last_dca_datetime}, 剩余冷却时间: {time_remaining:.1f}分钟"
+                        )
+                        return None
+
+                except Exception as e:
+                    logger.error(f"{pair}: 处理补仓冷却期时出错: {e}, 跳过冷却期检查")
+                    # 出错时不阻止补仓，但记录错误
 
             # 检查当前波动性 - 为当前交易对获取适合的数据
             dataframe, _ = self.dp.get_analyzed_dataframe(pair=trade.pair, timeframe=self.timeframe)
@@ -1374,8 +1551,9 @@ class KamaFama_Dynamic(IStrategy):
                             f"触发原因: {dca_tag}"
                         )
                         # 记录本次补仓信息
-                        last_dca_time = current_time.timestamp()
+                        last_dca_time = self._datetime_to_timestamp(current_time)
                         trade.set_custom_data('last_dca_time', last_dca_time)
+                        logger.info(f"{pair}: 记录补仓时间戳: {last_dca_time} (对应时间: {current_time})")
 
                         # 在补仓之前做好准备更新initial_stake
                         trade.set_custom_data('last_stake_amount', trade.stake_amount)
@@ -1463,6 +1641,8 @@ class KamaFama_Dynamic(IStrategy):
                         ):
                             logger.info(f"触发唯一退出点位 {pair}: 当前价格 {current_rate} - 全部退出")
                             self.enable_auto_calculation(pair, direction)
+                            # 重新计算所有自动点位监控的交易对
+                            self.recalculate_all_auto_monitoring_pairs()
                             return (
                                 -trade.stake_amount,
                                 f"{direction}_single_tp_{sorted_exit_points[0]}",
@@ -1493,6 +1673,8 @@ class KamaFama_Dynamic(IStrategy):
                                 trade.set_custom_data('exit_stage', 2)
                                 logger.info(f"触发第二级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余全部仓位")
                                 self.enable_auto_calculation(pair, direction)
+                                # 重新计算所有自动点位监控的交易对
+                                self.recalculate_all_auto_monitoring_pairs()
                                 return (
                                     -trade.stake_amount,
                                     f"{direction}_tp2_of2_{sorted_exit_points[1]}",
@@ -1505,6 +1687,8 @@ class KamaFama_Dynamic(IStrategy):
                                 # 从第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
                                 self.enable_auto_calculation(pair, direction)
+                                # 重新计算所有自动点位监控的交易对
+                                self.recalculate_all_auto_monitoring_pairs()
                                 return -trade.stake_amount, f'{direction}_tp1_pullback_cost'
 
                     # 3个或更多点位的情况 - 原有的30%/50%/全部逻辑
@@ -1529,6 +1713,8 @@ class KamaFama_Dynamic(IStrategy):
                             elif exit_stage == 2 and current_rate >= sorted_exit_points[2]:
                                 logger.info(f"触发第三级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余全部仓位")
                                 self.enable_auto_calculation(pair, direction)
+                                # 重新计算所有自动点位监控的交易对
+                                self.recalculate_all_auto_monitoring_pairs()
                                 return -trade.stake_amount, f"long_tp3_{sorted_exit_points[2]}"
 
                             # 处理回撤情况 - 多头
@@ -1536,12 +1722,16 @@ class KamaFama_Dynamic(IStrategy):
                                 # 第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
                                 self.enable_auto_calculation(pair, direction)
+                                # 重新计算所有自动点位监控的交易对
+                                self.recalculate_all_auto_monitoring_pairs()
                                 return -trade.stake_amount, 'long_tp1_pullback_cost'
 
                             elif exit_stage == 2 and current_rate <= sorted_exit_points[0]:
                                 # 第二阶段回撤到第一点位，清仓
                                 logger.info(f"{pair} 从第二点位回撤至第一点位 {sorted_exit_points[0]}，清仓")
                                 self.enable_auto_calculation(pair, direction)
+                                # 重新计算所有自动点位监控的交易对
+                                self.recalculate_all_auto_monitoring_pairs()
                                 return -trade.stake_amount, 'long_tp2_pullback_tp1'
 
                         # 空头策略
@@ -1567,6 +1757,8 @@ class KamaFama_Dynamic(IStrategy):
                             elif exit_stage == 2 and current_rate <= sorted_exit_points[2]:
                                 logger.info(f"触发第三级退出点位 {pair}: 当前价格 {current_rate} - 出售剩余全部仓位")
                                 self.enable_auto_calculation(pair, direction)
+                                # 重新计算所有自动点位监控的交易对
+                                self.recalculate_all_auto_monitoring_pairs()
                                 return -trade.stake_amount, f"short_tp3_{sorted_exit_points[2]}"
 
                             # 处理回撤情况 - 空头
@@ -1574,12 +1766,16 @@ class KamaFama_Dynamic(IStrategy):
                                 # 第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
                                 self.enable_auto_calculation(pair, direction)
+                                # 重新计算所有自动点位监控的交易对
+                                self.recalculate_all_auto_monitoring_pairs()
                                 return -trade.stake_amount, 'short_tp1_pullback_cost'
 
                             elif exit_stage == 2 and current_rate >= sorted_exit_points[0]:
                                 # 第二阶段回撤到第一点位，清仓
                                 logger.info(f"{pair} 从第二点位回撤至第一点位 {sorted_exit_points[0]}，清仓")
                                 self.enable_auto_calculation(pair, direction)
+                                # 重新计算所有自动点位监控的交易对
+                                self.recalculate_all_auto_monitoring_pairs()
                                 return -trade.stake_amount, 'short_tp2_pullback_tp1'
 
         return None
@@ -1657,6 +1853,8 @@ class KamaFama_Dynamic(IStrategy):
                             trade.set_custom_data('exit_stage', 3)
                             logger.info(f"触发第三级退出点位 {pair}: 当前价格 {current_rate} - 出售所有剩余仓位")
                             self.enable_auto_calculation(pair, direction)
+                            # 重新计算所有自动点位监控的交易对
+                            self.recalculate_all_auto_monitoring_pairs()
                             return f"{direction}_tp3_{sorted_exit_points[2]}"
         else:
             # 如果不满足固定点位监控的条件，使用原有退出逻辑
