@@ -1329,6 +1329,85 @@ class KamaFama_Dynamic(IStrategy):
         # 先检查是否需要补仓
         if current_profit < 0:
 
+            # 优先检查是否为止盈回撤情况（亏损小于0.5%且已经触发过减仓）
+            exit_stage = trade.get_custom_data('exit_stage', default=0)
+            if exit_stage >= 1 and current_profit >= -0.005:  # 已减仓且亏损小于0.5%
+                # 检查是否是固定点位监控的交易对
+                if (
+                    pair in self.coin_monitoring
+                    and self.coin_monitoring.get(pair)
+                    and list(
+                        itertools.chain(
+                            *[
+                                i['exit_points']
+                                for i in self.coin_monitoring[pair]
+                                if i['direction'] == direction
+                            ]
+                        )
+                    )
+                ):
+                    # 找到对应方向的监控配置
+                    for config in self.coin_monitoring[pair]:
+                        if config.get('direction') == direction:
+                            exit_points = config.get('exit_points', [])
+                            if exit_points and len(exit_points) >= 1:
+                                # 对退出点位进行排序
+                                if direction == 'long':
+                                    sorted_exit_points = sorted(exit_points)
+                                else:  # short
+                                    sorted_exit_points = sorted(exit_points, reverse=True)
+
+                                cost_price = trade.open_rate
+                                exit_points_count = len(sorted_exit_points)
+
+                                logger.info(
+                                    f"{pair} 检测到止盈回撤: exit_stage={exit_stage}, current_profit={current_profit:.3f}, current_rate={current_rate}, cost_price={cost_price}"
+                                )
+
+                                # 检查回撤清仓条件
+                                should_exit = False
+                                exit_tag = ''
+
+                                # 2个点位的回撤处理
+                                if exit_points_count == 2 and exit_stage == 1:
+                                    if (direction == 'long' and current_rate <= cost_price) or (
+                                        direction == 'short' and current_rate >= cost_price
+                                    ):
+                                        should_exit = True
+                                        exit_tag = f'{direction}_tp1_pullback_cost'
+
+                                # 3个或更多点位的回撤处理
+                                elif exit_points_count >= 3:
+                                    if direction == 'long':
+                                        if exit_stage == 1 and current_rate <= cost_price:
+                                            should_exit = True
+                                            exit_tag = 'long_tp1_pullback_cost'
+                                        elif (
+                                            exit_stage == 2
+                                            and current_rate <= sorted_exit_points[0]
+                                        ):
+                                            should_exit = True
+                                            exit_tag = 'long_tp2_pullback_tp1'
+                                    else:  # short
+                                        if exit_stage == 1 and current_rate >= cost_price:
+                                            should_exit = True
+                                            exit_tag = 'short_tp1_pullback_cost'
+                                        elif (
+                                            exit_stage == 2
+                                            and current_rate >= sorted_exit_points[0]
+                                        ):
+                                            should_exit = True
+                                            exit_tag = 'short_tp2_pullback_tp1'
+
+                                # 执行回撤清仓
+                                if should_exit:
+                                    logger.info(f"{pair} 触发止盈回撤清仓: {exit_tag}")
+                                    self.enable_auto_calculation(pair, direction)
+                                    self.recalculate_all_auto_monitoring_pairs()
+                                    return -trade.stake_amount, exit_tag
+
+                                break
+
             # 检查补仓冷却期
             last_dca_time = trade.get_custom_data('last_dca_time')
 
@@ -1358,25 +1437,14 @@ class KamaFama_Dynamic(IStrategy):
                         last_dca_timestamp, trade.open_date_utc.tzinfo
                     )
 
-                    # 检查时间戳是否合理（不能早于开仓时间，不能晚于当前时间太多）
-                    if last_dca_datetime < trade.open_date_utc:
-                        logger.warning(
-                            f"{pair}: last_dca_time ({last_dca_datetime}) 早于开仓时间 ({trade.open_date_utc})，使用开仓时间"
-                        )
-                        last_dca_datetime = trade.open_date_utc
-                    elif last_dca_datetime > current_time + timedelta(minutes=5):
-                        logger.warning(
-                            f"{pair}: last_dca_time ({last_dca_datetime}) 晚于当前时间太多，使用当前时间"
-                        )
-                        last_dca_datetime = current_time
-
                     if current_time < last_dca_datetime + timedelta(minutes=cooldown_minutes):
                         time_remaining = (
                             last_dca_datetime + timedelta(minutes=cooldown_minutes) - current_time
                         ).total_seconds() / 60
-                        logger.info(
-                            f"{pair}: 补仓冷却期未结束，上次补仓/开仓时间: {last_dca_datetime}, 剩余冷却时间: {time_remaining:.1f}分钟"
-                        )
+                        if int(time_remaining) % 60 == 0:
+                            logger.info(
+                                f"{pair}: 补仓冷却期未结束，上次补仓/开仓时间: {last_dca_datetime}, 剩余冷却时间: {time_remaining:.1f}分钟"
+                            )
                         return None
 
                 except Exception as e:
@@ -1535,7 +1603,7 @@ class KamaFama_Dynamic(IStrategy):
                     if min_stake and dca_amount < min_stake:
                         # 如果最小补仓金额会导致总金额超过400，则不补仓
                         if trade.stake_amount + min_stake > 400:
-                            logger.info(f"{pair}: 最小补仓金额 {min_stake} 会导致总金额超过 400，不补仓")
+                            # logger.info(f"{pair}: 最小补仓金额 {min_stake} 会导致总金额超过 400，不补仓")
                             dca_amount = 0
                         else:
                             dca_amount = min_stake
