@@ -1749,9 +1749,10 @@ class KamaFama_Dynamic(IStrategy):
                                 )
 
                             # 处理回撤情况
-                            elif (direction == 'long' and current_rate <= cost_price) or (
-                                direction == 'short' and current_rate >= cost_price
-                            ):
+                            elif (
+                                (direction == 'long' and current_rate <= cost_price)
+                                or (direction == 'short' and current_rate >= cost_price)
+                            ) and (current_profit >= -0.005):
                                 # 从第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
                                 self.enable_auto_calculation(pair, direction)
@@ -1786,7 +1787,11 @@ class KamaFama_Dynamic(IStrategy):
                                 return -trade.stake_amount, f"long_tp3_{sorted_exit_points[2]}"
 
                             # 处理回撤情况 - 多头
-                            elif exit_stage == 1 and current_rate <= cost_price:
+                            elif (
+                                exit_stage == 1
+                                and current_rate <= cost_price
+                                and current_profit >= -0.005
+                            ):
                                 # 第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
                                 self.enable_auto_calculation(pair, direction)
@@ -1830,7 +1835,11 @@ class KamaFama_Dynamic(IStrategy):
                                 return -trade.stake_amount, f"short_tp3_{sorted_exit_points[2]}"
 
                             # 处理回撤情况 - 空头
-                            elif exit_stage == 1 and current_rate >= cost_price:
+                            elif (
+                                exit_stage == 1
+                                and current_rate >= cost_price
+                                and current_profit >= -0.005
+                            ):
                                 # 第一阶段回撤到成本价，清仓
                                 logger.info(f"{pair} 从第一点位回撤至成本价 {cost_price}，清仓")
                                 self.enable_auto_calculation(pair, direction)
