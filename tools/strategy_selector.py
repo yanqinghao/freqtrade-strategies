@@ -108,7 +108,7 @@ def main(threshold=-50):
     # Select the strategies
     strategies = select_strategies(long_data, short_data, threshold=threshold)
 
-    pairs = list(strategies.keys())
+    pairs = list(set(list(strategies.keys()) + list(coin_monitoring.keys())))
 
     # Build the output JSON
     output = {'pair_strategy_mode': strategies}
