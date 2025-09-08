@@ -561,7 +561,7 @@ class KamaFama_Dynamic(IStrategy):
                 if exchange_name == 'binance':
                     exchange.options['defaultType'] = 'spot'
 
-            logger.info(f"使用CCXT获取 {pair} {timeframe} 数据")
+            # logger.info(f"使用CCXT获取 {pair} {timeframe} 数据")
 
             # 加载市场
             exchange.load_markets()
@@ -576,7 +576,7 @@ class KamaFama_Dynamic(IStrategy):
                 # 转换时间戳为日期时间
                 df['date'] = pd.to_datetime(df['date'], unit='ms')
 
-                logger.info(f"成功获取 {pair} {timeframe} 数据，共 {len(df)} 条")
+                # logger.info(f"成功获取 {pair} {timeframe} 数据，共 {len(df)} 条")
                 return df
             else:
                 logger.error(f"未获取到 {pair} 的 {timeframe} 数据")
