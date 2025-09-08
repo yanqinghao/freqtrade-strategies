@@ -75,6 +75,7 @@ class KamaFama_Dynamic(IStrategy):
 
     # 固定点位监控
     coin_monitoring = {}
+    manual_open = {}
 
     # For price monitoring notifications
     monitoring_notification_sent = {}
@@ -201,6 +202,8 @@ class KamaFama_Dynamic(IStrategy):
             # 加载并处理固定点位监控配置
             if 'coin_monitoring' in state_data:
                 self.coin_monitoring = state_data['coin_monitoring']
+            if 'manual_open' in state_data:
+                self.manual_open = state_data['manual_open']
                 updated_configs = False
 
                 # 处理每个交易对的监控配置
@@ -1261,6 +1264,26 @@ class KamaFama_Dynamic(IStrategy):
         Called right before executing a trade exit order.
         This method checks if the exit is due to ROI and re-enables auto calculation if needed.
         """
+        # Manual trade cleanup
+        if trade.enter_tag and 'manual' in trade.enter_tag:
+            # 'amount' 是卖出的标的数量；用 trade.amount 判定是否整仓
+            try:
+                full_close = (
+                    trade.amount is not None
+                    and amount is not None
+                    and abs(float(trade.amount) - float(amount))
+                    <= max(1e-12, float(trade.amount) * 1e-3)  # 0.1% 容差
+                )
+            except Exception:
+                full_close = False
+
+            if full_close and pair in self.manual_open:
+                logger.info(
+                    f"Manual trade for {pair} fully closing. Cleaning up manual monitoring."
+                )
+                del self.manual_open[pair]
+                self.update_strategy_state_file()
+
         direction = 'short' if trade.is_short else 'long'
 
         # Check if this is a ROI exit
@@ -1535,6 +1558,7 @@ class KamaFama_Dynamic(IStrategy):
                 strategy_state['coin_monitoring'] = self.coin_monitoring
                 strategy_state['pair_strategy_mode'] = self.pair_strategy_mode
                 strategy_state['price_range_thresholds'] = self.price_range_thresholds
+                strategy_state['manual_open'] = self.manual_open
 
                 # 写入更新后的内容
                 with open(file_path, 'w') as f:
@@ -1576,6 +1600,24 @@ class KamaFama_Dynamic(IStrategy):
         # 初次遇到交易时，保存初始stake金额
         if trade.get_custom_data('initial_stake') is None:
             trade.set_custom_data('initial_stake', trade.stake_amount)
+
+        if trade.enter_tag and 'manual' in trade.enter_tag:
+            manual_cfg = self.manual_open.get(trade.pair, {})
+            sl_price = manual_cfg.get('stop_loss')
+            if sl_price:
+                if trade.is_short:
+                    # 空头：若价格 >= SL 价，直接全部买回平仓
+                    if current_rate >= sl_price:
+                        # 可选：恢复自动点位计算
+                        self.enable_auto_calculation(trade.pair, 'short')
+                        self.recalculate_all_auto_monitoring_pairs()
+                        return -trade.stake_amount, 'manual_sl_hit'
+                else:
+                    # 多头：若价格 <= SL 价，直接全部卖出
+                    if current_rate <= sl_price:
+                        self.enable_auto_calculation(trade.pair, 'long')
+                        self.recalculate_all_auto_monitoring_pairs()
+                        return -trade.stake_amount, 'manual_sl_hit'
 
         # 先检查是否需要补仓
         if current_profit < 0:
@@ -1907,6 +1949,127 @@ class KamaFama_Dynamic(IStrategy):
                 trade.set_custom_data('exit_stage', 0)
 
         # 检查是否是固定点位监控的交易对
+        # Manual trade exit logic
+        if trade.enter_tag and 'manual' in trade.enter_tag:
+            manual_config = self.manual_open.get(pair)
+            if manual_config:
+                exit_points = manual_config.get('exit_points', [])
+                # The logic from here is an adaptation of the coin_monitoring logic below
+                if not exit_points or len(exit_points) < 1:
+                    return None
+
+                if direction == 'long':
+                    sorted_exit_points = sorted(exit_points)
+                else:  # short
+                    sorted_exit_points = sorted(exit_points, reverse=True)
+
+                cost_price = trade.open_rate
+                exit_stage = trade.get_custom_data('exit_stage', default=0)
+
+                if exit_stage == 0 and trade.get_custom_data('initial_stake') is None:
+                    trade.set_custom_data('initial_stake', trade.stake_amount)
+                initial_stake = trade.get_custom_data('initial_stake', default=trade.stake_amount)
+                exit_points_count = len(sorted_exit_points)
+
+                if exit_points_count == 1:
+                    if (direction == 'long' and current_rate >= sorted_exit_points[0]) or (
+                        direction == 'short' and current_rate <= sorted_exit_points[0]
+                    ):
+                        logger.info(f"Manual trade: Triggering single exit point for {pair}")
+                        return -trade.stake_amount, f"manual_{direction}_single_tp"
+
+                elif exit_points_count == 2:
+                    if exit_stage == 0 and (
+                        (direction == 'long' and current_rate >= sorted_exit_points[0])
+                        or (direction == 'short' and current_rate <= sorted_exit_points[0])
+                    ):
+                        trade.set_custom_data('exit_stage', 1)
+                        self._adjust_stoploss(trade, cost_price)
+                        logger.info(f"Manual trade: Triggering TP1 of 2 for {pair}")
+                        return -(initial_stake * 0.5), f"manual_{direction}_tp1_of_2"
+
+                    elif exit_stage == 1:
+                        if (direction == 'long' and current_rate >= sorted_exit_points[1]) or (
+                            direction == 'short' and current_rate <= sorted_exit_points[1]
+                        ):
+                            trade.set_custom_data('exit_stage', 2)
+                            logger.info(f"Manual trade: Triggering TP2 of 2 for {pair}")
+                            return -trade.stake_amount, f"manual_{direction}_tp2_of_2"
+                        # Pullback logic for 2 exit points
+                        elif (
+                            (direction == 'long' and current_rate <= cost_price)
+                            or (direction == 'short' and current_rate >= cost_price)
+                        ) and (current_profit >= -0.005):
+                            logger.info(
+                                f"Manual trade for {pair} pulling back to cost price. Exiting position."
+                            )
+                            self.enable_auto_calculation(pair, direction)
+                            self.recalculate_all_auto_monitoring_pairs()
+                            return -trade.stake_amount, f'manual_{direction}_tp1_pullback_cost'
+
+                else:  # 3 or more points
+                    if exit_stage == 0 and (
+                        (direction == 'long' and current_rate >= sorted_exit_points[0])
+                        or (direction == 'short' and current_rate <= sorted_exit_points[0])
+                    ):
+                        trade.set_custom_data('exit_stage', 1)
+                        self._adjust_stoploss(trade, cost_price)
+                        logger.info(
+                            f"Manual trade: Triggering TP1 of {exit_points_count} for {pair}"
+                        )
+                        return -(initial_stake * 0.3), f"manual_{direction}_tp1"
+
+                    elif exit_stage == 1:
+                        if (direction == 'long' and current_rate >= sorted_exit_points[1]) or (
+                            direction == 'short' and current_rate <= sorted_exit_points[1]
+                        ):
+                            trade.set_custom_data('exit_stage', 2)
+                            self._adjust_stoploss(trade, sorted_exit_points[0])
+                            remaining_stake = trade.stake_amount
+                            logger.info(
+                                f"Manual trade: Triggering TP2 of {exit_points_count} for {pair}"
+                            )
+                            return -(remaining_stake * 0.5), f"manual_{direction}_tp2"
+                        # Pullback from TP1 to cost
+                        elif (
+                            direction == 'long'
+                            and current_rate <= cost_price
+                            and current_profit >= -0.005
+                        ) or (
+                            direction == 'short'
+                            and current_rate >= cost_price
+                            and current_profit >= -0.005
+                        ):
+                            logger.info(
+                                f"Manual trade for {pair} pulling back to cost price from TP1. Exiting position."
+                            )
+                            self.enable_auto_calculation(pair, direction)
+                            self.recalculate_all_auto_monitoring_pairs()
+                            return -trade.stake_amount, f'manual_{direction}_tp1_pullback_cost'
+
+                    elif exit_stage == 2:
+                        if (direction == 'long' and current_rate >= sorted_exit_points[2]) or (
+                            direction == 'short' and current_rate <= sorted_exit_points[2]
+                        ):
+                            logger.info(
+                                f"Manual trade: Triggering TP3 of {exit_points_count} for {pair}"
+                            )
+                            return -trade.stake_amount, f"manual_{direction}_tp3"
+                        # Pullback from TP2 to TP1
+                        elif (direction == 'long' and current_rate <= sorted_exit_points[0]) or (
+                            direction == 'short' and current_rate >= sorted_exit_points[0]
+                        ):
+                            logger.info(
+                                f"Manual trade for {pair} pulling back to TP1 price. Exiting position."
+                            )
+                            self.enable_auto_calculation(pair, direction)
+                            self.recalculate_all_auto_monitoring_pairs()
+                            return -trade.stake_amount, f'manual_{direction}_tp2_pullback_tp1'
+
+            # If it's a manual trade, we've handled it or decided not to act.
+            # Don't fall through to coin_monitoring logic.
+            return None
+
         if (
             pair in self.coin_monitoring
             and self.coin_monitoring.get(pair)

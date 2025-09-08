@@ -10,6 +10,7 @@ import logging
 import re
 import io
 import ccxt
+import time
 
 # Generate chart image
 import pandas as pd
@@ -36,10 +37,11 @@ from telegram import (
     Update,
     InputMediaPhoto,
     InputMediaDocument,
+    ForceReply,
 )
 from telegram.constants import MessageLimit, ParseMode
 from telegram.error import BadRequest, NetworkError, TelegramError
-from telegram.ext import Application, CallbackContext, CallbackQueryHandler, CommandHandler
+from telegram.ext import Application, CallbackContext, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from telegram.helpers import escape_markdown
 
 from freqtrade.__init__ import __version__
@@ -75,6 +77,12 @@ logger = logging.getLogger(__name__)
 
 logger.debug('Included module rpc.telegram ...')
 
+def _normalize_pair(p: str) -> str:
+        p = p.upper()
+        if ':' in p: return p
+        if p.endswith('/USDT'): return p + ':USDT'
+        if '/' not in p: return p + '/USDT:USDT'
+        return p
 
 def safe_async_db(func: Callable[..., Any]):
     """
@@ -166,6 +174,7 @@ class Telegram(RPCHandler):
         self._loop: asyncio.AbstractEventLoop
         self._init_keyboard()
         self._start_thread()
+        self._pending_force: dict[tuple[int, int], dict] = {}
 
     def _start_thread(self):
         """
@@ -362,6 +371,7 @@ class Telegram(RPCHandler):
             CallbackQueryHandler(self._count, pattern='update_count'),
             CallbackQueryHandler(self._force_exit_inline, pattern=r'force_exit__\S+'),
             CallbackQueryHandler(self._force_enter_inline, pattern=r'force_enter__\S+'),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_force_enter_reply)
         ]
         for handle in handles:
             self._app.add_handler(handle)
@@ -1394,13 +1404,61 @@ class Telegram(RPCHandler):
                 else:
                     await query.edit_message_text(text=f"Trade {trade_id} not found.")
 
-    async def _force_enter_action(self, pair, price: float | None, order_side: SignalDirection):
+
+
+    @authorized_only
+    async def on_force_enter_reply(self, update: Update, context: CallbackContext) -> None:
+        msg = update.message
+        key = (msg.chat_id, msg.from_user.id)
+        pending = self._pending_force.get(key)
+        if not pending:
+            return  # 不是我们的收集流程，忽略
+
+        # （可选）超时 2 分钟
+        if time.time() - pending['ts'] > 120:
+            del self._pending_force[key]
+            await msg.reply_text('已超时，请重新点击按钮发起。')
+            return
+
+        parts = msg.text.strip().split()
+        if len(parts) < 6:
+            await msg.reply_text('参数不足，请按格式：<size> <leverage> <tp1> <tp2> <tp3> <sl> [price]')
+            return
+
+        try:
+            size = float(parts[0]); leverage = float(parts[1])
+            tp1  = float(parts[2]); tp2      = float(parts[3]); tp3 = float(parts[4])
+            sl   = float(parts[5])
+            price = float(parts[6]) if len(parts) > 6 else None
+
+            pair = _normalize_pair(pending['pair'])
+            order_side = SignalDirection(pending['side'])
+
+            # 写入 manual_open 配置
+            await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side)
+
+            # 真正强制进场
+            await self._force_enter_action(
+                pair, price, order_side,
+                stake_amount=size, leverage=leverage,
+                enter_tag=f'manual_{order_side.value}'
+            )
+
+            await msg.reply_text('手动开单已提交 ✅')
+        except Exception as e:
+            await msg.reply_text(f"解析或下单失败：{e}")
+            logger.exception('Force enter reply error')
+        finally:
+            # 清理状态
+            self._pending_force.pop(key, None)
+
+    async def _force_enter_action(self, pair, price: float | None, order_side: SignalDirection, stake_amount: float, leverage: float, enter_tag: str):
         if pair != 'cancel':
             try:
 
                 @safe_async_db
                 def _force_enter():
-                    self._rpc._rpc_force_entry(pair, price, order_side=order_side)
+                    self._rpc._rpc_force_entry(pair, price, order_side=order_side, stake_amount=stake_amount, leverage=leverage, enter_tag=enter_tag)
 
                 loop = asyncio.get_running_loop()
                 # Workaround to avoid nested loops
@@ -1412,19 +1470,28 @@ class Telegram(RPCHandler):
     async def _force_enter_inline(self, update: Update, _: CallbackContext) -> None:
         if update.callback_query:
             query = update.callback_query
-            if query.data and '__' in query.data:
-                # Input data is "force_enter__<pair|cancel>_<side>"
-                payload = query.data.split('__')[1]
-                if payload == 'cancel':
-                    await query.answer()
-                    await query.edit_message_text(text='Force enter canceled.')
-                    return
-                if payload and '_||_' in payload:
-                    pair, side = payload.split('_||_')
-                    order_side = SignalDirection(side)
-                    await query.answer()
-                    await query.edit_message_text(text=f"Manually entering {order_side} for {pair}")
-                    await self._force_enter_action(pair, None, order_side)
+            payload = query.data.split('__')[1]  # "force_enter__<pair|cancel>_||_<side>"
+            if payload == 'cancel':
+                await query.answer()
+                await query.edit_message_text(text='Force enter canceled.')
+                return
+
+            if '_||_' in payload:
+                pair, side = payload.split('_||_')
+                order_side = SignalDirection(side)
+                await query.answer()
+                await query.edit_message_text(text=f"准备手动开单 {order_side.value} / {pair}")
+
+                # 记录待填写状态（按 chat_id + user_id）
+                key = (query.message.chat_id, query.from_user.id)
+                self._pending_force[key] = {'pair': pair, 'side': order_side.value, 'ts': time.time()}
+
+                # 让用户在下一条消息里输入参数
+                await query.message.reply_text(
+                    '请按格式回复：<size> <leverage> <tp1> <tp2> <tp3> <sl> [price]\n'
+                    '例如：100 3 71000 72000 73500 69500',
+                    reply_markup=ForceReply(selective=True)
+                )
 
     @staticmethod
     def _layout_inline_keyboard(
@@ -1432,37 +1499,119 @@ class Telegram(RPCHandler):
     ) -> list[list[InlineKeyboardButton]]:
         return [buttons[i : i + cols] for i in range(0, len(buttons), cols)]
 
-    @authorized_only
-    async def _force_enter(
-        self, update: Update, context: CallbackContext, order_side: SignalDirection
-    ) -> None:
+    async def _update_manual_trade_config(
+        self,
+        pair: str,
+        size: float,
+        leverage: float,
+        tps: list[float],
+        sl: float,
+        order_side: SignalDirection,
+    ):
         """
-        Handler for /forcelong <asset> <price> and `/forceshort <asset> <price>
-        Buys a pair trade at the given or current price
-        :param bot: telegram bot
-        :param update: message update
-        :return: None
+        Updates strategy_state.json with manual trade configuration.
         """
-        if context.args:
-            pair = context.args[0]
-            price = float(context.args[1]) if len(context.args) > 1 else None
-            await self._force_enter_action(pair, price, order_side)
-        else:
-            whitelist = self._rpc._rpc_whitelist()['whitelist']
-            pair_buttons = [
-                InlineKeyboardButton(
-                    text=pair, callback_data=f"force_enter__{pair}_||_{order_side}"
-                )
-                for pair in sorted(whitelist)
-            ]
-            buttons_aligned = self._layout_inline_keyboard(pair_buttons)
+        state_file = 'user_data/strategy_state.json'
 
-            buttons_aligned.append(
-                [InlineKeyboardButton(text='Cancel', callback_data='force_enter__cancel')]
-            )
-            await self._send_msg(
-                msg='Which pair?', keyboard=buttons_aligned, query=update.callback_query
-            )
+        try:
+            with open(state_file, 'r') as f:
+                strategy_state = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            strategy_state = {}
+
+        if 'manual_open' not in strategy_state:
+            strategy_state['manual_open'] = {}
+
+        strategy_state['manual_open'][pair] = {
+            'size': size,
+            'leverage': leverage,
+            'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)),
+            'stop_loss': sl,
+            'direction': order_side.value,
+            'timestamp': datetime.now().timestamp(),  # Add timestamp to avoid using stale entries
+        }
+
+        with open(state_file, 'w') as f:
+            json.dump(strategy_state, f, indent=4)
+
+        # Update in-memory strategy attribute
+        if hasattr(self._rpc._freqtrade, 'strategy'):
+            self._rpc._freqtrade.strategy.manual_open = strategy_state['manual_open']
+
+        logger.info(f"Updated manual trade config for {pair} in {state_file} and in-memory.")
+        await self._send_msg(
+            f"Manual trade config for {pair} has been set. The strategy will pick it up on the next tick."
+        )
+        # 获取当前白名单
+        current_whitelist = self._rpc._rpc_whitelist()['whitelist']
+
+        if pair in current_whitelist:
+            await self._send_msg(f'交易对 {pair} 已在当前白名单中')
+        else:
+            with open('/freqtrade/config_production.json', 'r') as f:
+                config = json.load(f)
+
+            config['exchange']['pair_whitelist'].append(pair)
+
+            with open('/freqtrade/config_production.json', 'w') as f:
+                json.dump(config, f, indent=4)
+
+            self._rpc._rpc_reload_config()
+            await self._send_msg(f'交易对 {', '.join(pair)} 已加入白名单')
+
+    @authorized_only
+    async def _force_enter(self, update: Update, context: CallbackContext, order_side: SignalDirection) -> None:
+        """
+        /forcelong <pair> <size> <leverage> <tp1> <tp2> <tp3> <sl> [price]
+        /forceshort <pair> <size> <leverage> <tp1> <tp2> <tp3> <sl> [price]
+        """
+        # 1) 参数齐全：走你原来的逻辑
+        if context.args and len(context.args) >= 7:
+            try:
+                pair = self._normalize_pair(context.args[0])
+                size = float(context.args[1])
+                leverage = float(context.args[2])
+                tp1 = float(context.args[3]); tp2 = float(context.args[4]); tp3 = float(context.args[5])
+                sl  = float(context.args[6])
+                price = float(context.args[7]) if len(context.args) > 7 else None
+
+                await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side)
+                await self._force_enter_action(
+                    pair, price, order_side,
+                    stake_amount=size, leverage=leverage,
+                    enter_tag=f'manual_{order_side.value}'
+                )
+
+            except ValueError:
+                await self._send_msg('Invalid parameter format. Size, leverage, TPs and SL must be numbers.')
+            except Exception as e:
+                await self._send_msg(f"An error occurred: {e}")
+                logger.exception('Error in _force_enter')
+            return
+
+        # 2) 参数不全：触发 ForceReply“窗口”
+        user = update.effective_user
+        chat = update.effective_chat
+        key = (chat.id, user.id)
+
+        # 记录待填写状态（保存方向；pair 可让用户一并填）
+        self._pending_force[key] = {
+            'side': order_side.value,
+            'ts': time.time()
+        }
+
+        command = '/forcelong' if order_side == SignalDirection.LONG else '/forceshort'
+        text = (
+            f"请按格式回复以下参数（含交易对）：\n"
+            f"<pair> <size> <leverage> <tp1> <tp2> <tp3> <sl> [price]\n"
+            f"示例：BTC/USDT 100 3 71000 72000 73500 69500\n\n"
+            f"也可以写现货合约格式：BTC/USDT:USDT"
+        )
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=ForceReply(selective=True)
+        )
 
     @authorized_only
     async def _trades(self, update: Update, context: CallbackContext) -> None:
