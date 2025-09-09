@@ -905,248 +905,412 @@ class KamaFama_Dynamic(IStrategy):
 
     def check_price_monitoring(self, dataframe: DataFrame, pair: str):
         """
-        两路并行通知：
-        1) 形态反转通知：15m反转形态 + 1h趋势过滤（独立于监控价位）
-        2) 接近/跌破监控位通知：5m价格 vs entry_points（不要求形态或1h过滤）
+        两路并行通知（优化精简版，含 Morning/Evening Star + 趋势直通车）：
+        1) 形态反转：15m 形态(Setup) + 1h 背景 + 靠近监控位 + 突破确认(ATR)
+        2) 监控位靠近/穿越：5m 价格 vs entry_points（ATR 距离）
+        3) 强趋势直通车：1h 趋势强时，绕过形态，直接以“越过监控位 + ATR 余量”确认
         """
-        # === 参数 ===
-        USE_LAST_CLOSED_CANDLE = True  # 形态/过滤统一使用已收盘K线（-2）
-        APPROACH_PCT = 0.005  # 接近阈值 0.5%
+        # ===== 参数 =====
+        USE_LAST_CLOSED_CANDLE = True
+        COOLDOWN_BARS_15M = 6
+        SETUP_EXPIRE_BARS = 2
+        CONFIRM_ATR_MULT = 0.25
+        NEAR_LEVEL_ATR_MULT = 0.6
+        MIN_BODY_ATR_MULT = 0.25
+        APPROACH_ATR_MULT = 0.35
+        SWING_LOOKBACK = 6
+
+        # 趋势直通车参数（不改变原有参数）
+        TREND_BYPASS = True            # 开关：强趋势时允许绕过形态
+        ADX_TREND = 22                 # 1h ADX 判强阈值（20~25常用） ADX_TREND 降到 20；BYPASS_LEVEL_ATR_MULT 降到 0.2。
+        BYPASS_LEVEL_ATR_MULT = 0.25   # 越过监控位所需的 ATR 余量 ADX_TREND 提到 25；BYPASS_LEVEL_ATR_MULT 提到 0.3~0.35
 
         if self.config.get('runmode', None) not in ('live', 'dry_run'):
             return
         if pair not in self.coin_monitoring:
             return
 
-        # 有持仓则不发“价格监控位通知”，但形态反转通知仍可自行决定是否保留。
+        # ========= 状态 =========
+        if not hasattr(self, 'monitoring_notification_sent'):
+            self.monitoring_notification_sent = {}
+        if not hasattr(self, 'reversal_notification_sent'):
+            self.reversal_notification_sent = {}
+        if not hasattr(self, 'reversal_setups'):
+            self.reversal_setups = {}
+
+        # ========= 小工具 =========
+        def _cooldown_ok(direction_ts, current_ts):
+            if direction_ts is None:
+                return True
+            try:
+                return (current_ts - direction_ts).total_seconds() >= COOLDOWN_BARS_15M * 15 * 60
+            except Exception:
+                return True
+
+        def _near_any_level(price, levels, atr_val, atr_mult):
+            if not levels or atr_val is None or np.isnan(atr_val):
+                return False
+            thr = atr_mult * atr_val
+            for lv in levels:
+                if abs(price - lv) <= thr:
+                    return True
+            return False
+
+        # ========= 监控位集合（直接使用 coin_monitoring 的 entry_points） =========
+        monitoring_configs = self.coin_monitoring.get(pair, [])
+        levels_long, levels_short = [], []
+        for cfg in monitoring_configs:
+            pts = cfg.get('entry_points', []) or []
+            if cfg.get('direction', 'long') == 'long':
+                levels_long.extend(pts)
+            else:
+                levels_short.extend(pts)
+
+        # ========= ② 接近/穿越监控位（5m ATR） =========
         active_trades = Trade.get_trades_proxy(is_open=True, pair=pair)
-        # —— 5m 当前价格（价格类通知使用）——
-        current_price = dataframe['close'].iloc[-1]
+        current_price = float(dataframe['close'].iloc[-1])
 
-        # ========== ① 形态反转通知：15m + 1h 过滤 ==========
-        # 15m K线（用你提供的 ccxt 封装）
+        try:
+            atr_5m_series = ta.ATR(dataframe, timeperiod=14)
+            atr_5m = float(atr_5m_series.iloc[-1]) if len(atr_5m_series) == len(dataframe) else np.nan
+        except Exception:
+            atr_5m = np.nan
+
+        if not active_trades:
+            for cfg in monitoring_configs:
+                direction = cfg.get('direction', 'long')
+                eps = cfg.get('entry_points', []) or []
+                for price_point in eps:
+                    state = (
+                        self.monitoring_notification_sent
+                            .setdefault(pair, {})
+                            .setdefault(direction, {})
+                            .setdefault(price_point, {'approaching': False, 'crossed': False})
+                    )
+
+                    if direction == 'long':
+                        is_approaching = (
+                            (current_price > price_point)
+                            and (not np.isnan(atr_5m))
+                            and ((current_price - price_point) <= APPROACH_ATR_MULT * atr_5m)
+                        )
+                        has_crossed = current_price < price_point
+                        is_away = (not np.isnan(atr_5m)) and (current_price > price_point + APPROACH_ATR_MULT * atr_5m)
+
+                        if is_approaching and not state['approaching']:
+                            if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                                self.dp.send_msg(
+                                    f"🔔 LONG approaching {pair}\n"
+                                    f"Price: {current_price:.6f} | Point: {price_point:.6f}"
+                                )
+                            state['approaching'] = True
+                            state['crossed'] = False
+
+                        if has_crossed and not state['crossed']:
+                            if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                                self.dp.send_msg(
+                                    f"✅ LONG crossed {pair}\n"
+                                    f"Price: {current_price:.6f} | Point: {price_point:.6f}"
+                                )
+                            state['crossed'] = True
+                            state['approaching'] = True
+
+                        if is_away and (state['approaching'] or state['crossed']):
+                            state['approaching'] = False
+                            state['crossed'] = False
+
+                    else:  # short
+                        is_approaching = (
+                            (current_price < price_point)
+                            and (not np.isnan(atr_5m))
+                            and ((price_point - current_price) <= APPROACH_ATR_MULT * atr_5m)
+                        )
+                        has_crossed = current_price > price_point
+                        is_away = (not np.isnan(atr_5m)) and (current_price < price_point - APPROACH_ATR_MULT * atr_5m)
+
+                        if is_approaching and not state['approaching']:
+                            if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                                self.dp.send_msg(
+                                    f"🔔 SHORT approaching {pair}\n"
+                                    f"Price: {current_price:.6f} | Point: {price_point:.6f}"
+                                )
+                            state['approaching'] = True
+                            state['crossed'] = False
+
+                        if has_crossed and not state['crossed']:
+                            if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                                self.dp.send_msg(
+                                    f"✅ SHORT crossed {pair}\n"
+                                    f"Price: {current_price:.6f} | Point: {price_point:.6f}"
+                                )
+                            state['crossed'] = True
+                            state['approaching'] = True
+
+                        if is_away and (state['approaching'] or state['crossed']):
+                            state['approaching'] = False
+                            state['crossed'] = False
+
+        # ========= ① 形态反转：15m + 1h 背景 + 监控位约束 + 突破确认 =========
         df15m = self.get_ohlcv_history(pair, timeframe='15m', limit=200)
-        # 1h K线
         df1h = self.get_ohlcv_history(pair, timeframe='1h', limit=200)
+        if df15m is None or len(df15m) < 5:
+            return
 
-        def _bodies_shadows(r):
-            o, h, l, c = r['open'], r['high'], r['low'], r['close']
-            body = abs(c - o)
-            upper = max(h - max(c, o), 0)
-            lower = max(min(c, o) - l, 0)
-            return body, upper, lower, o, c, h, l
+        # 15m ATR 和索引
+        try:
+            atr_15m_series = ta.ATR(df15m, timeperiod=14)
+        except Exception:
+            atr_15m_series = pd.Series(index=df15m.index, dtype=float)
 
-        # ---- 15m 反转形态 ----
-        def _hammer(r):
-            body, upper, lower, o, c, h, l = _bodies_shadows(r)
-            return body > 0 and (lower >= 2.0 * body) and (upper <= 1.2 * body) and (c > o)
+        idx15 = -2 if USE_LAST_CLOSED_CANDLE else -1
+        r = df15m.iloc[idx15]
+        atr_val = float(atr_15m_series.iloc[idx15]) if len(atr_15m_series) >= len(df15m) else np.nan
+        ts_15m = r['date'] if 'date' in r else df15m.index[idx15]
 
-        def _inverted_hammer(r):
-            body, upper, lower, o, c, h, l = _bodies_shadows(r)
-            return body > 0 and (upper >= 2.0 * body) and (lower <= 1.0 * body) and (c > o)
-
-        def _bullish_engulfing(p, r):
-            pb, _, _, po, pc, _, _ = _bodies_shadows(p)
-            b, _, _, o, c, _, _ = _bodies_shadows(r)
-            return (pc < po) and (c > o) and (o <= pc) and (c >= po) and (b > pb * 0.8)
-
-        def _morning_star(p2, p1, r):
-            b2, _, _, o2, c2, _, _ = _bodies_shadows(p2)
-            b1, _, _, o1, c1, _, _ = _bodies_shadows(p1)
-            b0, _, _, o0, c0, _, _ = _bodies_shadows(r)
-            mid2 = (o2 + c2) / 2.0
-            return (
-                (c2 < o2) and (b2 > 0) and (abs(c1 - o1) <= b2 * 0.5) and (c0 > o0) and (c0 >= mid2)
-            )
-
-        def _shooting_star(r):
-            body, upper, lower, o, c, h, l = _bodies_shadows(r)
-            return body > 0 and (upper >= 2.0 * body) and (lower <= 1.0 * body) and (c < o)
-
-        def _bearish_engulfing(p, r):
-            pb, _, _, po, pc, _, _ = _bodies_shadows(p)
-            b, _, _, o, c, _, _ = _bodies_shadows(r)
-            return (pc > po) and (c < o) and (o >= pc) and (c <= po) and (b > pb * 0.8)
-
-        def _evening_star(p2, p1, r):
-            b2, _, _, o2, c2, _, _ = _bodies_shadows(p2)
-            b1, _, _, o1, c1, _, _ = _bodies_shadows(p1)
-            b0, _, _, o0, c0, _, _ = _bodies_shadows(r)
-            mid2 = (o2 + c2) / 2.0
-            return (
-                (c2 > o2) and (b2 > 0) and (abs(c1 - o1) <= b2 * 0.5) and (c0 < o0) and (c0 <= mid2)
-            )
-
-        def _reversal_15m(df):
-            if df is None or len(df) < 5:
-                return (False, False, None, 'None')  # 无法做形态判断
-            idx = -2 if USE_LAST_CLOSED_CANDLE else -1
-            r = df.iloc[idx]
-            p1 = df.iloc[idx - 1]
-            p2 = df.iloc[idx - 2]
-            bull = (
-                _hammer(r)
-                or _inverted_hammer(r)
-                or _bullish_engulfing(p1, r)
-                or _morning_star(p2, p1, r)
-            )
-            bear = _shooting_star(r) or _bearish_engulfing(p1, r) or _evening_star(p2, p1, r)
-            labels = []
-            if _hammer(r):
-                labels.append('Hammer')
-            elif _inverted_hammer(r):
-                labels.append('InvHammer')
-            if _bullish_engulfing(p1, r):
-                labels.append('BullEngulf')
-            if _morning_star(p2, p1, r):
-                labels.append('MorningStar')
-            if _shooting_star(r):
-                labels.append('ShootingStar')
-            if _bearish_engulfing(p1, r):
-                labels.append('BearEngulf')
-            if _evening_star(p2, p1, r):
-                labels.append('EveningStar')
-            # 返回最后一根用于“去重”的时间戳
-            ts = r['date'] if 'date' in r else None
-            return bool(bull), bool(bear), ts, ('+'.join(labels) if labels else 'None')
-
-        bull_15m, bear_15m, ts_15m, label_15m = _reversal_15m(df15m)
-
-        # ---- 1h 趋势过滤（EMA20/EMA50）----
-        def _ema(series, n):
-            return series.ewm(span=n, adjust=False).mean()
-
+        # 1h 背景过滤（EMA20/EMA50）
         bull_1h_ok, bear_1h_ok = True, True
         if df1h is not None and len(df1h) >= 60:
             idx1h = -2 if USE_LAST_CLOSED_CANDLE else -1
-            df1h['ema20'] = _ema(df1h['close'], 20)
-            df1h['ema50'] = _ema(df1h['close'], 50)
+            ema20 = df1h['close'].ewm(span=20, adjust=False).mean()
+            ema50 = df1h['close'].ewm(span=50, adjust=False).mean()
             r1 = df1h.iloc[idx1h]
-            # 宽松过滤：满足其一即可（更稳可改成同时满足）
-            bull_1h_ok = (r1['close'] >= r1['ema20']) or (r1['ema20'] >= r1['ema50'])
-            bear_1h_ok = (r1['close'] <= r1['ema20']) or (r1['ema20'] <= r1['ema50'])
+            e20 = float(ema20.iloc[idx1h]); e50 = float(ema50.iloc[idx1h])
+            bull_1h_ok = (r1['close'] >= e20) or (e20 >= e50)
+            bear_1h_ok = (r1['close'] <= e20) or (e20 <= e50)
+        else:
+            idx1h = -1
+            ema20 = ema50 = None
 
-        pass_rev_long = bull_15m and bull_1h_ok
-        pass_rev_short = bear_15m and bear_1h_ok
+        # ===== 新增：1h 趋势强度（ADX + EMA20 斜率）=====
+        try:
+            adx1h_series = ta.ADX(df1h, timeperiod=14) if (df1h is not None and len(df1h) >= 20) else None
+            adx1h = float(adx1h_series.iloc[idx1h]) if adx1h_series is not None else np.nan
+        except Exception:
+            adx1h = np.nan
 
-        # —— 形态反转通知节流（每根15m只发一次）——
-        # 给策略新增一个状态容器（无需在__init__预先声明）
-        if not hasattr(self, 'reversal_notification_sent'):
-            self.reversal_notification_sent = {}  # { pair: {'long': last_ts, 'short': last_ts} }
+        ema20_slope = 0.0
+        try:
+            if df1h is not None and ema20 is not None and len(df1h) >= 5:
+                ema20_slope = float(ema20.iloc[idx1h] - ema20.iloc[idx1h - 3])
+        except Exception:
+            pass
+
+        trend_long_ok  = bull_1h_ok and (not np.isnan(adx1h)) and (adx1h >= ADX_TREND) and (ema20_slope > 0)
+        trend_short_ok = bear_1h_ok and (not np.isnan(adx1h)) and (adx1h >= ADX_TREND) and (ema20_slope < 0)
+
+        # ===== 新增：趋势直通车（绕过形态，仅要求“越过监控位 + ATR余量”）=====
+        def _trend_bypass(direction: str) -> bool:
+            if not TREND_BYPASS or np.isnan(atr_val):
+                return False
+
+            close_chk = float(df15m.iloc[idx15]['close'])
+            thr = BYPASS_LEVEL_ATR_MULT * atr_val
+
+            if direction == 'long' and trend_long_ok:
+                last_ts_long = self.reversal_notification_sent.get(pair, {}).get('long')
+                if not _cooldown_ok(last_ts_long, ts_15m):
+                    return False
+                for lv in levels_long:
+                    if close_chk > (lv + thr):
+                        self.reversal_notification_sent.setdefault(pair, {})['long'] = ts_15m
+                        self.reversal_setups.get(pair, {}).pop('long', None)
+                        if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                            self.dp.send_msg(
+                                f"🚀 Trend LONG Confirmed {pair}\n"
+                                f"Break lvl: {lv:.6f} (+{thr:.6f})\n"
+                                f"ADX(1h): {adx1h:.1f} | EMA20 slope: {ema20_slope:.6f}\n"
+                                f"Last Price(15m): {close_chk:.6f}"
+                            )
+                        logger.info(f"[TREND] LONG confirmed {pair} | break {lv} thr {thr}")
+                        return True
+                return False
+
+            if direction == 'short' and trend_short_ok:
+                last_ts_short = self.reversal_notification_sent.get(pair, {}).get('short')
+                if not _cooldown_ok(last_ts_short, ts_15m):
+                    return False
+                for lv in levels_short:
+                    if close_chk < (lv - thr):
+                        self.reversal_notification_sent.setdefault(pair, {})['short'] = ts_15m
+                        self.reversal_setups.get(pair, {}).pop('short', None)
+                        if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                            self.dp.send_msg(
+                                f"📉 Trend SHORT Confirmed {pair}\n"
+                                f"Break lvl: {lv:.6f} (-{thr:.6f})\n"
+                                f"ADX(1h): {adx1h:.1f} | EMA20 slope: {ema20_slope:.6f}\n"
+                                f"Last Price(15m): {close_chk:.6f}"
+                            )
+                        logger.info(f"[TREND] SHORT confirmed {pair} | break {lv} thr {thr}")
+                        return True
+                return False
+
+            return False
+
+        # ===== 在登记/确认形态之前，先尝试“趋势直通车” =====
+        trend_long_fired  = _trend_bypass('long')
+        trend_short_fired = _trend_bypass('short')
+
+        # --- 形态识别（TA-Lib CDL + 实体质量 + 摆位，含晨星/暮星） ---
+        try:
+            eng = int(ta.CDLENGULFING(df15m).iloc[idx15])           # +100/-100
+            hammer = int(ta.CDLHAMMER(df15m).iloc[idx15])           # +100
+            invham = int(ta.CDLINVERTEDHAMMER(df15m).iloc[idx15])   # +100
+            shooting = int(ta.CDLSHOOTINGSTAR(df15m).iloc[idx15])   # -100
+            try:
+                morning_series = ta.CDLMORNINGSTAR(df15m, penetration=0.3)
+            except TypeError:
+                morning_series = ta.CDLMORNINGSTAR(df15m)
+            morning = int(morning_series.iloc[idx15])               # +100
+            try:
+                evening_series = ta.CDLEVENINGSTAR(df15m, penetration=0.3)
+            except TypeError:
+                evening_series = ta.CDLEVENINGSTAR(df15m)
+            evening = int(evening_series.iloc[idx15])               # -100
+        except Exception:
+            eng = hammer = invham = shooting = morning = evening = 0
+
+        body = abs(float(r['close']) - float(r['open']))
+        quality_ok = (not np.isnan(atr_val)) and (body >= MIN_BODY_ATR_MULT * atr_val)
+
+        # 局部极值摆位：最近 SWING_LOOKBACK 根内的新低/新高
+        abs_idx = len(df15m) + idx15 if idx15 < 0 else idx15
+        start = max(0, abs_idx - (SWING_LOOKBACK - 1))
+        win = df15m.iloc[start:abs_idx + 1]
+        is_swing_low = len(win) > 0 and (float(r['low']) <= float(win['low'].min()))
+        is_swing_high = len(win) > 0 and (float(r['high']) >= float(win['high'].max()))
+
+        # 最终形态布尔（加入晨星/暮星）
+        bull_15m = quality_ok and is_swing_low  and (
+            (eng > 0) or (hammer > 0) or (invham > 0) or (morning > 0)
+        )
+        bear_15m = quality_ok and is_swing_high and (
+            (eng < 0) or (shooting < 0) or (evening < 0)
+        )
+
+        # 形态标签
+        labels = []
+        if eng > 0:        labels.append('BullEngulf')
+        if hammer > 0:     labels.append('Hammer')
+        if invham > 0:     labels.append('InvHammer')
+        if morning > 0:    labels.append('MorningStar')
+        if eng < 0:        labels.append('BearEngulf')
+        if shooting < 0:   labels.append('ShootingStar')
+        if evening < 0:    labels.append('EveningStar')
+        label_15m = '+'.join(labels) if labels else 'None'
+
+        # 仅当靠近相应监控位时才登记 Setup
+        near_long = bull_15m and _near_any_level(float(r['close']), levels_long, atr_val, NEAR_LEVEL_ATR_MULT)
+        near_short = bear_15m and _near_any_level(float(r['close']), levels_short, atr_val, NEAR_LEVEL_ATR_MULT)
 
         last_ts_long = self.reversal_notification_sent.get(pair, {}).get('long')
         last_ts_short = self.reversal_notification_sent.get(pair, {}).get('short')
+        pair_setups = self.reversal_setups.setdefault(pair, {})
 
-        # 触发：做多反转
-        if pass_rev_long and ts_15m is not None and ts_15m != last_ts_long:
+        # Long Setup
+        if bull_15m and bull_1h_ok and near_long and _cooldown_ok(last_ts_long, ts_15m):
+            pair_setups['long'] = {'ts': ts_15m, 'anchor': float(r['high']), 'atr': float(atr_val), 'label': label_15m}
+
+        # Short Setup
+        if bear_15m and bear_1h_ok and near_short and _cooldown_ok(last_ts_short, ts_15m):
+            pair_setups['short'] = {'ts': ts_15m, 'anchor': float(r['low']), 'atr': float(atr_val), 'label': label_15m}
+
+        # 确认逻辑：在后续 N 根 15m 内，收盘突破形态锚点 ± CONFIRM_ATR_MULT*ATR
+        def _confirm(direction_key: str):
+            setup = pair_setups.get(direction_key)
+            if not setup:
+                return False
+
+            # 找到 setup 的索引
+            setup_idx = None
+            if 'date' in df15m.columns:
+                for i in range(len(df15m)):
+                    if df15m.iloc[i]['date'] == setup['ts']:
+                        setup_idx = i
+                        break
+            if setup_idx is None:
+                try:
+                    setup_idx = df15m.index.get_loc(setup['ts'])
+                except Exception:
+                    return False
+
+            end_idx = min(len(df15m) - 1, setup_idx + SETUP_EXPIRE_BARS)
+            if end_idx <= setup_idx:
+                return False
+
+            idx_chk = -2 if USE_LAST_CLOSED_CANDLE else -1
+            real_chk = len(df15m) + idx_chk if idx_chk < 0 else idx_chk
+            if real_chk <= setup_idx:
+                return False
+
+            close_chk = float(df15m.iloc[idx_chk]['close'])
+            anchor = float(setup['anchor'])
+            atr0 = setup.get('atr', np.nan)
+            thr = CONFIRM_ATR_MULT * (atr0 if not np.isnan(atr0) else 0.0)
+
+            if direction_key == 'long':
+                return close_chk > (anchor + thr)
+            else:
+                return close_chk < (anchor - thr)
+
+        # Long Confirm
+        if _confirm('long'): #(not trend_long_fired) and 
+            setup = self.reversal_setups.get(pair, {}).pop('long', None)
+            self.reversal_notification_sent.setdefault(pair, {})['long'] = ts_15m
             if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
                 self.dp.send_msg(
-                    f"📈 Reversal LONG {pair}\n"
-                    f"15m Pattern: {label_15m}\n"
+                    f"📈 Reversal LONG Confirmed {pair}\n"
+                    f"Pattern: {setup.get('label','?') if setup else 'N/A'}\n"
                     f"1h Filter: {'OK' if bull_1h_ok else 'NO'}\n"
                     f"Last Price(5m): {current_price:.6f}"
                 )
-            logger.info(f"[REV] LONG {pair} 15m={label_15m} | 1h_filter={bull_1h_ok}")
-            self.reversal_notification_sent.setdefault(pair, {})['long'] = ts_15m
+            logger.info(f"[REV] LONG confirmed {pair} | {setup.get('label','?') if setup else ''}")
+        else:
+            st = self.reversal_setups.get(pair, {}).get('long')
+            if st:
+                setup_idx = None
+                if 'date' in df15m.columns:
+                    for i in range(len(df15m)):
+                        if df15m.iloc[i]['date'] == st['ts']:
+                            setup_idx = i
+                            break
+                if setup_idx is None:
+                    try:
+                        setup_idx = df15m.index.get_loc(st['ts'])
+                    except Exception:
+                        setup_idx = None
+                if setup_idx is not None and (len(df15m) - 1 - setup_idx) > SETUP_EXPIRE_BARS:
+                    self.reversal_setups[pair].pop('long', None)
 
-        # 触发：做空反转
-        if pass_rev_short and ts_15m is not None and ts_15m != last_ts_short:
+        # Short Confirm
+        if _confirm('short'): #(not trend_short_fired) and 
+            setup = self.reversal_setups.get(pair, {}).pop('short', None)
+            self.reversal_notification_sent.setdefault(pair, {})['short'] = ts_15m
             if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
                 self.dp.send_msg(
-                    f"📉 Reversal SHORT {pair}\n"
-                    f"15m Pattern: {label_15m}\n"
+                    f"📉 Reversal SHORT Confirmed {pair}\n"
+                    f"Pattern: {setup.get('label','?') if setup else 'N/A'}\n"
                     f"1h Filter: {'OK' if bear_1h_ok else 'NO'}\n"
                     f"Last Price(5m): {current_price:.6f}"
                 )
-            logger.info(f"[REV] SHORT {pair} 15m={label_15m} | 1h_filter={bear_1h_ok}")
-            self.reversal_notification_sent.setdefault(pair, {})['short'] = ts_15m
+            logger.info(f"[REV] SHORT confirmed {pair} | {setup.get('label','?') if setup else ''}")
+        else:
+            st = self.reversal_setups.get(pair, {}).get('short')
+            if st:
+                setup_idx = None
+                if 'date' in df15m.columns:
+                    for i in range(len(df15m)):
+                        if df15m.iloc[i]['date'] == st['ts']:
+                            setup_idx = i
+                            break
+                if setup_idx is None:
+                    try:
+                        setup_idx = df15m.index.get_loc(st['ts'])
+                    except Exception:
+                        setup_idx = None
+                if setup_idx is not None and (len(df15m) - 1 - setup_idx) > SETUP_EXPIRE_BARS:
+                    self.reversal_setups[pair].pop('short', None)
 
-        # ========== ② 接近/跌破监控位通知（与形态独立） ==========
-        monitoring_configs = self.coin_monitoring.get(pair, [])
-        if active_trades:
-            # 有持仓时，保持你原来的设计：价格监控位通知可跳过，避免干扰
-            return
 
-        for config in monitoring_configs:
-            direction = config.get('direction', 'long')
-            monitoring_points = config.get('entry_points', [])
-            if not monitoring_points:
-                continue
-
-            for price_point in monitoring_points:
-                # 初始化状态
-                state = (
-                    self.monitoring_notification_sent.setdefault(pair, {})
-                    .setdefault(direction, {})
-                    .setdefault(price_point, {'approaching': False, 'crossed': False})
-                )
-
-                if direction == 'long':
-                    is_approaching = (current_price > price_point) and (
-                        current_price <= price_point * (1 + APPROACH_PCT)
-                    )
-                    has_crossed = current_price < price_point
-                    is_away = current_price > price_point * (1 + APPROACH_PCT)
-
-                    # approaching（不要求形态或1h过滤）
-                    if is_approaching and not state['approaching']:
-                        if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
-                            self.dp.send_msg(
-                                f"🔔 LONG approaching {pair}\n"
-                                f"Price: {current_price:.6f} | Point: {price_point:.6f}"
-                            )
-                        logger.info(f"[MON] {pair} long approaching {price_point}")
-                        state['approaching'] = True
-                        state['crossed'] = False
-
-                    # crossed（不要求形态或1h过滤；如需更稳，可在此叠加 pass_rev_long）
-                    if has_crossed and not state['crossed']:
-                        if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
-                            self.dp.send_msg(
-                                f"✅ LONG crossed {pair}\n"
-                                f"Price: {current_price:.6f} | Point: {price_point:.6f}"
-                            )
-                        logger.info(f"[MON] {pair} long crossed {price_point}")
-                        state['crossed'] = True
-                        state['approaching'] = True
-
-                    # reset
-                    if is_away and (state['approaching'] or state['crossed']):
-                        logger.info(f"[MON] reset flags {pair} long @ {price_point}")
-                        state['approaching'] = False
-                        state['crossed'] = False
-
-                else:  # short
-                    is_approaching = (current_price < price_point) and (
-                        current_price >= price_point * (1 - APPROACH_PCT)
-                    )
-                    has_crossed = current_price > price_point
-                    is_away = current_price < price_point * (1 - APPROACH_PCT)
-
-                    if is_approaching and not state['approaching']:
-                        if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
-                            self.dp.send_msg(
-                                f"🔔 SHORT approaching {pair}\n"
-                                f"Price: {current_price:.6f} | Point: {price_point:.6f}"
-                            )
-                        logger.info(f"[MON] {pair} short approaching {price_point}")
-                        state['approaching'] = True
-                        state['crossed'] = False
-
-                    if has_crossed and not state['crossed']:
-                        if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
-                            self.dp.send_msg(
-                                f"✅ SHORT crossed {pair}\n"
-                                f"Price: {current_price:.6f} | Point: {price_point:.6f}"
-                            )
-                        logger.info(f"[MON] {pair} short crossed {price_point}")
-                        state['crossed'] = True
-                        state['approaching'] = True
-
-                    if is_away and (state['approaching'] or state['crossed']):
-                        logger.info(f"[MON] reset flags {pair} short @ {price_point}")
-                        state['approaching'] = False
-                        state['crossed'] = False
 
     def check_active_trades(
         self, pair: str, current_price: float, threshold_percent: float = 10
@@ -1625,6 +1789,68 @@ class KamaFama_Dynamic(IStrategy):
             # 优先检查是否为止盈回撤情况（亏损小于0.5%且已经触发过减仓）
             exit_stage = trade.get_custom_data('exit_stage', default=0)
             if exit_stage >= 1 and current_profit >= -0.005:  # 已减仓且亏损小于0.5%
+                # ===== ① manual_open 优先：手动单的回撤清仓 =====
+                if trade.enter_tag and 'manual' in trade.enter_tag:
+                    manual_cfg = self.manual_open.get(pair)
+                    if manual_cfg:
+                        manual_exit_points = manual_cfg.get('exit_points', []) or []
+                        if manual_exit_points:
+                            # 排序：多头升序，空头降序
+                            if direction == 'long':
+                                m_sorted_exit_points = sorted(manual_exit_points)
+                            else:
+                                m_sorted_exit_points = sorted(manual_exit_points, reverse=True)
+
+                            cost_price = trade.open_rate
+                            m_count = len(m_sorted_exit_points)
+
+                            should_exit = False
+                            exit_tag = ''
+
+                            # 两点位：从 TP1 回撤到成本清仓
+                            if m_count == 2 and exit_stage == 1:
+                                if (direction == 'long' and current_rate <= cost_price) or (
+                                    direction == 'short' and current_rate >= cost_price
+                                ):
+                                    should_exit = True
+                                    exit_tag = f'manual_{direction}_tp1_pullback_cost'
+
+                            # 三点位及以上
+                            elif m_count >= 3:
+                                if direction == 'long':
+                                    # TP1 后回撤到成本
+                                    if exit_stage == 1 and current_rate <= cost_price:
+                                        should_exit = True
+                                        exit_tag = 'manual_long_tp1_pullback_cost'
+                                    # TP2 后回撤到 TP1
+                                    elif exit_stage == 2 and current_rate <= m_sorted_exit_points[0]:
+                                        should_exit = True
+                                        exit_tag = 'manual_long_tp2_pullback_tp1'
+                                else:  # short
+                                    # TP1 后回撤到成本
+                                    if exit_stage == 1 and current_rate >= cost_price:
+                                        should_exit = True
+                                        exit_tag = 'manual_short_tp1_pullback_cost'
+                                    # TP2 后回撤到 TP1
+                                    elif exit_stage == 2 and current_rate >= m_sorted_exit_points[0]:
+                                        should_exit = True
+                                        exit_tag = 'manual_short_tp2_pullback_tp1'
+
+                            # 触发“手动单回撤清仓”
+                            if should_exit:
+                                # ✨ 全仓退出前清理手动监控 & 恢复自动计算
+                                if hasattr(self, '_manual_cleanup_after_full_close'):
+                                    self._manual_cleanup_after_full_close(pair, direction, exit_tag)
+                                else:
+                                    # 若你未添加该工具函数，可临时回退为以下3步：
+                                    self.enable_auto_calculation(pair, direction)
+                                    self.recalculate_all_auto_monitoring_pairs()
+                                    if pair in self.manual_open:
+                                        del self.manual_open[pair]
+                                        self.update_strategy_state_file()
+
+                                return -trade.stake_amount, exit_tag
+                            
                 # 检查是否是固定点位监控的交易对
                 if (
                     pair in self.coin_monitoring

@@ -1063,8 +1063,8 @@ class Telegram(RPCHandler):
         :param update: message update
         :return: None
         """
-        stake_cur = self._config['stake_currency']
-        fiat_disp_cur = self._config.get('fiat_display_currency', '')
+        stake_cur = self._config["stake_currency"]
+        fiat_disp_cur = self._config.get("fiat_display_currency", "")
 
         start_date = datetime.fromtimestamp(0)
         timescale = None
@@ -1077,41 +1077,40 @@ class Telegram(RPCHandler):
             pass
 
         stats = self._rpc._rpc_trade_statistics(stake_cur, fiat_disp_cur, start_date)
-        profit_closed_coin = stats['profit_closed_coin']
-        profit_closed_ratio_mean = stats['profit_closed_ratio_mean']
-        profit_closed_percent = stats['profit_closed_percent']
-        profit_closed_fiat = stats['profit_closed_fiat']
-        profit_all_coin = stats['profit_all_coin']
-        profit_all_ratio_mean = stats['profit_all_ratio_mean']
-        profit_all_percent = stats['profit_all_percent']
-        profit_all_fiat = stats['profit_all_fiat']
-        trade_count = stats['trade_count']
+        profit_closed_coin = stats["profit_closed_coin"]
+        profit_closed_ratio_mean = stats["profit_closed_ratio_mean"]
+        profit_closed_percent = stats["profit_closed_percent"]
+        profit_closed_fiat = stats["profit_closed_fiat"]
+        profit_all_coin = stats["profit_all_coin"]
+        profit_all_ratio_mean = stats["profit_all_ratio_mean"]
+        profit_all_percent = stats["profit_all_percent"]
+        profit_all_fiat = stats["profit_all_fiat"]
+        trade_count = stats["trade_count"]
         first_trade_date = f"{stats['first_trade_humanized']} ({stats['first_trade_date']})"
         latest_trade_date = f"{stats['latest_trade_humanized']} ({stats['latest_trade_date']})"
-        avg_duration = stats['avg_duration']
-        best_pair = stats['best_pair']
-        best_pair_profit_ratio = stats['best_pair_profit_ratio']
-        best_pair_profit_abs = fmt_coin(stats['best_pair_profit_abs'], stake_cur)
-        winrate = stats['winrate']
-        expectancy = stats['expectancy']
-        expectancy_ratio = stats['expectancy_ratio']
+        avg_duration = stats["avg_duration"]
+        best_pair = stats["best_pair"]
+        best_pair_profit_ratio = stats["best_pair_profit_ratio"]
+        winrate = stats["winrate"]
+        expectancy = stats["expectancy"]
+        expectancy_ratio = stats["expectancy_ratio"]
 
-        if stats['trade_count'] == 0:
+        if stats["trade_count"] == 0:
             markdown_msg = f"No trades yet.\n*Bot started:* `{stats['bot_start_date']}`"
         else:
             # Message to display
-            if stats['closed_trade_count'] > 0:
+            if stats["closed_trade_count"] > 0:
                 markdown_msg = (
-                    '*ROI:* Closed trades\n'
+                    "*ROI:* Closed trades\n"
                     f"∙ `{fmt_coin(profit_closed_coin, stake_cur)} "
                     f"({profit_closed_ratio_mean:.2%}) "
                     f"({profit_closed_percent} \N{GREEK CAPITAL LETTER SIGMA}%)`\n"
                     f"∙ `{fmt_coin(profit_closed_fiat, fiat_disp_cur)}`\n"
                 )
             else:
-                markdown_msg = '`No closed trade` \n'
+                markdown_msg = "`No closed trade` \n"
             fiat_all_trades = (
-                f"∙ `{fmt_coin(profit_all_fiat, fiat_disp_cur)}`\n" if fiat_disp_cur else ''
+                f"∙ `{fmt_coin(profit_all_fiat, fiat_disp_cur)}`\n" if fiat_disp_cur else ""
             )
             markdown_msg += (
                 f"*ROI:* All trades\n"
@@ -1128,11 +1127,10 @@ class Telegram(RPCHandler):
                 f"*Winrate:* `{winrate:.2%}`\n"
                 f"*Expectancy (Ratio):* `{expectancy:.2f} ({expectancy_ratio:.2f})`"
             )
-            if stats['closed_trade_count'] > 0:
+            if stats["closed_trade_count"] > 0:
                 markdown_msg += (
                     f"\n*Avg. Duration:* `{avg_duration}`\n"
-                    f"*Best Performing:* `{best_pair}: {best_pair_profit_abs} "
-                    f"({best_pair_profit_ratio:.2%})`\n"
+                    f"*Best Performing:* `{best_pair}: {best_pair_profit_ratio:.2%}`\n"
                     f"*Trading volume:* `{fmt_coin(stats['trading_volume'], stake_cur)}`\n"
                     f"*Profit factor:* `{stats['profit_factor']:.2f}`\n"
                     f"*Max Drawdown:* `{stats['max_drawdown']:.2%} "
@@ -1145,7 +1143,7 @@ class Telegram(RPCHandler):
         await self._send_msg(
             markdown_msg,
             reload_able=True,
-            callback_path='update_profit',
+            callback_path="update_profit",
             query=update.callback_query,
         )
 
