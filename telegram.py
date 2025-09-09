@@ -1580,7 +1580,7 @@ class Telegram(RPCHandler):
                 json.dump(config, f, indent=4)
 
             self._rpc._rpc_reload_config()
-            await self._send_msg(f'交易对 {', '.join(pair)} 已加入白名单')
+            await self._send_msg(f'交易对 {pair} 已加入白名单')
 
     @authorized_only
     async def _force_enter(self, update: Update, context: CallbackContext, order_side: SignalDirection) -> None:

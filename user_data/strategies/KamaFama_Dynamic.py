@@ -1425,9 +1425,9 @@ class KamaFama_Dynamic(IStrategy):
 
             # If price is within threshold% of opening price, skip this pair
             if price_diff_percent <= threshold_percent:
-                logger.info(
-                    f"Skipping {pair}: Current price {current_price} is within {threshold_percent}% of opening price {open_rate}"
-                )
+                # logger.info(
+                #     f"Skipping {pair}: Current price {current_price} is within {threshold_percent}% of opening price {open_rate}"
+                # )
                 return True
 
         return True
@@ -1836,6 +1836,20 @@ class KamaFama_Dynamic(IStrategy):
         - 如果有2个点位：每次退出50%仓位
         - 如果有3个或更多点位：第一点位退出30%，第二点位退出剩余的50%，第三点位全部退出
         """
+
+        # --- 未真正开单（首单未完全成交）则直接跳过 ---
+        # 1) open_rate 为空 => 首单还没成交完成
+        if trade.open_rate is None:
+            return None
+
+        # 2) 保险起见，再加几条稳妥的保护（可选）
+        if not trade.is_open:
+            return None
+        if trade.amount is None or trade.amount <= 0:
+            return None
+        # 如果还有挂着的订单（首单/补仓/减仓）也不要再下新单（可选）
+        if getattr(trade, 'open_order_id', None):
+            return None
 
         pair = trade.pair
         direction = 'short' if trade.is_short else 'long'
@@ -2595,6 +2609,15 @@ class KamaFama_Dynamic(IStrategy):
             trade.adjust_stop_loss(trade.open_rate, stoploss_percent)
             logger.info(f"已调整 {trade.pair} 的止损到 {new_stoploss_price} (相对: {stoploss_percent:.2%})")
 
+    def _has_monitoring_cfg(self, pair: str, direction: str) -> bool:
+        cfgs = self.coin_monitoring.get(pair, []) if hasattr(self, 'coin_monitoring') else []
+        for cfg in cfgs:
+            if cfg.get('direction', 'long') == direction and (
+                cfg.get('exit_points') or cfg.get('entry_points')
+            ):
+                return True
+        return False
+
     def custom_exit(
         self,
         pair: str,
@@ -2606,66 +2629,140 @@ class KamaFama_Dynamic(IStrategy):
     ):
         """
         基于持久化存储处理最终退出点位
+        - 手动单（manual_open）优先：只按手动点位做最终全退判断，避免被 coin_monitoring 误退
+        - 非手动单：按 coin_monitoring 的第三级（或对应最终）退出处理
+        - 其它情况回落到原有 _custom_exit_long/_short
         """
+        # 1) open_rate 为空 => 首单还没成交完成
+        if trade.open_rate is None:
+            return None
+
+        # 2) 保险起见，再加几条稳妥的保护（可选）
+        if not trade.is_open:
+            return None
+        if trade.amount is None or trade.amount <= 0:
+            return None
+        # 如果还有挂着的订单（首单/补仓/减仓）也不要再下新单（可选）
+        if getattr(trade, 'open_order_id', None):
+            return None
+
         direction = 'short' if trade.is_short else 'long'
 
-        # 检查是否是固定点位监控的交易对
-        if (
-            pair in self.coin_monitoring
-            and self.coin_monitoring.get(pair)
-            and list(
-                itertools.chain(
-                    *[
-                        i['exit_points']
-                        for i in self.coin_monitoring[pair]
-                        if i['direction'] == direction
-                    ]
-                )
+        # ========= ① 手动单优先：只处理“最终全退”，其余交给 adjust_trade_position =========
+        if trade.enter_tag and 'manual' in trade.enter_tag:
+            manual_cfg = self.manual_open.get(pair, {})
+            exit_points = manual_cfg.get('exit_points', []) or []
+
+            if exit_points:
+                # 排序：多头升序，空头降序
+                if direction == 'long':
+                    sorted_exit_points = sorted(exit_points)
+                else:
+                    sorted_exit_points = sorted(exit_points, reverse=True)
+
+                exit_stage = trade.get_custom_data('exit_stage', default=0)
+                n = len(sorted_exit_points)
+
+                # 1 个点位：到价即全退（兜底，避免边界情况下未在 adjust_trade_position 执行）
+                if n == 1:
+                    trig = (
+                        (current_rate >= sorted_exit_points[0])
+                        if direction == 'long'
+                        else (current_rate <= sorted_exit_points[0])
+                    )
+                    if trig:
+                        # 手动单全退清理
+                        if hasattr(self, '_manual_cleanup_after_full_close'):
+                            self._manual_cleanup_after_full_close(
+                                pair, direction, f"manual_{direction}_single_tp"
+                            )
+                        return f"manual_{direction}_single_tp_{sorted_exit_points[0]}"
+
+                    # 未到最终点位 -> 不允许落到 coin_monitoring，避免误退
+                    return None
+
+                # 2 个点位：仅当已过 TP1（exit_stage==1）且到达 TP2 时全退（兜底）
+                if n == 2 and exit_stage == 1:
+                    trig = (
+                        (current_rate >= sorted_exit_points[1])
+                        if direction == 'long'
+                        else (current_rate <= sorted_exit_points[1])
+                    )
+                    if trig:
+                        if hasattr(self, '_manual_cleanup_after_full_close'):
+                            self._manual_cleanup_after_full_close(
+                                pair, direction, f"manual_{direction}_tp2_of_2"
+                            )
+                        return f"manual_{direction}_tp2_of_2_{sorted_exit_points[1]}"
+
+                    # 未到“最终全退”条件 -> 直接返回，避免 coin_monitoring 误退
+                    return None
+
+                # ≥3 个点位：仅当已过 TP2（exit_stage==2）且到达 TP3 时全退（与你原设计一致）
+                if n >= 3 and exit_stage == 2:
+                    trig = (
+                        (current_rate >= sorted_exit_points[2])
+                        if direction == 'long'
+                        else (current_rate <= sorted_exit_points[2])
+                    )
+                    if trig:
+                        # 手动单全退清理
+                        if hasattr(self, '_manual_cleanup_after_full_close'):
+                            self._manual_cleanup_after_full_close(
+                                pair, direction, f"manual_{direction}_tp3"
+                            )
+                        # 内部状态更新仅用于记录；真正的清理在 _manual_cleanup_after_full_close 完成
+                        trade.set_custom_data('exit_stage', 3)
+                        return f"manual_{direction}_tp3_{sorted_exit_points[2]}"
+
+                # 手动单存在，但未满足“最终全退” → 明确不让 coin_monitoring 介入
+                return None
+
+            # 没有手动 exit_points，则继续走后续逻辑（可能是老单/被外部清空）
+            # 不 return
+
+        # ===== ② coin_monitoring：只处理“最终全退”；否则不下放 =====
+        if self._has_monitoring_cfg(pair, direction):
+            # 找到该方向的退出点位
+            for cfg in self.coin_monitoring.get(pair, []):
+                if cfg.get('direction', 'long') != direction:
+                    continue
+                xs = cfg.get('exit_points', []) or []
+                if not xs:
+                    continue
+
+                sorted_xs = sorted(xs, reverse=direction == 'short')
+                stage = trade.get_custom_data('exit_stage', default=0)
+                n = len(sorted_xs)
+
+                # 与原设计一致：≥3点位，已过TP2(stage==2)且到TP3 -> 全退
+                if n >= 3 and stage == 2:
+                    trig = (
+                        (current_rate >= sorted_xs[2])
+                        if direction == 'long'
+                        else (current_rate <= sorted_xs[2])
+                    )
+                    if trig:
+                        trade.set_custom_data('exit_stage', 3)
+                        self.enable_auto_calculation(pair, direction)
+                        self.recalculate_all_auto_monitoring_pairs()
+                        return f"{direction}_tp3_{sorted_xs[2]}"
+
+                # 无论是否触发最终全退，coin_monitoring 接管了该 pair 的退出。
+                # 为避免误触默认 _custom_exit_*，这里必须阻断下放：
+                return None
+
+            # 有 coin_monitoring 但没拿到点位（异常情况） -> 允许下放到默认
+
+        # ========= ③ 其余情况：回落到你原有的 _custom_exit_* =========
+        if trade.is_short:
+            return self._custom_exit_short(
+                pair, trade, current_time, current_rate, current_profit, **kwargs
             )
-        ):
-            # 找到对应方向的监控配置
-            for config in self.coin_monitoring[pair]:
-                if config.get('direction') == direction:
-                    exit_points = config.get('exit_points', [])
-
-                    # 确保有足够的退出点位
-                    if not exit_points:
-                        break
-
-                    # 对退出点位进行排序：多头从小到大，空头从大到小
-                    if direction == 'long':
-                        sorted_exit_points = sorted(exit_points)
-                    else:  # short
-                        sorted_exit_points = sorted(exit_points, reverse=True)
-
-                    # 获取当前退出阶段
-                    exit_stage = trade.get_custom_data('exit_stage', default=0)
-
-                    # 根据退出点位数量确定退出逻辑
-                    exit_points_count = len(sorted_exit_points)
-
-                    # 只处理3个或更多点位的第三级退出
-                    if exit_points_count >= 3 and exit_stage == 2:
-                        if (direction == 'long' and current_rate >= sorted_exit_points[2]) or (
-                            direction == 'short' and current_rate <= sorted_exit_points[2]
-                        ):
-                            # 第三个点位：全部退出
-                            trade.set_custom_data('exit_stage', 3)
-                            logger.info(f"触发第三级退出点位 {pair}: 当前价格 {current_rate} - 出售所有剩余仓位")
-                            self.enable_auto_calculation(pair, direction)
-                            # 重新计算所有自动点位监控的交易对
-                            self.recalculate_all_auto_monitoring_pairs()
-                            return f"{direction}_tp3_{sorted_exit_points[2]}"
         else:
-            # 如果不满足固定点位监控的条件，使用原有退出逻辑
-            if trade.is_short:
-                return self._custom_exit_short(
-                    pair, trade, current_time, current_rate, current_profit, **kwargs
-                )
-            else:
-                return self._custom_exit_long(
-                    pair, trade, current_time, current_rate, current_profit, **kwargs
-                )
+            return self._custom_exit_long(
+                pair, trade, current_time, current_rate, current_profit, **kwargs
+            )
 
     def _custom_exit_short(
         self,

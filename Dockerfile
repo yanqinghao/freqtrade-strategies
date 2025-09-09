@@ -4,6 +4,7 @@ RUN pip install langchain langchain_openai matplotlib mplfinance dotenv psycopg2
 
 COPY telegram.py /freqtrade/freqtrade/rpc/telegram.py
 COPY rpc.py /freqtrade/freqtrade/rpc/rpc.py
+COPY freqtradebot.py /freqtrade/freqtrade/freqtradebot.py
 RUN mkdir -p /freqtrade/freqtrade/freqllm
 COPY analysis_agent.py /freqtrade/freqtrade/freqllm/analysis_agent.py
 COPY key_level_agent.py /freqtrade/freqtrade/freqllm/key_level_agent.py
