@@ -865,7 +865,53 @@ class KamaFama_Dynamic(IStrategy):
 
                 logger.info(f"成功更新 {pair} 的监控配置并保存到文件")
 
+    def _prune_manual_open_orphans(self):
+        """
+        清理 manual_open 中没有对应“手动未平仓交易”的残留配置。
+        逻辑：取所有 is_open 的 trade 中 enter_tag 含 'manual' 的 pair，作为保留集合；
+            manual_open 里不在该集合的直接删除。
+        """
+        try:
+            # 回测不清理，避免影响回测复现
+            if self.config.get('runmode', None) not in ('live', 'dry_run'):
+                return
+            # 没有手动配置就不用做了
+            if not getattr(self, 'manual_open', None):
+                return
+
+            # 收集所有“手动且未平仓”的交易对
+            open_trades = Trade.get_trades_proxy(is_open=True)
+            keep_pairs = {
+                t.pair
+                for t in open_trades
+                if (getattr(t, 'enter_tag', '') or '').find('manual') != -1
+            }
+
+            # 删掉 manual_open 里那些没有手动未平仓单的交易对
+            to_delete = [p for p in list(self.manual_open.keys()) if p not in keep_pairs]
+            if not to_delete:
+                return
+
+            for p in to_delete:
+                # 如需顺便恢复自动点位计算，可用下面两行（若 manual_open 里带方向）：
+                # direction = (self.manual_open.get(p, {}).get('direction') or 'long').lower()
+                # self.enable_auto_calculation(p, 'short' if direction == 'short' else 'long')
+                del self.manual_open[p]
+
+            self.update_strategy_state_file()
+
+            msg = f"🧹 清理失效 manual 配置: {', '.join(to_delete)}"
+            logger.info(msg)
+            if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                self.dp.send_msg(msg)
+
+        except Exception as e:
+            logger.warning(f"_prune_manual_open_orphans failed: {e}")
+
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+
+        self._prune_manual_open_orphans()
+
         # 获取当前pair
         pair = metadata['pair']
 
@@ -921,9 +967,11 @@ class KamaFama_Dynamic(IStrategy):
         SWING_LOOKBACK = 6
 
         # 趋势直通车参数（不改变原有参数）
-        TREND_BYPASS = True            # 开关：强趋势时允许绕过形态
-        ADX_TREND = 22                 # 1h ADX 判强阈值（20~25常用） ADX_TREND 降到 20；BYPASS_LEVEL_ATR_MULT 降到 0.2。
-        BYPASS_LEVEL_ATR_MULT = 0.25   # 越过监控位所需的 ATR 余量 ADX_TREND 提到 25；BYPASS_LEVEL_ATR_MULT 提到 0.3~0.35
+        TREND_BYPASS = True  # 开关：强趋势时允许绕过形态
+        ADX_TREND = 22  # 1h ADX 判强阈值（20~25常用） ADX_TREND 降到 20；BYPASS_LEVEL_ATR_MULT 降到 0.2。
+        BYPASS_LEVEL_ATR_MULT = (
+            0.25  # 越过监控位所需的 ATR 余量 ADX_TREND 提到 25；BYPASS_LEVEL_ATR_MULT 提到 0.3~0.35
+        )
 
         if self.config.get('runmode', None) not in ('live', 'dry_run'):
             return
@@ -972,7 +1020,9 @@ class KamaFama_Dynamic(IStrategy):
 
         try:
             atr_5m_series = ta.ATR(dataframe, timeperiod=14)
-            atr_5m = float(atr_5m_series.iloc[-1]) if len(atr_5m_series) == len(dataframe) else np.nan
+            atr_5m = (
+                float(atr_5m_series.iloc[-1]) if len(atr_5m_series) == len(dataframe) else np.nan
+            )
         except Exception:
             atr_5m = np.nan
 
@@ -982,10 +1032,9 @@ class KamaFama_Dynamic(IStrategy):
                 eps = cfg.get('entry_points', []) or []
                 for price_point in eps:
                     state = (
-                        self.monitoring_notification_sent
-                            .setdefault(pair, {})
-                            .setdefault(direction, {})
-                            .setdefault(price_point, {'approaching': False, 'crossed': False})
+                        self.monitoring_notification_sent.setdefault(pair, {})
+                        .setdefault(direction, {})
+                        .setdefault(price_point, {'approaching': False, 'crossed': False})
                     )
 
                     if direction == 'long':
@@ -995,7 +1044,9 @@ class KamaFama_Dynamic(IStrategy):
                             and ((current_price - price_point) <= APPROACH_ATR_MULT * atr_5m)
                         )
                         has_crossed = current_price < price_point
-                        is_away = (not np.isnan(atr_5m)) and (current_price > price_point + APPROACH_ATR_MULT * atr_5m)
+                        is_away = (not np.isnan(atr_5m)) and (
+                            current_price > price_point + APPROACH_ATR_MULT * atr_5m
+                        )
 
                         if is_approaching and not state['approaching']:
                             if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
@@ -1026,7 +1077,9 @@ class KamaFama_Dynamic(IStrategy):
                             and ((price_point - current_price) <= APPROACH_ATR_MULT * atr_5m)
                         )
                         has_crossed = current_price > price_point
-                        is_away = (not np.isnan(atr_5m)) and (current_price < price_point - APPROACH_ATR_MULT * atr_5m)
+                        is_away = (not np.isnan(atr_5m)) and (
+                            current_price < price_point - APPROACH_ATR_MULT * atr_5m
+                        )
 
                         if is_approaching and not state['approaching']:
                             if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
@@ -1074,7 +1127,8 @@ class KamaFama_Dynamic(IStrategy):
             ema20 = df1h['close'].ewm(span=20, adjust=False).mean()
             ema50 = df1h['close'].ewm(span=50, adjust=False).mean()
             r1 = df1h.iloc[idx1h]
-            e20 = float(ema20.iloc[idx1h]); e50 = float(ema50.iloc[idx1h])
+            e20 = float(ema20.iloc[idx1h])
+            e50 = float(ema50.iloc[idx1h])
             bull_1h_ok = (r1['close'] >= e20) or (e20 >= e50)
             bear_1h_ok = (r1['close'] <= e20) or (e20 <= e50)
         else:
@@ -1083,7 +1137,9 @@ class KamaFama_Dynamic(IStrategy):
 
         # ===== 新增：1h 趋势强度（ADX + EMA20 斜率）=====
         try:
-            adx1h_series = ta.ADX(df1h, timeperiod=14) if (df1h is not None and len(df1h) >= 20) else None
+            adx1h_series = (
+                ta.ADX(df1h, timeperiod=14) if (df1h is not None and len(df1h) >= 20) else None
+            )
             adx1h = float(adx1h_series.iloc[idx1h]) if adx1h_series is not None else np.nan
         except Exception:
             adx1h = np.nan
@@ -1095,8 +1151,12 @@ class KamaFama_Dynamic(IStrategy):
         except Exception:
             pass
 
-        trend_long_ok  = bull_1h_ok and (not np.isnan(adx1h)) and (adx1h >= ADX_TREND) and (ema20_slope > 0)
-        trend_short_ok = bear_1h_ok and (not np.isnan(adx1h)) and (adx1h >= ADX_TREND) and (ema20_slope < 0)
+        trend_long_ok = (
+            bull_1h_ok and (not np.isnan(adx1h)) and (adx1h >= ADX_TREND) and (ema20_slope > 0)
+        )
+        trend_short_ok = (
+            bear_1h_ok and (not np.isnan(adx1h)) and (adx1h >= ADX_TREND) and (ema20_slope < 0)
+        )
 
         # ===== 新增：趋势直通车（绕过形态，仅要求“越过监控位 + ATR余量”）=====
         def _trend_bypass(direction: str) -> bool:
@@ -1147,25 +1207,25 @@ class KamaFama_Dynamic(IStrategy):
             return False
 
         # ===== 在登记/确认形态之前，先尝试“趋势直通车” =====
-        trend_long_fired  = _trend_bypass('long')
+        trend_long_fired = _trend_bypass('long')
         trend_short_fired = _trend_bypass('short')
 
         # --- 形态识别（TA-Lib CDL + 实体质量 + 摆位，含晨星/暮星） ---
         try:
-            eng = int(ta.CDLENGULFING(df15m).iloc[idx15])           # +100/-100
-            hammer = int(ta.CDLHAMMER(df15m).iloc[idx15])           # +100
-            invham = int(ta.CDLINVERTEDHAMMER(df15m).iloc[idx15])   # +100
-            shooting = int(ta.CDLSHOOTINGSTAR(df15m).iloc[idx15])   # -100
+            eng = int(ta.CDLENGULFING(df15m).iloc[idx15])  # +100/-100
+            hammer = int(ta.CDLHAMMER(df15m).iloc[idx15])  # +100
+            invham = int(ta.CDLINVERTEDHAMMER(df15m).iloc[idx15])  # +100
+            shooting = int(ta.CDLSHOOTINGSTAR(df15m).iloc[idx15])  # -100
             try:
                 morning_series = ta.CDLMORNINGSTAR(df15m, penetration=0.3)
             except TypeError:
                 morning_series = ta.CDLMORNINGSTAR(df15m)
-            morning = int(morning_series.iloc[idx15])               # +100
+            morning = int(morning_series.iloc[idx15])  # +100
             try:
                 evening_series = ta.CDLEVENINGSTAR(df15m, penetration=0.3)
             except TypeError:
                 evening_series = ta.CDLEVENINGSTAR(df15m)
-            evening = int(evening_series.iloc[idx15])               # -100
+            evening = int(evening_series.iloc[idx15])  # -100
         except Exception:
             eng = hammer = invham = shooting = morning = evening = 0
 
@@ -1175,32 +1235,43 @@ class KamaFama_Dynamic(IStrategy):
         # 局部极值摆位：最近 SWING_LOOKBACK 根内的新低/新高
         abs_idx = len(df15m) + idx15 if idx15 < 0 else idx15
         start = max(0, abs_idx - (SWING_LOOKBACK - 1))
-        win = df15m.iloc[start:abs_idx + 1]
+        win = df15m.iloc[start : abs_idx + 1]
         is_swing_low = len(win) > 0 and (float(r['low']) <= float(win['low'].min()))
         is_swing_high = len(win) > 0 and (float(r['high']) >= float(win['high'].max()))
 
         # 最终形态布尔（加入晨星/暮星）
-        bull_15m = quality_ok and is_swing_low  and (
-            (eng > 0) or (hammer > 0) or (invham > 0) or (morning > 0)
+        bull_15m = (
+            quality_ok
+            and is_swing_low
+            and ((eng > 0) or (hammer > 0) or (invham > 0) or (morning > 0))
         )
-        bear_15m = quality_ok and is_swing_high and (
-            (eng < 0) or (shooting < 0) or (evening < 0)
-        )
+        bear_15m = quality_ok and is_swing_high and ((eng < 0) or (shooting < 0) or (evening < 0))
 
         # 形态标签
         labels = []
-        if eng > 0:        labels.append('BullEngulf')
-        if hammer > 0:     labels.append('Hammer')
-        if invham > 0:     labels.append('InvHammer')
-        if morning > 0:    labels.append('MorningStar')
-        if eng < 0:        labels.append('BearEngulf')
-        if shooting < 0:   labels.append('ShootingStar')
-        if evening < 0:    labels.append('EveningStar')
+        if eng > 0:
+            labels.append('BullEngulf')
+        if hammer > 0:
+            labels.append('Hammer')
+        if invham > 0:
+            labels.append('InvHammer')
+        if morning > 0:
+            labels.append('MorningStar')
+        if eng < 0:
+            labels.append('BearEngulf')
+        if shooting < 0:
+            labels.append('ShootingStar')
+        if evening < 0:
+            labels.append('EveningStar')
         label_15m = '+'.join(labels) if labels else 'None'
 
         # 仅当靠近相应监控位时才登记 Setup
-        near_long = bull_15m and _near_any_level(float(r['close']), levels_long, atr_val, NEAR_LEVEL_ATR_MULT)
-        near_short = bear_15m and _near_any_level(float(r['close']), levels_short, atr_val, NEAR_LEVEL_ATR_MULT)
+        near_long = bull_15m and _near_any_level(
+            float(r['close']), levels_long, atr_val, NEAR_LEVEL_ATR_MULT
+        )
+        near_short = bear_15m and _near_any_level(
+            float(r['close']), levels_short, atr_val, NEAR_LEVEL_ATR_MULT
+        )
 
         last_ts_long = self.reversal_notification_sent.get(pair, {}).get('long')
         last_ts_short = self.reversal_notification_sent.get(pair, {}).get('short')
@@ -1208,11 +1279,21 @@ class KamaFama_Dynamic(IStrategy):
 
         # Long Setup
         if bull_15m and bull_1h_ok and near_long and _cooldown_ok(last_ts_long, ts_15m):
-            pair_setups['long'] = {'ts': ts_15m, 'anchor': float(r['high']), 'atr': float(atr_val), 'label': label_15m}
+            pair_setups['long'] = {
+                'ts': ts_15m,
+                'anchor': float(r['high']),
+                'atr': float(atr_val),
+                'label': label_15m,
+            }
 
         # Short Setup
         if bear_15m and bear_1h_ok and near_short and _cooldown_ok(last_ts_short, ts_15m):
-            pair_setups['short'] = {'ts': ts_15m, 'anchor': float(r['low']), 'atr': float(atr_val), 'label': label_15m}
+            pair_setups['short'] = {
+                'ts': ts_15m,
+                'anchor': float(r['low']),
+                'atr': float(atr_val),
+                'label': label_15m,
+            }
 
         # 确认逻辑：在后续 N 根 15m 内，收盘突破形态锚点 ± CONFIRM_ATR_MULT*ATR
         def _confirm(direction_key: str):
@@ -1253,7 +1334,7 @@ class KamaFama_Dynamic(IStrategy):
                 return close_chk < (anchor - thr)
 
         # Long Confirm
-        if _confirm('long'): #(not trend_long_fired) and 
+        if _confirm('long'):  # (not trend_long_fired) and
             setup = self.reversal_setups.get(pair, {}).pop('long', None)
             self.reversal_notification_sent.setdefault(pair, {})['long'] = ts_15m
             if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
@@ -1282,7 +1363,7 @@ class KamaFama_Dynamic(IStrategy):
                     self.reversal_setups[pair].pop('long', None)
 
         # Short Confirm
-        if _confirm('short'): #(not trend_short_fired) and 
+        if _confirm('short'):  # (not trend_short_fired) and
             setup = self.reversal_setups.get(pair, {}).pop('short', None)
             self.reversal_notification_sent.setdefault(pair, {})['short'] = ts_15m
             if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
@@ -1309,8 +1390,6 @@ class KamaFama_Dynamic(IStrategy):
                         setup_idx = None
                 if setup_idx is not None and (len(df15m) - 1 - setup_idx) > SETUP_EXPIRE_BARS:
                     self.reversal_setups[pair].pop('short', None)
-
-
 
     def check_active_trades(
         self, pair: str, current_price: float, threshold_percent: float = 10
@@ -1823,7 +1902,9 @@ class KamaFama_Dynamic(IStrategy):
                                         should_exit = True
                                         exit_tag = 'manual_long_tp1_pullback_cost'
                                     # TP2 后回撤到 TP1
-                                    elif exit_stage == 2 and current_rate <= m_sorted_exit_points[0]:
+                                    elif (
+                                        exit_stage == 2 and current_rate <= m_sorted_exit_points[0]
+                                    ):
                                         should_exit = True
                                         exit_tag = 'manual_long_tp2_pullback_tp1'
                                 else:  # short
@@ -1832,7 +1913,9 @@ class KamaFama_Dynamic(IStrategy):
                                         should_exit = True
                                         exit_tag = 'manual_short_tp1_pullback_cost'
                                     # TP2 后回撤到 TP1
-                                    elif exit_stage == 2 and current_rate >= m_sorted_exit_points[0]:
+                                    elif (
+                                        exit_stage == 2 and current_rate >= m_sorted_exit_points[0]
+                                    ):
                                         should_exit = True
                                         exit_tag = 'manual_short_tp2_pullback_tp1'
 
@@ -1850,7 +1933,7 @@ class KamaFama_Dynamic(IStrategy):
                                         self.update_strategy_state_file()
 
                                 return -trade.stake_amount, exit_tag
-                            
+
                 # 检查是否是固定点位监控的交易对
                 if (
                     pair in self.coin_monitoring
