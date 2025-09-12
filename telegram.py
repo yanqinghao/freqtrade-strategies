@@ -79,14 +79,15 @@ logger.debug('Included module rpc.telegram ...')
 
 @contextmanager
 def _temp_entry_type(strategy, new_type='limit'):
-    old = strategy.order_types.get('entry', 'market')
+    old_entry = strategy.order_types.get('entry', 'market')
+    old_force = strategy.order_types.get('force_entry', old_entry)
     strategy.order_types['entry'] = new_type
     strategy.order_types['force_entry'] = new_type
     try:
         yield
     finally:
-        strategy.order_types['entry'] = old
-        strategy.order_types['force_entry'] = new_type
+        strategy.order_types['entry'] = old_entry
+        strategy.order_types['force_entry'] = old_force
 
 def _normalize_pair(p: str) -> str:
         p = p.upper()
@@ -186,6 +187,7 @@ class Telegram(RPCHandler):
         self._init_keyboard()
         self._start_thread()
         self._pending_force: dict[tuple[int, int], dict] = {}
+        self._pending_manual_edit: dict[tuple[int, int], dict] = {}
 
     def _start_thread(self):
         """
@@ -203,7 +205,7 @@ class Telegram(RPCHandler):
             ['/daily', '/profit', '/balance'],
             ['/status', '/status table', '/performance'],
             ['/count', '/start', '/stop', '/help'],
-            ['/chart', '/analysis', '/prompt', '/promptjson'],
+            ['/chart', '/analysis', '/prompt', '/promptjson', '/manual'],
             ['/addpair', '/delpair'],
             ['/setpairstrategy', '/delpairstrategy', '/showpairstrategy', '/setpairstrategyauto'],
         ]
@@ -255,6 +257,7 @@ class Telegram(RPCHandler):
             r'/version$',
             r'/marketdir (long|short|even|none)$',
             r'/marketdir$',
+            r'/manual$',
             r'/chart$',  # chart命令格式
             r'/analysis$',  # analysis命令格式
             r'/prompt$',  # analysis命令格式
@@ -361,6 +364,8 @@ class Telegram(RPCHandler):
             CommandHandler('setpairstrategyauto', self._set_pair_strategy_auto),
             CommandHandler('delpairstrategy', self._del_pair_strategy),
             CommandHandler('showpairstrategy', self._show_pair_strategy),
+            CommandHandler('manualopen', self._manual_open),
+            CommandHandler('manual', self._manual_open),
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern='update_status_table'),
@@ -382,7 +387,11 @@ class Telegram(RPCHandler):
             CallbackQueryHandler(self._count, pattern='update_count'),
             CallbackQueryHandler(self._force_exit_inline, pattern=r'force_exit__\S+'),
             CallbackQueryHandler(self._force_enter_inline, pattern=r'force_enter__\S+'),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_force_enter_reply)
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_force_enter_reply),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_manual_edit_reply),
+            CallbackQueryHandler(self._manual_open, pattern='update_manual_list'),
+            CallbackQueryHandler(self._manual_open_view, pattern=r'manual_select__.+'),
+            CallbackQueryHandler(self._manual_edit_inline, pattern=r'manual_edit__.+'),
         ]
         for handle in handles:
             self._app.add_handler(handle)
@@ -1414,6 +1423,244 @@ class Telegram(RPCHandler):
                     await query.edit_message_text(text=f"Trade {trade_id} not found.")
 
 
+    @authorized_only
+    async def _manual_open(self, update: Update, context: CallbackContext) -> None:
+        """
+        列出所有 manual_open 的手动单，点击进入详情
+        """
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        data = st.get('manual_open', {})
+        if not data:
+            await self._send_msg('当前没有手动单（manual_open）配置。')
+            return
+
+        # 生成按钮
+        buttons = []
+        for pair, v in sorted(data.items()):
+            side = v.get('direction', 'long')
+            ep = v.get('entry_price')
+            ep_txt = f"{ep}" if isinstance(ep, (int, float)) else '市价'
+            btn_text = f"{pair} [{side}] EP:{ep_txt}"
+            buttons.append(
+                InlineKeyboardButton(text=btn_text, callback_data=f"manual_select__{pair}")
+            )
+        rows = self._layout_inline_keyboard(buttons, cols=1)
+        rows.append([InlineKeyboardButton(text='刷新', callback_data='update_manual_list')])
+
+        await self._send_msg(
+            '请选择一个手动单查看 / 编辑：',
+            keyboard=rows,
+            query=update.callback_query,        # 保留即可
+        )
+
+
+    @authorized_only
+    async def _manual_open_view(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        pair = query.data.split('__', 1)[1]
+
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        item = st.get('manual_open', {}).get(pair)
+        if not item:
+            await self._send_msg(f'{pair} 不在 manual_open 中。', query=query)
+            return
+
+        side = item.get('direction', 'long')
+        size = item.get('size')
+        lev  = item.get('leverage')
+        ep   = item.get('entry_price')
+        tps  = item.get('exit_points', [])
+        sl   = item.get('stop_loss')
+        ts   = datetime.fromtimestamp(item.get('timestamp', datetime.now().timestamp())).strftime('%Y-%m-%d %H:%M:%S')
+
+        tps_fmt = ', '.join([str(x) for x in tps]) if tps else '(未设)'
+        ep_txt = f"{ep}" if isinstance(ep, (int, float)) else '市价'
+
+        msg = (
+            f"📌 *{pair}*  手动单详情\n"
+            f"• 方向：`{side}`   • 杠杆：`{lev}`   • 仓位：`{size}`\n"
+            f"• 进场价（enter price）：`{ep_txt}`\n"
+            f"• TP1/2/3：`{tps_fmt}`\n"
+            f"• SL：`{sl}`\n"
+            f"• 设置时间：`{ts}`\n\n"
+            f"✏️ *修改方法*：\n"
+            f"1）五值：`entry tp1 tp2 tp3 sl`\n"
+            f"2）或键值对：`entry=... tp1=... tp2=... tp3=... sl=...`\n"
+            f"   （可只改其中一部分）\n"
+        )
+
+        kb = [
+            [InlineKeyboardButton('✏️ 修改参数', callback_data=f"manual_edit__{pair}")],
+            [InlineKeyboardButton('⬅️ 返回列表', callback_data='update_manual_list')],
+            [InlineKeyboardButton('🔁 刷新本页', callback_data=f"manual_select__{pair}")],
+        ]
+        await self._send_msg(msg, parse_mode=ParseMode.MARKDOWN, keyboard=kb, query=query)
+
+    @authorized_only
+    async def _manual_edit_inline(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        pair = query.data.split('__', 1)[1]
+
+        key = (query.message.chat_id, query.from_user.id)
+        self._pending_manual_edit[key] = {'pair': pair, 'ts': time.time()}
+
+        tip = (
+            '请回复新的参数：\n'
+            '• 五值：`entry tp1 tp2 tp3 sl`\n'
+            '• 或键值对：`entry=... tp1=... tp2=... tp3=... sl=...`\n'
+            '示例：`71000 72000 73500 75000 69500`（含 entry）\n'
+            '或：`tp1=72000 tp2=73500 sl=69500`（只改部分）'
+        )
+        await query.message.reply_text(tip, parse_mode=ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
+
+
+    def _parse_edit_input(self, text: str, current: dict) -> tuple[float | None, list[float], float]:
+        """
+        解析用户输入。返回 (entry_price, tps[3], sl)
+        - 支持五个数：entry tp1 tp2 tp3 sl
+        - 支持四个数：tp1 tp2 tp3 sl（entry 不改）
+        - 支持键值对：entry= / price= / ep= ，tp1= tp2= tp3= sl=
+        """
+        text = text.strip().replace(',', ' ')
+        tokens = [t for t in text.split() if t]
+
+        entry = current.get('entry_price')
+        tps   = list(current.get('exit_points', [None, None, None]))
+        # 确保长度为 3
+        if len(tps) < 3: tps += [None] * (3 - len(tps))
+        sl    = current.get('stop_loss')
+
+        # 键值对优先
+        if any('=' in t for t in tokens):
+            for t in tokens:
+                if '=' not in t: continue
+                k, v = t.split('=', 1)
+                k = k.lower()
+                try:
+                    val = float(v)
+                except ValueError:
+                    continue
+                if k in ('entry', 'price', 'ep'):
+                    entry = val
+                elif k == 'tp1':
+                    tps[0] = val
+                elif k == 'tp2':
+                    tps[1] = val
+                elif k == 'tp3':
+                    tps[2] = val
+                elif k in ('sl', 'stop', 'stop_loss'):
+                    sl = val
+            # 填回旧值（仍可能是 None 的就保持 None）
+            return entry, [tps[0], tps[1], tps[2]], sl
+
+        # 纯数字序列
+        nums = []
+        for t in tokens:
+            try:
+                nums.append(float(t))
+            except ValueError:
+                pass
+
+        if len(nums) == 5:
+            entry, tp1, tp2, tp3, sl = nums
+            return entry, [tp1, tp2, tp3], sl
+        elif len(nums) == 4:
+            tp1, tp2, tp3, sl = nums
+            return entry, [tp1, tp2, tp3], sl
+        else:
+            raise ValueError('参数数量不正确。请输入 5 个数（含 entry）或 4 个数（不含 entry），或使用键值对。')
+
+    @authorized_only
+    async def on_manual_edit_reply(self, update: Update, context: CallbackContext) -> None:
+        msg = update.message
+        key = (msg.chat_id, msg.from_user.id)
+        pending = self._pending_manual_edit.get(key)
+        if not pending:
+            return  # 不是我们的编辑流程
+
+        # （可选）超时 3 分钟
+        if time.time() - pending['ts'] > 180:
+            self._pending_manual_edit.pop(key, None)
+            await msg.reply_text('编辑已超时，请重新点击“✏️ 修改参数”。')
+            return
+
+        pair = pending['pair']
+
+        # 读现有
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+        current = st.get('manual_open', {}).get(pair)
+        if not current:
+            await msg.reply_text('未找到该手动单，可能已被移除。')
+            self._pending_manual_edit.pop(key, None)
+            return
+
+        try:
+            entry_price, tps, sl = self._parse_edit_input(msg.text, current)
+
+            # 用原来的 size/lev/方向
+            size = float(current.get('size', 0))
+            lev  = float(current.get('leverage', 1))
+            side = SignalDirection(current.get('direction', 'long'))
+
+            # 根据方向做排序（long 升序，short 降序）
+            tps_clean = [x for x in tps if x is not None]
+            if len(tps_clean) != 3:
+                # 保证三档 TP
+                # 缺失的直接沿用旧值
+                old = current.get('exit_points', [])
+                while len(tps_clean) < 3 and old:
+                    tps_clean.append(old[len(tps_clean)])
+                if len(tps_clean) != 3:
+                    raise ValueError('TP 数量不足（需要 3 个）。')
+
+            if side == SignalDirection.SHORT:
+                tps_clean = sorted(tps_clean, reverse=True)
+            else:
+                tps_clean = sorted(tps_clean)
+
+            # 调用统一的保存逻辑（会更新 JSON 和内存，并提示）
+            await self._update_manual_trade_config(
+                pair, size, lev, tps_clean, float(sl), side, entry_price=entry_price
+            )
+
+            await msg.reply_text('已更新 ✅')
+            # 回到详情页
+            fake_cb = deepcopy(update)
+            # 构造一个简易的 callback_query 供 _manual_open_view 复用（也可以直接再次发送 /manualopen）
+            if hasattr(fake_cb, 'callback_query') and fake_cb.callback_query:
+                fake_cb.callback_query.data = f"manual_select__{pair}"
+            else:
+                # 简化：直接调用详情
+                class _Q: pass
+                q = _Q()
+                q.data = f"manual_select__{pair}"
+                q.message = msg
+                fake_cb = Update(update.update_id, callback_query=q)
+            await self._manual_open_view(update=fake_cb, context=context)
+        except Exception as e:
+            await msg.reply_text(f'解析或保存失败：{e}\n'
+                                '示例：`71000 72000 73500 75000 69500` 或 `tp1=72000 tp2=73500 sl=69500`',
+                                parse_mode=ParseMode.MARKDOWN)
+        finally:
+            self._pending_manual_edit.pop(key, None)
+
 
     @authorized_only
     async def on_force_enter_reply(self, update: Update, context: CallbackContext) -> None:
@@ -1451,7 +1698,7 @@ class Telegram(RPCHandler):
             )
 
             # 写入 manual_open 配置
-            await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side)
+            await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price)
 
             await msg.reply_text('手动开单已提交 ✅')
         except Exception as e:
@@ -1530,6 +1777,7 @@ class Telegram(RPCHandler):
         tps: list[float],
         sl: float,
         order_side: SignalDirection,
+        entry_price: float | None = None,   # <== 新增
     ):
         """
         Updates strategy_state.json with manual trade configuration.
@@ -1548,6 +1796,7 @@ class Telegram(RPCHandler):
         strategy_state['manual_open'][pair] = {
             'size': size,
             'leverage': leverage,
+            'entry_price': entry_price,   # <== 新增记录
             'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)),
             'stop_loss': sl,
             'direction': order_side.value,
@@ -1600,7 +1849,7 @@ class Telegram(RPCHandler):
                     stake_amount=size, leverage=leverage,
                     enter_tag=f'manual_{order_side.value}'
                 )
-                await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side)
+                await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price)
                 return
             except Exception as e:
                 await self._send_msg(f"参数或下单错误：{e}")
@@ -1609,7 +1858,7 @@ class Telegram(RPCHandler):
 
         # B) 只有 pair（或用户只想手输参数）：直接进入 ForceReply
         if len(args) == 1:
-            pair = self._normalize_pair(args[0])
+            pair = _normalize_pair(args[0])
             key = (update.effective_chat.id, update.effective_user.id)
             self._pending_force[key] = {'pair': pair, 'side': order_side.value, 'ts': time.time()}
             tip = ('请按格式回复以下参数：\n'
