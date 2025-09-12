@@ -64,7 +64,7 @@ class KamaFama_Dynamic(IStrategy):
             {'method': 'CooldownPeriod', 'stop_duration_candles': 5},
         ]
 
-    minimal_roi = {'0': 0.087, '372': 0.068, '861': 0.045}
+    minimal_roi = {'0': 0.5, '372': 0.3, '861': 0.2}
     cc_long = {}
     cc_short = {}
 
@@ -94,12 +94,12 @@ class KamaFama_Dynamic(IStrategy):
 
     # Trailing stop:
     trailing_stop = False
-    trailing_stop_positive = 0.002
-    trailing_stop_positive_offset = 0.05
+    trailing_stop_positive = 0.01
+    trailing_stop_positive_offset = 0.10
     trailing_only_offset_is_reached = True
     max_entry_position_adjustment = 5
 
-    use_custom_stoploss = True
+    use_custom_stoploss = False
 
     order_types = {
         'entry': 'market',
@@ -303,22 +303,22 @@ class KamaFama_Dynamic(IStrategy):
         except Exception as e:
             logger.info(f"加载策略模式配置时出错: {e}")
 
-    def custom_stoploss(
-        self,
-        pair: str,
-        trade: Trade,
-        current_time: datetime,
-        current_rate: float,
-        current_profit: float,
-        **kwargs,
-    ) -> float:
-        # 常规止损逻辑
-        if current_profit >= 0.05:
-            return -0.002
+    # def custom_stoploss(
+    #     self,
+    #     pair: str,
+    #     trade: Trade,
+    #     current_time: datetime,
+    #     current_rate: float,
+    #     current_profit: float,
+    #     **kwargs,
+    # ) -> float:
+    #     # 常规止损逻辑
+    #     if current_profit >= 0.05:
+    #         return -0.002
 
-        # 这里不要加其他处理逻辑，因为这个函数会被频繁调用
-        # 止损后的处理逻辑应该放在 exit_positions 里处理
-        return None
+    #     # 这里不要加其他处理逻辑，因为这个函数会被频繁调用
+    #     # 止损后的处理逻辑应该放在 exit_positions 里处理
+    #     return None
 
     # def calculate_coin_points(self, pair: str, direction: str):
     #     df, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
