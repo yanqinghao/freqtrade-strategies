@@ -188,6 +188,7 @@ class Telegram(RPCHandler):
         self._start_thread()
         self._pending_force: dict[tuple[int, int], dict] = {}
         self._pending_manual_edit: dict[tuple[int, int], dict] = {}
+        self._pending_monitor_edit: dict[tuple[int, int], dict] = {}
 
     def _start_thread(self):
         """
@@ -205,7 +206,7 @@ class Telegram(RPCHandler):
             ['/daily', '/profit', '/balance'],
             ['/status', '/status table', '/performance'],
             ['/count', '/start', '/stop', '/help'],
-            ['/chart', '/analysis', '/prompt', '/promptjson', '/manual'],
+            ['/chart', '/analysis', '/prompt', '/promptjson', '/manual', '/monitor'],
             ['/addpair', '/delpair'],
             ['/setpairstrategy', '/delpairstrategy', '/showpairstrategy', '/setpairstrategyauto'],
         ]
@@ -258,6 +259,7 @@ class Telegram(RPCHandler):
             r'/marketdir (long|short|even|none)$',
             r'/marketdir$',
             r'/manual$',
+            r'/monitor$',
             r'/chart$',  # chart命令格式
             r'/analysis$',  # analysis命令格式
             r'/prompt$',  # analysis命令格式
@@ -366,6 +368,8 @@ class Telegram(RPCHandler):
             CommandHandler('showpairstrategy', self._show_pair_strategy),
             CommandHandler('manualopen', self._manual_open),
             CommandHandler('manual', self._manual_open),
+            CommandHandler('monitor', self._monitor_list),
+            CommandHandler('monitoring', self._monitor_list),
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern='update_status_table'),
@@ -387,11 +391,13 @@ class Telegram(RPCHandler):
             CallbackQueryHandler(self._count, pattern='update_count'),
             CallbackQueryHandler(self._force_exit_inline, pattern=r'force_exit__\S+'),
             CallbackQueryHandler(self._force_enter_inline, pattern=r'force_enter__\S+'),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_force_enter_reply),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_manual_edit_reply),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self._text_router),
             CallbackQueryHandler(self._manual_open, pattern='update_manual_list'),
             CallbackQueryHandler(self._manual_open_view, pattern=r'manual_select__.+'),
             CallbackQueryHandler(self._manual_edit_inline, pattern=r'manual_edit__.+'),
+            CallbackQueryHandler(self._monitor_list, pattern='update_monitor_list'),
+            CallbackQueryHandler(self._monitor_view, pattern=r'monitor_select__.+'),
+            CallbackQueryHandler(self._monitor_edit_inline, pattern=r'monitor_edit__.+'),
         ]
         for handle in handles:
             self._app.add_handler(handle)
@@ -1582,6 +1588,163 @@ class Telegram(RPCHandler):
         else:
             raise ValueError('参数数量不正确。请输入 5 个数（含 entry）或 4 个数（不含 entry），或使用键值对。')
 
+
+    def _parse_num_list(self, s: str) -> list[float]:
+        s = s.strip()
+        if s.startswith('[') and s.endswith(']'):
+            s = s[1:-1]
+        parts = re.split(r'[,\s]+', s.strip())
+        out = []
+        for p in parts:
+            if not p: continue
+            out.append(float(p))
+        return out
+
+    async def _text_router(self, update: Update, context: CallbackContext) -> None:
+        if not update.message:
+            return
+        key = (update.message.chat_id, update.message.from_user.id)
+
+        # ① /manual 编辑优先
+        if getattr(self, '_pending_manual_edit', None) and self._pending_manual_edit.get(key):
+            await self.on_manual_edit_reply(update, context)
+            return
+
+        # ② /monitor 编辑其次
+        if getattr(self, '_pending_monitor_edit', None) and self._pending_monitor_edit.get(key):
+            await self.on_monitor_edit_reply(update, context)
+            return
+
+        # ③ 手动开单参数填写
+        if getattr(self, '_pending_force', None) and self._pending_force.get(key):
+            await self.on_force_enter_reply(update, context)
+            return
+
+        # 其他纯文本不处理
+        return
+
+
+    def _parse_monitor_edit_input(self, text: str, current: dict) -> tuple[list[float] | None, list[float] | None, float | None]:
+        """
+        返回 (entries, tps, sl)
+        - 五值：entry tp1 tp2 tp3 sl -> entries=[entry], tps=[tp1,tp2,tp3], sl
+        - 键值对：entries=/ep=（多值可逗号或空格或 [a,b]），tp=/tp1-3=，sl=
+        - 允许只改部分，未给的返回 None
+        """
+        text = text.strip()
+        tokens = [t for t in re.split(r'\s+', text) if t]
+
+        # 若有 '=' 走键值对
+        if any('=' in t for t in tokens):
+            entries = None
+            tps = [None, None, None]
+            sl = None
+            tp_bulk = None
+            for tok in tokens:
+                if '=' not in tok: continue
+                k, v = tok.split('=', 1)
+                k = k.lower().strip()
+                v = v.strip()
+                try:
+                    if k in ('entries','ep','entry','eps'):
+                        entries = self._parse_num_list(v)
+                    elif k in ('tp','tps'):
+                        tp_bulk = self._parse_num_list(v)
+                    elif k == 'tp1':
+                        tps[0] = float(v)
+                    elif k == 'tp2':
+                        tps[1] = float(v)
+                    elif k == 'tp3':
+                        tps[2] = float(v)
+                    elif k in ('sl','stop','stop_loss'):
+                        sl = float(v)
+                except ValueError:
+                    pass
+            # 合并单独 tp1-3 与 tp= 批量
+            if tp_bulk is not None:
+                # 用批量覆盖前三个
+                while len(tp_bulk) < 3:
+                    tp_bulk.append(None)
+                tps = tp_bulk[:3]
+            # 若 tps 三个都是 None，则表示不改
+            if all(x is None for x in tps):
+                tps = None
+            else:
+                # 用当前值补齐缺失
+                cur = (current.get('exit_points') or [None, None, None]) + [None]*3
+                tps = [tps[i] if tps[i] is not None else cur[i] for i in range(3)]
+            return entries, tps, sl
+
+        # 否则尝试纯数字
+        nums = []
+        for t in tokens:
+            try:
+                nums.append(float(t))
+            except ValueError:
+                pass
+        if len(nums) == 5:
+            entry, tp1, tp2, tp3, sl = nums
+            return [entry], [tp1, tp2, tp3], sl
+        elif len(nums) == 4:
+            tp1, tp2, tp3, sl = nums
+            return None, [tp1, tp2, tp3], sl
+        else:
+            raise ValueError('参数数量不正确。请输入 5 个数（含 entry）或 4 个数（不含 entry），或使用键值对。')
+
+
+    async def _update_coin_monitoring_config(
+        self,
+        pair: str,
+        idx: int,
+        entry_points: list[float] | None,
+        exit_points: list[float] | None,
+        sl: float | None,
+    ):
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        if 'coin_monitoring' not in st:
+            st['coin_monitoring'] = {}
+        if pair not in st['coin_monitoring'] or not isinstance(st['coin_monitoring'][pair], list):
+            st['coin_monitoring'][pair] = []
+
+        # 确保索引存在
+        while len(st['coin_monitoring'][pair]) <= idx:
+            st['coin_monitoring'][pair].append({})
+
+        item = st['coin_monitoring'][pair][idx]
+        direction = item.get('direction', 'long')
+
+        if entry_points is not None:
+            item['entry_points'] = entry_points
+        if exit_points is not None:
+            # 按方向排序
+            eps = [x for x in exit_points if x is not None]
+            if direction == 'short':
+                eps = sorted(eps, reverse=True)
+            else:
+                eps = sorted(eps)
+            item['exit_points'] = eps
+        if sl is not None:
+            item['stop_loss'] = sl
+
+        # 打时间戳，方便追踪
+        item['timestamp'] = datetime.now().timestamp()
+
+        with open(state_file, 'w', encoding='utf-8') as f:
+            json.dump(st, f, indent=4, ensure_ascii=False)
+
+        # 刷新内存
+        if hasattr(self._rpc._freqtrade, 'strategy'):
+            self._rpc._freqtrade.strategy.coin_monitoring = st['coin_monitoring']
+
+        await self._send_msg(f'已更新 {pair}（#{idx}）的 coin_monitoring ✅')
+
+
     @authorized_only
     async def on_manual_edit_reply(self, update: Update, context: CallbackContext) -> None:
         msg = update.message
@@ -1663,6 +1826,109 @@ class Telegram(RPCHandler):
 
 
     @authorized_only
+    async def _monitor_view(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        _, pair, idx_s = query.data.split('__', 2)
+        idx = int(idx_s)
+
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        items = (st.get('coin_monitoring', {}) or {}).get(pair) or []
+        if idx < 0 or idx >= len(items):
+            await self._send_msg(f'{pair} 的索引 #{idx} 不存在。', query=query)
+            return
+        it = items[idx]
+
+        side = it.get('direction', 'long')
+        auto = '是' if it.get('auto') else '否'
+        eps  = it.get('entry_points') or []
+        tps  = it.get('exit_points') or []
+        sl   = it.get('stop_loss')
+        ts   = it.get('timestamp')
+        ts   = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else '—'
+
+        def fmt_list(a): return ', '.join(f'{x:g}' for x in a) if a else '（未设）'
+
+        msg = (
+            f"📈 *{pair}*  监控详情（#{idx})\n"
+            f"• 方向：`{side}`   • 自动：`{auto}`\n"
+            f"• 入场价（entries）：`{fmt_list(eps)}`\n"
+            f"• TP1/2/3：`{fmt_list(tps)}`\n"
+            f"• SL：`{sl if sl is not None else '（未设）'}`\n"
+            f"• 设置时间：`{ts}`\n\n"
+            f"✏️ *修改方法*：\n"
+            f"1）五值（单入场）：`entry tp1 tp2 tp3 sl`\n"
+            f"2）键值对：`entries=...` 或 `ep=...`（可多值），`tp=...`（或 `tp1= tp2= tp3=`），`sl=`\n"
+            f"   例：`entries=[71000,70800] tp=72000,73500,75000 sl=69500`\n"
+        )
+
+        kb = [
+            [InlineKeyboardButton('✏️ 修改参数', callback_data=f"monitor_edit__{pair}__{idx}")],
+            [InlineKeyboardButton('⬅️ 返回列表', callback_data='update_monitor_list')],
+            [InlineKeyboardButton('🔁 刷新本页', callback_data=f"monitor_select__{pair}__{idx}")],
+        ]
+        await self._send_msg(msg, parse_mode=ParseMode.MARKDOWN, keyboard=kb, query=query)
+
+
+    @authorized_only
+    async def _monitor_edit_inline(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        _, pair, idx_s = query.data.split('__', 2)
+        idx = int(idx_s)
+
+        key = (query.message.chat_id, query.from_user.id)
+        self._pending_monitor_edit[key] = {'pair': pair, 'idx': idx, 'ts': time.time()}
+
+        tip = (
+            '请回复新的参数：\n'
+            '• 五值（单入场）：`entry tp1 tp2 tp3 sl`\n'
+            '• 或键值对：`entries=...`（或 `ep=` 支持多值） `tp=...`/`tp1=`/`tp2=`/`tp3=` `sl=`\n'
+            '示例：\n'
+            '  `entries=[71000,70800] tp=72000,73500,75000 sl=69500`\n'
+            '  `71000 72000 73500 75000 69500`'
+        )
+        await query.message.reply_text(tip, parse_mode=ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
+
+
+
+
+    @authorized_only
+    async def _monitor_list(self, update: Update, context: CallbackContext) -> None:
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        cm = st.get('coin_monitoring', {})
+        if not cm:
+            await self._send_msg('当前没有 coin_monitoring 配置。', query=update.callback_query)
+            return
+
+        buttons = []
+        for pair, items in sorted(cm.items()):
+            # items 是列表，逐条列出
+            for idx, it in enumerate(items):
+                side = it.get('direction', 'long')
+                auto = 'A' if it.get('auto') else 'M'
+                eps  = it.get('entry_points') or []
+                ep_txt = ','.join(f'{x:g}' for x in eps[:3]) + ('...' if len(eps) > 3 else '') if eps else '—'
+                btn_text = f"{pair} [{side}/{auto}] EP:{ep_txt} #{idx}"
+                buttons.append(InlineKeyboardButton(text=btn_text, callback_data=f"monitor_select__{pair}__{idx}"))
+
+        rows = self._layout_inline_keyboard(buttons, cols=1)
+        rows.append([InlineKeyboardButton('刷新', callback_data='update_monitor_list')])
+
+        await self._send_msg('请选择一个监控项查看 / 编辑：', keyboard=rows, query=update.callback_query)
+
+
+    @authorized_only
     async def on_force_enter_reply(self, update: Update, context: CallbackContext) -> None:
         msg = update.message
         key = (msg.chat_id, msg.from_user.id)
@@ -1707,6 +1973,56 @@ class Telegram(RPCHandler):
         finally:
             # 清理状态
             self._pending_force.pop(key, None)
+
+    @authorized_only
+    async def on_monitor_edit_reply(self, update: Update, context: CallbackContext) -> None:
+        msg = update.message
+        key = (msg.chat_id, msg.from_user.id)
+        pending = self._pending_monitor_edit.get(key)
+        if not pending:
+            return
+
+        if time.time() - pending['ts'] > 180:
+            self._pending_monitor_edit.pop(key, None)
+            await msg.reply_text('编辑已超时，请重新点击“✏️ 修改参数”。')
+            return
+
+        pair = pending['pair']; idx = pending['idx']
+
+        # 读取当前项
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+        items = (st.get('coin_monitoring', {}) or {}).get(pair) or []
+        if idx < 0 or idx >= len(items):
+            await msg.reply_text('未找到该监控项，可能已被移除。')
+            self._pending_monitor_edit.pop(key, None)
+            return
+        current = items[idx]
+
+        try:
+            entries, tps, sl = self._parse_monitor_edit_input(msg.text, current)
+            await self._update_coin_monitoring_config(pair, idx, entries, tps, sl)
+            await msg.reply_text('已更新 ✅')
+
+            # 返回详情页
+            class _Q: pass
+            q = _Q(); q.data = f"monitor_select__{pair}__{idx}"; q.message = msg
+            fake_update = Update(update.update_id, callback_query=q)
+            await self._monitor_view(update=fake_update, context=context)
+        except Exception as e:
+            await msg.reply_text(
+                f'解析或保存失败：{e}\n'
+                '示例：`entries=[71000,70800] tp=72000,73500,75000 sl=69500`\n'
+                '或：`71000 72000 73500 75000 69500`（单入场）',
+                parse_mode=ParseMode.MARKDOWN
+            )
+        finally:
+            self._pending_monitor_edit.pop(key, None)
+
 
     async def _force_enter_action(self, pair, price: float | None, order_side: SignalDirection, stake_amount: float, leverage: float, enter_tag: str):
         if pair != 'cancel':
@@ -2469,15 +2785,21 @@ class Telegram(RPCHandler):
         photo: BytesIO | None = None,
         document: io.BufferedReader | None = None,
         filename: str | None = None,
+        keyboard: list[list[InlineKeyboardButton]] | None = None,   # <== 新增
     ) -> None:
+        # 组合 reply_markup：优先合并你自定义的 keyboard，再附加 Refresh（如果需要）
         if reload_able:
-            reply_markup = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton('Refresh', callback_data=callback_path)],
-                ]
-            )
+            refresh_row = [InlineKeyboardButton('Refresh', callback_data=callback_path)]
+            if keyboard:
+                reply_markup = InlineKeyboardMarkup(keyboard + [refresh_row])
+            else:
+                reply_markup = InlineKeyboardMarkup([refresh_row])
         else:
-            reply_markup = InlineKeyboardMarkup([[]])
+            if keyboard:
+                reply_markup = InlineKeyboardMarkup(keyboard)
+            else:
+                reply_markup = InlineKeyboardMarkup([[]])
+
         msg += f"\nUpdated: {datetime.now().ctime()}"
         if not query.message:
             return
@@ -2489,14 +2811,14 @@ class Telegram(RPCHandler):
                     reply_markup=reply_markup,
                 )
             elif document and filename:
+                from telegram import InputFile
                 await query.edit_message_media(
-                    InputMediaDocument(document, filename=filename, caption=msg, parse_mode=parse_mode),
+                    InputMediaDocument(InputFile(document, filename=filename),
+                                    caption=msg, parse_mode=parse_mode),
                     reply_markup=reply_markup,
                 )
             else:
-                await query.edit_message_text(
-                    text=msg, parse_mode=parse_mode, reply_markup=reply_markup
-                )
+                await query.edit_message_text(text=msg, parse_mode=parse_mode, reply_markup=reply_markup)
         except BadRequest as e:
             if 'not modified' in e.message.lower():
                 pass
@@ -2504,7 +2826,6 @@ class Telegram(RPCHandler):
                 logger.warning('TelegramError: %s', e.message)
         except TelegramError as telegram_err:
             logger.warning('TelegramError: %s! Giving up on that message.', telegram_err.message)
-
 
     async def _send_msg(
         self,
@@ -2537,6 +2858,7 @@ class Telegram(RPCHandler):
                 photo=photo,
                 document=document,
                 filename=filename,
+                keyboard=keyboard,
             )
             return
         if reload_able and self._config['telegram'].get('reload', True):
