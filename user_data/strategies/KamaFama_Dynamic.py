@@ -1541,9 +1541,6 @@ class KamaFama_Dynamic(IStrategy):
         # Check if this is a ROI exit
         if exit_reason.upper().startswith('ROI'):
             logger.info(f"{pair}: Exit triggered by ROI - re-enabling auto calculation")
-            self.enable_auto_calculation(pair, direction)
-            # 重新计算所有自动点位监控的交易对
-            self.recalculate_all_auto_monitoring_pairs()
 
         # Always confirm the exit
         return True
@@ -1874,15 +1871,10 @@ class KamaFama_Dynamic(IStrategy):
                 if trade.is_short:
                     # 空头：若价格 >= SL 价，直接全部买回平仓
                     if current_rate >= sl_price:
-                        # 可选：恢复自动点位计算
-                        self.enable_auto_calculation(trade.pair, 'short')
-                        self.recalculate_all_auto_monitoring_pairs()
                         return -trade.stake_amount, 'manual_sl_hit'
                 else:
                     # 多头：若价格 <= SL 价，直接全部卖出
                     if current_rate <= sl_price:
-                        self.enable_auto_calculation(trade.pair, 'long')
-                        self.recalculate_all_auto_monitoring_pairs()
                         return -trade.stake_amount, 'manual_sl_hit'
 
         # 先检查是否需要补仓
@@ -1949,8 +1941,6 @@ class KamaFama_Dynamic(IStrategy):
                                     self._manual_cleanup_after_full_close(pair, direction, exit_tag)
                                 else:
                                     # 若你未添加该工具函数，可临时回退为以下3步：
-                                    self.enable_auto_calculation(pair, direction)
-                                    self.recalculate_all_auto_monitoring_pairs()
                                     if pair in self.manual_open:
                                         del self.manual_open[pair]
                                         self.update_strategy_state_file()
@@ -2335,8 +2325,6 @@ class KamaFama_Dynamic(IStrategy):
                             logger.info(
                                 f"Manual trade for {pair} pulling back to cost price. Exiting position."
                             )
-                            self.enable_auto_calculation(pair, direction)
-                            self.recalculate_all_auto_monitoring_pairs()
                             return -trade.stake_amount, f'manual_{direction}_tp1_pullback_cost'
 
                 else:  # 3 or more points
@@ -2375,8 +2363,6 @@ class KamaFama_Dynamic(IStrategy):
                             logger.info(
                                 f"Manual trade for {pair} pulling back to cost price from TP1. Exiting position."
                             )
-                            self.enable_auto_calculation(pair, direction)
-                            self.recalculate_all_auto_monitoring_pairs()
                             return -trade.stake_amount, f'manual_{direction}_tp1_pullback_cost'
 
                     elif exit_stage == 2:
@@ -2394,8 +2380,6 @@ class KamaFama_Dynamic(IStrategy):
                             logger.info(
                                 f"Manual trade for {pair} pulling back to TP1 price. Exiting position."
                             )
-                            self.enable_auto_calculation(pair, direction)
-                            self.recalculate_all_auto_monitoring_pairs()
                             return -trade.stake_amount, f'manual_{direction}_tp2_pullback_tp1'
 
             # If it's a manual trade, we've handled it or decided not to act.
