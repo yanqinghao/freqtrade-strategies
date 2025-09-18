@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from functools import partial, wraps
 from html import escape
+import html as _py_html
 from itertools import chain
 from math import isnan
 from threading import Thread
@@ -66,6 +67,9 @@ from freqtrade.util import (
     round_value,
 )
 from freqtrade.freqllm.analysis_agent import CryptoTechnicalAnalyst
+from freqtrade.freqllm.ai_agent import run_two_phase
+from freqtrade.freqllm.pagination_utils import split_html_pages, save_pages, get_page
+from freqtrade.freqllm.html_sanitizer import sanitize_telegram_html
 from freqtrade.freqllm.key_level_agent import TradingSignalExtractor
 from freqtrade.freqllm.db_manager import connect_to_db, get_todays_analysis, insert_analysis_result
 from contextlib import contextmanager
@@ -76,6 +80,7 @@ MAX_MESSAGE_LENGTH = MessageLimit.MAX_TEXT_LENGTH
 logger = logging.getLogger(__name__)
 
 logger.debug('Included module rpc.telegram ...')
+
 
 @contextmanager
 def _temp_entry_type(strategy, new_type='limit'):
@@ -89,12 +94,50 @@ def _temp_entry_type(strategy, new_type='limit'):
         strategy.order_types['entry'] = old_entry
         strategy.order_types['force_entry'] = old_force
 
+
 def _normalize_pair(p: str) -> str:
-        p = p.upper()
-        if ':' in p: return p
-        if p.endswith('/USDT'): return p + ':USDT'
-        if '/' not in p: return p + '/USDT:USDT'
+    p = p.upper()
+    if ':' in p:
         return p
+    if p.endswith('/USDT'):
+        return p + ':USDT'
+    if '/' not in p:
+        return p + '/USDT:USDT'
+    return p
+
+
+def _to_clean_plain(text: str) -> str:
+    """
+    将可能包含 HTML / 实体 / 占位残渣的文本转为干净纯文本：
+      - 去标签
+      - 去我们占位符（\uFFF0idx\uFFF0）
+      - 解实体 (&amp; -> &)
+      - 合理压缩空白
+    """
+    if not text:
+        return ''
+    # 1) 去标签
+    plain = re.sub(r'<[^>]+>', '', text)
+    # 2) 去占位符（如果还有）
+    plain = re.sub(r'\uFFF0\d+\uFFF0', '', plain)
+    # 3) 解实体
+    plain = _py_html.unescape(plain)
+    # 4) 压缩多空格与空行
+    plain = re.sub(r'[ \t]{2,}', ' ', plain)
+    plain = re.sub(r'\n{3,}', '\n\n', plain).strip()
+    return plain[:3900]  # Telegram 安全边界
+
+
+def _beautify_inequalities(html_text: str) -> str:
+    # 把 &lt;number 转成 ≤number ，把 &gt;number 转成 ≥number
+    # 仅替换普通正文里的模式，不碰标签
+    html_text = re.sub(r'&lt;\s*(\d+(\.\d+)?\s*\w*)', r'≤ \1', html_text)
+    html_text = re.sub(r'&gt;\s*(\d+(\.\d+)?\s*\w*)', r'≥ \1', html_text)
+    # 去掉替换后多余空格，例如 "≤ 1h" → "≤1h"
+    html_text = re.sub(r'≤\s+', '≤', html_text)
+    html_text = re.sub(r'≥\s+', '≥', html_text)
+    return html_text
+
 
 def safe_async_db(func: Callable[..., Any]):
     """
@@ -206,7 +249,7 @@ class Telegram(RPCHandler):
             ['/daily', '/profit', '/balance'],
             ['/status', '/status table', '/performance'],
             ['/count', '/start', '/stop', '/help'],
-            ['/chart', '/analysis', '/prompt', '/promptjson', '/manual', '/monitor'],
+            ['/chart', '/analysis', '/ai', '/prompt', '/promptjson', '/manual', '/monitor'],
             ['/addpair', '/delpair'],
             ['/setpairstrategy', '/delpairstrategy', '/showpairstrategy', '/setpairstrategyauto'],
         ]
@@ -261,6 +304,7 @@ class Telegram(RPCHandler):
             r'/manual$',
             r'/monitor$',
             r'/chart$',  # chart命令格式
+            r'/ai$',  # ai命令格式
             r'/analysis$',  # analysis命令格式
             r'/prompt$',  # analysis命令格式
             r'/promptjson$',  # analysis命令格式
@@ -357,6 +401,7 @@ class Telegram(RPCHandler):
             CommandHandler('list_custom_data', self._list_custom_data),
             CommandHandler('tg_info', self._tg_info),
             CommandHandler('chart', self._chart),
+            CommandHandler('ai', self._cmd_two_phase),
             CommandHandler('analysis', self._analysis),
             CommandHandler('prompt', self._prompt),
             CommandHandler('promptjson', self._prompt_json),
@@ -398,6 +443,7 @@ class Telegram(RPCHandler):
             CallbackQueryHandler(self._monitor_list, pattern='update_monitor_list'),
             CallbackQueryHandler(self._monitor_view, pattern=r'monitor_select__.+'),
             CallbackQueryHandler(self._monitor_edit_inline, pattern=r'monitor_edit__.+'),
+            CallbackQueryHandler(self._ai_pagination_handler, pattern=r'^ai_(page|copy):'),
         ]
         for handle in handles:
             self._app.add_handler(handle)
@@ -1428,7 +1474,6 @@ class Telegram(RPCHandler):
                 else:
                     await query.edit_message_text(text=f"Trade {trade_id} not found.")
 
-
     @authorized_only
     async def _manual_open(self, update: Update, context: CallbackContext) -> None:
         """
@@ -1465,7 +1510,6 @@ class Telegram(RPCHandler):
             query=update.callback_query,        # 保留即可
         )
 
-
     @authorized_only
     async def _manual_open_view(self, update: Update, context: CallbackContext) -> None:
         query = update.callback_query
@@ -1485,11 +1529,11 @@ class Telegram(RPCHandler):
 
         side = item.get('direction', 'long')
         size = item.get('size')
-        lev  = item.get('leverage')
-        ep   = item.get('entry_price')
-        tps  = item.get('exit_points', [])
-        sl   = item.get('stop_loss')
-        ts   = datetime.fromtimestamp(item.get('timestamp', datetime.now().timestamp())).strftime('%Y-%m-%d %H:%M:%S')
+        lev = item.get('leverage')
+        ep = item.get('entry_price')
+        tps = item.get('exit_points', [])
+        sl = item.get('stop_loss')
+        ts = datetime.fromtimestamp(item.get('timestamp', datetime.now().timestamp())).strftime('%Y-%m-%d %H:%M:%S')
 
         tps_fmt = ', '.join([str(x) for x in tps]) if tps else '(未设)'
         ep_txt = f"{ep}" if isinstance(ep, (int, float)) else '市价'
@@ -1512,7 +1556,22 @@ class Telegram(RPCHandler):
             [InlineKeyboardButton('⬅️ 返回列表', callback_data='update_manual_list')],
             [InlineKeyboardButton('🔁 刷新本页', callback_data=f"manual_select__{pair}")],
         ]
-        await self._send_msg(msg, parse_mode=ParseMode.MARKDOWN, keyboard=kb, query=query)
+        # 计算 chat_id 以便 fallback 发送
+        chat_id = getattr(getattr(update, 'effective_chat', None), 'id', None) \
+            or getattr(getattr(query, 'message', None), 'chat_id', None)
+
+        if query is not None and hasattr(query, 'edit_message_text'):
+            # 有真实的 CallbackQuery，走“编辑原消息”
+            await self._send_msg(msg, parse_mode=ParseMode.MARKDOWN, keyboard=kb, query=query)
+        else:
+            # 否则新发一条（不要传 query）
+            from telegram import InlineKeyboardMarkup
+            await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
 
     @authorized_only
     async def _manual_edit_inline(self, update: Update, context: CallbackContext) -> None:
@@ -1531,7 +1590,6 @@ class Telegram(RPCHandler):
         )
         await query.message.reply_text(tip, parse_mode=ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
 
-
     def _parse_edit_input(self, text: str, current: dict) -> tuple[float | None, list[float], float]:
         """
         解析用户输入。返回 (entry_price, tps[3], sl)
@@ -1543,15 +1601,17 @@ class Telegram(RPCHandler):
         tokens = [t for t in text.split() if t]
 
         entry = current.get('entry_price')
-        tps   = list(current.get('exit_points', [None, None, None]))
+        tps = list(current.get('exit_points', [None, None, None]))
         # 确保长度为 3
-        if len(tps) < 3: tps += [None] * (3 - len(tps))
-        sl    = current.get('stop_loss')
+        if len(tps) < 3:
+            tps += [None] * (3 - len(tps))
+        sl = current.get('stop_loss')
 
         # 键值对优先
         if any('=' in t for t in tokens):
             for t in tokens:
-                if '=' not in t: continue
+                if '=' not in t:
+                    continue
                 k, v = t.split('=', 1)
                 k = k.lower()
                 try:
@@ -1588,7 +1648,6 @@ class Telegram(RPCHandler):
         else:
             raise ValueError('参数数量不正确。请输入 5 个数（含 entry）或 4 个数（不含 entry），或使用键值对。')
 
-
     def _parse_num_list(self, s: str) -> list[float]:
         s = s.strip()
         if s.startswith('[') and s.endswith(']'):
@@ -1596,7 +1655,8 @@ class Telegram(RPCHandler):
         parts = re.split(r'[,\s]+', s.strip())
         out = []
         for p in parts:
-            if not p: continue
+            if not p:
+                continue
             out.append(float(p))
         return out
 
@@ -1623,32 +1683,38 @@ class Telegram(RPCHandler):
         # 其他纯文本不处理
         return
 
-
-    def _parse_monitor_edit_input(self, text: str, current: dict) -> tuple[list[float] | None, list[float] | None, float | None]:
+    def _parse_monitor_edit_input(self, text: str, current: dict) -> tuple[list[float] | None, list[float] | None, float | None, bool | None]:
         """
-        返回 (entries, tps, sl)
-        - 五值：entry tp1 tp2 tp3 sl -> entries=[entry], tps=[tp1,tp2,tp3], sl
-        - 键值对：entries=/ep=（多值可逗号或空格或 [a,b]），tp=/tp1-3=，sl=
+        返回 (entries, tps, sl, auto)
+        - 五值：entry tp1 tp2 tp3 sl -> entries=[entry], tps=[tp1,tp2,tp3], sl, auto=None
+        - 键值对：entries=/ep=（多值可逗号或空格或 [a,b]），tp=/tp1-3=，sl=，auto=
+        auto= 支持 true/false/1/0/yes/no/on/off（大小写不敏感）
         - 允许只改部分，未给的返回 None
         """
         text = text.strip()
         tokens = [t for t in re.split(r'\s+', text) if t]
+
+        def _to_bool(v: str) -> bool:
+            s = v.strip().lower()
+            return s in ('1', 'true', 'yes', 'on')
 
         # 若有 '=' 走键值对
         if any('=' in t for t in tokens):
             entries = None
             tps = [None, None, None]
             sl = None
+            auto = None
             tp_bulk = None
             for tok in tokens:
-                if '=' not in tok: continue
+                if '=' not in tok:
+                    continue
                 k, v = tok.split('=', 1)
                 k = k.lower().strip()
                 v = v.strip()
                 try:
-                    if k in ('entries','ep','entry','eps'):
+                    if k in ('entries', 'ep', 'entry', 'eps'):
                         entries = self._parse_num_list(v)
-                    elif k in ('tp','tps'):
+                    elif k in ('tp', 'tps'):
                         tp_bulk = self._parse_num_list(v)
                     elif k == 'tp1':
                         tps[0] = float(v)
@@ -1656,24 +1722,26 @@ class Telegram(RPCHandler):
                         tps[1] = float(v)
                     elif k == 'tp3':
                         tps[2] = float(v)
-                    elif k in ('sl','stop','stop_loss'):
+                    elif k in ('sl', 'stop', 'stop_loss'):
                         sl = float(v)
+                    elif k in ('auto',):
+                        auto = _to_bool(v)
                 except ValueError:
                     pass
+
             # 合并单独 tp1-3 与 tp= 批量
             if tp_bulk is not None:
-                # 用批量覆盖前三个
                 while len(tp_bulk) < 3:
                     tp_bulk.append(None)
                 tps = tp_bulk[:3]
+
             # 若 tps 三个都是 None，则表示不改
             if all(x is None for x in tps):
                 tps = None
             else:
-                # 用当前值补齐缺失
-                cur = (current.get('exit_points') or [None, None, None]) + [None]*3
+                cur = (current.get('exit_points') or [None, None, None]) + [None] * 3
                 tps = [tps[i] if tps[i] is not None else cur[i] for i in range(3)]
-            return entries, tps, sl
+            return entries, tps, sl, auto
 
         # 否则尝试纯数字
         nums = []
@@ -1684,13 +1752,12 @@ class Telegram(RPCHandler):
                 pass
         if len(nums) == 5:
             entry, tp1, tp2, tp3, sl = nums
-            return [entry], [tp1, tp2, tp3], sl
+            return [entry], [tp1, tp2, tp3], sl, None
         elif len(nums) == 4:
             tp1, tp2, tp3, sl = nums
-            return None, [tp1, tp2, tp3], sl
+            return None, [tp1, tp2, tp3], sl, None
         else:
             raise ValueError('参数数量不正确。请输入 5 个数（含 entry）或 4 个数（不含 entry），或使用键值对。')
-
 
     async def _update_coin_monitoring_config(
         self,
@@ -1699,6 +1766,7 @@ class Telegram(RPCHandler):
         entry_points: list[float] | None,
         exit_points: list[float] | None,
         sl: float | None,
+        auto: bool | None = None,   # <== 新增
     ):
         state_file = 'user_data/strategy_state_production.json'
         try:
@@ -1712,7 +1780,6 @@ class Telegram(RPCHandler):
         if pair not in st['coin_monitoring'] or not isinstance(st['coin_monitoring'][pair], list):
             st['coin_monitoring'][pair] = []
 
-        # 确保索引存在
         while len(st['coin_monitoring'][pair]) <= idx:
             st['coin_monitoring'][pair].append({})
 
@@ -1722,7 +1789,6 @@ class Telegram(RPCHandler):
         if entry_points is not None:
             item['entry_points'] = entry_points
         if exit_points is not None:
-            # 按方向排序
             eps = [x for x in exit_points if x is not None]
             if direction == 'short':
                 eps = sorted(eps, reverse=True)
@@ -1731,19 +1797,18 @@ class Telegram(RPCHandler):
             item['exit_points'] = eps
         if sl is not None:
             item['stop_loss'] = sl
+        if auto is not None:                # <== 新增
+            item['auto'] = bool(auto)
 
-        # 打时间戳，方便追踪
         item['timestamp'] = datetime.now().timestamp()
 
         with open(state_file, 'w', encoding='utf-8') as f:
             json.dump(st, f, indent=4, ensure_ascii=False)
 
-        # 刷新内存
         if hasattr(self._rpc._freqtrade, 'strategy'):
             self._rpc._freqtrade.strategy.coin_monitoring = st['coin_monitoring']
 
         await self._send_msg(f'已更新 {pair}（#{idx}）的 coin_monitoring ✅')
-
 
     @authorized_only
     async def on_manual_edit_reply(self, update: Update, context: CallbackContext) -> None:
@@ -1779,7 +1844,7 @@ class Telegram(RPCHandler):
 
             # 用原来的 size/lev/方向
             size = float(current.get('size', 0))
-            lev  = float(current.get('leverage', 1))
+            lev = float(current.get('leverage', 1))
             side = SignalDirection(current.get('direction', 'long'))
 
             # 根据方向做排序（long 升序，short 降序）
@@ -1811,7 +1876,8 @@ class Telegram(RPCHandler):
                 fake_cb.callback_query.data = f"manual_select__{pair}"
             else:
                 # 简化：直接调用详情
-                class _Q: pass
+                class _Q:
+                    pass
                 q = _Q()
                 q.data = f"manual_select__{pair}"
                 q.message = msg
@@ -1819,11 +1885,10 @@ class Telegram(RPCHandler):
             await self._manual_open_view(update=fake_cb, context=context)
         except Exception as e:
             await msg.reply_text(f'解析或保存失败：{e}\n'
-                                '示例：`71000 72000 73500 75000 69500` 或 `tp1=72000 tp2=73500 sl=69500`',
-                                parse_mode=ParseMode.MARKDOWN)
+                                 '示例：`71000 72000 73500 75000 69500` 或 `tp1=72000 tp2=73500 sl=69500`',
+                                 parse_mode=ParseMode.MARKDOWN)
         finally:
             self._pending_manual_edit.pop(key, None)
-
 
     @authorized_only
     async def _monitor_view(self, update: Update, context: CallbackContext) -> None:
@@ -1846,13 +1911,14 @@ class Telegram(RPCHandler):
 
         side = it.get('direction', 'long')
         auto = '是' if it.get('auto') else '否'
-        eps  = it.get('entry_points') or []
-        tps  = it.get('exit_points') or []
-        sl   = it.get('stop_loss')
-        ts   = it.get('timestamp')
-        ts   = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else '—'
+        eps = it.get('entry_points') or []
+        tps = it.get('exit_points') or []
+        sl = it.get('stop_loss')
+        ts = it.get('timestamp')
+        ts = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else '—'
 
-        def fmt_list(a): return ', '.join(f'{x:g}' for x in a) if a else '（未设）'
+        def fmt_list(a):
+            return ', '.join(f'{x:g}' for x in a) if a else '（未设）'
 
         msg = (
             f"📈 *{pair}*  监控详情（#{idx})\n"
@@ -1865,6 +1931,7 @@ class Telegram(RPCHandler):
             f"1）五值（单入场）：`entry tp1 tp2 tp3 sl`\n"
             f"2）键值对：`entries=...` 或 `ep=...`（可多值），`tp=...`（或 `tp1= tp2= tp3=`），`sl=`\n"
             f"   例：`entries=[71000,70800] tp=72000,73500,75000 sl=69500`\n"
+            f"3）手动入场方式：\n<pre><code>/force{side} {pair.replace('/USDT:USDT', '')} 100 1 {tps[0]} {tps[1]} {tps[2]} {sl} {eps[0]}</code></pre>\n"
         )
 
         kb = [
@@ -1872,8 +1939,22 @@ class Telegram(RPCHandler):
             [InlineKeyboardButton('⬅️ 返回列表', callback_data='update_monitor_list')],
             [InlineKeyboardButton('🔁 刷新本页', callback_data=f"monitor_select__{pair}__{idx}")],
         ]
-        await self._send_msg(msg, parse_mode=ParseMode.MARKDOWN, keyboard=kb, query=query)
+        # 计算 chat_id 以便 fallback 发送
+        chat_id = getattr(getattr(update, 'effective_chat', None), 'id', None) \
+            or getattr(getattr(query, 'message', None), 'chat_id', None)
 
+        if query is not None and hasattr(query, 'edit_message_text'):
+            # 有真实的 CallbackQuery，走“编辑原消息”
+            await self._send_msg(msg, parse_mode=ParseMode.MARKDOWN, keyboard=kb, query=query)
+        else:
+            # 否则新发一条（不要传 query）
+            from telegram import InlineKeyboardMarkup
+            await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
 
     @authorized_only
     async def _monitor_edit_inline(self, update: Update, context: CallbackContext) -> None:
@@ -1887,15 +1968,12 @@ class Telegram(RPCHandler):
         tip = (
             '请回复新的参数：\n'
             '• 五值（单入场）：`entry tp1 tp2 tp3 sl`\n'
-            '• 或键值对：`entries=...`（或 `ep=` 支持多值） `tp=...`/`tp1=`/`tp2=`/`tp3=` `sl=`\n'
+            '• 或键值对：`entries=...`（或 `ep=` 支持多值） `tp=...`/`tp1=`/`tp2=`/`tp3=` `sl=` `auto=`\n'
             '示例：\n'
-            '  `entries=[71000,70800] tp=72000,73500,75000 sl=69500`\n'
+            '  `entries=[1.47,1.468] tp=1.49,1.507,1.526 sl=1.446 auto=true`\n'
             '  `71000 72000 73500 75000 69500`'
         )
         await query.message.reply_text(tip, parse_mode=ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
-
-
-
 
     @authorized_only
     async def _monitor_list(self, update: Update, context: CallbackContext) -> None:
@@ -1917,7 +1995,7 @@ class Telegram(RPCHandler):
             for idx, it in enumerate(items):
                 side = it.get('direction', 'long')
                 auto = 'A' if it.get('auto') else 'M'
-                eps  = it.get('entry_points') or []
+                eps = it.get('entry_points') or []
                 ep_txt = ','.join(f'{x:g}' for x in eps[:3]) + ('...' if len(eps) > 3 else '') if eps else '—'
                 btn_text = f"{pair} [{side}/{auto}] EP:{ep_txt} #{idx}"
                 buttons.append(InlineKeyboardButton(text=btn_text, callback_data=f"monitor_select__{pair}__{idx}"))
@@ -1926,7 +2004,6 @@ class Telegram(RPCHandler):
         rows.append([InlineKeyboardButton('刷新', callback_data='update_monitor_list')])
 
         await self._send_msg('请选择一个监控项查看 / 编辑：', keyboard=rows, query=update.callback_query)
-
 
     @authorized_only
     async def on_force_enter_reply(self, update: Update, context: CallbackContext) -> None:
@@ -1948,9 +2025,12 @@ class Telegram(RPCHandler):
             return
 
         try:
-            size = float(parts[0]); leverage = float(parts[1])
-            tp1  = float(parts[2]); tp2      = float(parts[3]); tp3 = float(parts[4])
-            sl   = float(parts[5])
+            size = float(parts[0])
+            leverage = float(parts[1])
+            tp1 = float(parts[2])
+            tp2 = float(parts[3])
+            tp3 = float(parts[4])
+            sl = float(parts[5])
             price = float(parts[6]) if len(parts) > 6 else None
 
             pair = _normalize_pair(pending['pair'])
@@ -1980,49 +2060,80 @@ class Telegram(RPCHandler):
         key = (msg.chat_id, msg.from_user.id)
         pending = self._pending_monitor_edit.get(key)
         if not pending:
-            return
+            return  # 不是 monitor 编辑流程
 
+        # 超时保护（3分钟）
         if time.time() - pending['ts'] > 180:
             self._pending_monitor_edit.pop(key, None)
             await msg.reply_text('编辑已超时，请重新点击“✏️ 修改参数”。')
             return
 
-        pair = pending['pair']; idx = pending['idx']
+        pair = pending['pair']
+        idx = pending['idx']
 
-        # 读取当前项
+        # 读取当前 coin_monitoring
         state_file = 'user_data/strategy_state_production.json'
         try:
             with open(state_file, 'r', encoding='utf-8') as f:
                 st = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             st = {}
+
         items = (st.get('coin_monitoring', {}) or {}).get(pair) or []
         if idx < 0 or idx >= len(items):
-            await msg.reply_text('未找到该监控项，可能已被移除。')
+            await msg.reply_text(f'{pair} 的索引 #{idx} 不存在。')
             self._pending_monitor_edit.pop(key, None)
             return
-        current = items[idx]
+        current = items[idx] or {}
 
         try:
-            entries, tps, sl = self._parse_monitor_edit_input(msg.text, current)
-            await self._update_coin_monitoring_config(pair, idx, entries, tps, sl)
+            entry_points, tps, sl, auto = self._parse_monitor_edit_input(msg.text, current)
+
+            # 根据方向做 TP 排序（如果只改 TP）
+            if tps is not None:
+                side = current.get('direction', 'long')
+                tps_clean = [x for x in tps if x is not None]
+                if len(tps_clean) != 3:
+                    old = current.get('exit_points', [])
+                    while len(tps_clean) < 3 and len(old) > len(tps_clean):
+                        tps_clean.append(old[len(tps_clean)])
+                    if len(tps_clean) != 3:
+                        raise ValueError('TP 数量不足（需要 3 个）。')
+                if side == 'short':
+                    tps_clean = sorted(tps_clean, reverse=True)
+                else:
+                    tps_clean = sorted(tps_clean)
+            else:
+                tps_clean = None
+
+            await self._update_coin_monitoring_config(
+                pair=pair,
+                idx=int(idx),
+                entry_points=entry_points,
+                exit_points=tps_clean,
+                sl=sl,
+                auto=auto,  # <== 传入
+            )
+
             await msg.reply_text('已更新 ✅')
 
-            # 返回详情页
-            class _Q: pass
-            q = _Q(); q.data = f"monitor_select__{pair}__{idx}"; q.message = msg
-            fake_update = Update(update.update_id, callback_query=q)
-            await self._monitor_view(update=fake_update, context=context)
+            # 刷新详情页
+            class _Q:
+                pass
+            q = _Q()
+            q.data = f"monitor_select__{pair}__{idx}"
+            q.message = msg
+            fake_cb = Update(update.update_id, callback_query=q)
+            await self._monitor_view(update=fake_cb, context=context)
+
         except Exception as e:
             await msg.reply_text(
                 f'解析或保存失败：{e}\n'
-                '示例：`entries=[71000,70800] tp=72000,73500,75000 sl=69500`\n'
-                '或：`71000 72000 73500 75000 69500`（单入场）',
+                '示例：`71000 72000 73500 75000 69500` 或 `entries=[71000,70800] tp=72000,73500,75000 sl=69500 auto=false`',
                 parse_mode=ParseMode.MARKDOWN
             )
         finally:
             self._pending_monitor_edit.pop(key, None)
-
 
     async def _force_enter_action(self, pair, price: float | None, order_side: SignalDirection, stake_amount: float, leverage: float, enter_tag: str):
         if pair != 'cancel':
@@ -2155,9 +2266,12 @@ class Telegram(RPCHandler):
         if len(args) >= 7:
             try:
                 pair = _normalize_pair(args[0])
-                size = float(args[1]); leverage = float(args[2])
-                tp1  = float(args[3]); tp2 = float(args[4]); tp3 = float(args[5])
-                sl   = float(args[6])
+                size = float(args[1])
+                leverage = float(args[2])
+                tp1 = float(args[3])
+                tp2 = float(args[4])
+                tp3 = float(args[5])
+                sl = float(args[6])
                 price = float(args[7]) if len(args) > 7 else None
 
                 await self._force_enter_action(
@@ -2178,8 +2292,8 @@ class Telegram(RPCHandler):
             key = (update.effective_chat.id, update.effective_user.id)
             self._pending_force[key] = {'pair': pair, 'side': order_side.value, 'ts': time.time()}
             tip = ('请按格式回复以下参数：\n'
-                '<size> <leverage> <tp1> <tp2> <tp3> <sl> [price]\n'
-                '示例：100 3 71000 72000 73500 69500')
+                   '<size> <leverage> <tp1> <tp2> <tp3> <sl> [price]\n'
+                   '示例：100 3 71000 72000 73500 69500')
             await context.bot.send_message(chat_id=update.effective_chat.id, text=tip, reply_markup=ForceReply(selective=True))
             return
 
@@ -2813,9 +2927,7 @@ class Telegram(RPCHandler):
             elif document and filename:
                 from telegram import InputFile
                 await query.edit_message_media(
-                    InputMediaDocument(InputFile(document, filename=filename),
-                                    caption=msg, parse_mode=parse_mode),
-                    reply_markup=reply_markup,
+                    InputMediaDocument(InputFile(document, filename=filename), caption=msg, parse_mode=parse_mode), reply_markup=reply_markup
                 )
             else:
                 await query.edit_message_text(text=msg, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -3014,6 +3126,140 @@ class Telegram(RPCHandler):
             )
         except TelegramError as telegram_err:
             logger.warning('TelegramError: %s! Giving up on that message.', telegram_err.message)
+
+    def _page_kb(self, key: str, i: int, n: int) -> InlineKeyboardMarkup:
+        prev_i = max(0, i - 1)
+        next_i = min(n - 1, i + 1)
+        rows = []
+        if n > 1:
+            rows.append([
+                InlineKeyboardButton('⬅️ Prev', callback_data=f"ai_page:{key}:{prev_i}"),
+                InlineKeyboardButton('Next ➡️', callback_data=f"ai_page:{key}:{next_i}"),
+            ])
+        rows.append([InlineKeyboardButton('📋 Copy as text', callback_data=f"ai_copy:{key}:{i}")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _send_html_paginated(self, chat_id: int, html_text: str, key: str):
+        # 1) 先清洗为 Telegram-safe
+        safe_html = sanitize_telegram_html(html_text)
+        # 2) 再标签感知分页
+        pages = split_html_pages(safe_html)
+        save_pages(key, pages)
+        page, i, n = get_page(key, 0)
+        # 3) 安全发送（失败自动 .txt 回退）
+        await self._safe_send_html(
+            chat_id=chat_id,
+            html_text=page,
+            reply_markup=self._page_kb(key, i, n),
+            page_hint=f"page {i + 1}/{n}"
+        )
+
+    @authorized_only
+    async def _ai_pagination_handler(self, update, context):
+        q = update.callback_query
+        data = q.data or ''
+        try:
+            # 先取 action
+            action, rest = data.split(':', 1)          # e.g. "ta_page:1758100545:1"
+            # 再从右侧取 idx
+            key, idx_s = rest.rsplit(':', 1)           # key = "1758100545", idx_s = "1" ；若 key 中还有冒号也安全
+            idx = int(idx_s)
+        except Exception:
+            await q.answer('Invalid action')
+            return
+
+        if action == 'ai_page':
+            page, i, n = get_page(key, idx)
+            await self._safe_edit_html(
+                q=q,
+                html_text=page,
+                reply_markup=self._page_kb(key, i, n),
+                page_hint=f"page {i + 1}/{n}",
+            )
+            try:
+                await q.answer(f"Page {i + 1}/{n}")
+            except Exception:
+                pass
+
+        elif action == 'ai_copy':
+            page, i, n = get_page(key, idx)
+            plain = re.sub(r'<[^>]+>', '', page or '')
+            if len(plain) > 3900:
+                plain = plain[:3900]
+            try:
+                await q.answer('Copied as text', show_alert=False)
+            except Exception:
+                pass
+            await self._bot.send_message(chat_id=q.message.chat_id, text=plain)
+
+    async def _send_txt_document(self, chat_id: int, content: str, filename: str, caption: str | None = None):
+        bio = BytesIO(content.encode('utf-8'))
+        bio.name = filename
+        await self._app.bot.send_document(
+            chat_id=chat_id,
+            document=bio,
+            caption=caption or 'Rendered as .txt (HTML parsing error). Please forward this file back for debugging.'
+        )
+
+    async def _safe_send_html(self, chat_id: int, html_text: str, reply_markup=None, page_hint: str | None = None):
+        try:
+            pretty = _beautify_inequalities(html_text or '')
+            await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=pretty,
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            plain = _to_clean_plain(html_text or '')
+            await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=plain,
+                reply_markup=reply_markup,
+            )
+
+    async def _safe_edit_html(self, q, html_text: str, reply_markup=None, page_hint: str | None = None):
+        try:
+            pretty = _beautify_inequalities(html_text or '')
+            await q.edit_message_text(
+                text=pretty,
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            plain = _to_clean_plain(html_text or '')
+            await q.edit_message_text(
+                text=plain,
+                reply_markup=reply_markup,
+            )
+            try:
+                await q.answer('Rendered as plain text due to HTML error', show_alert=False)
+            except Exception:
+                pass
+
+    @authorized_only
+    async def _cmd_two_phase(self, update, context):
+        msg = update.message or update.effective_message
+        raw = (msg.text or '').strip()
+        parts = raw.split(' ', 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await msg.reply_text('Usage: /ai <your prompt>\nExample: /ai ONDO/USDT short-term plan')
+            return
+        prompt = parts[1].strip()
+
+        await msg.reply_text(f"Got it. Analyzing:\n{prompt}\n\nI'll send the result here when it's ready.")
+
+        async def _worker(chat_id: int, prompt: str):
+            try:
+                html_result = await run_two_phase(prompt)  # 应返回 HTML 片段
+                key = f"{chat_id}:{int(time.time())}"
+                await self._send_html_paginated(chat_id, html_result, key)
+            except Exception as e:
+                await self._app.bot.send_message(chat_id=chat_id, text=f"Analysis failed: {e}")
+
+        asyncio.create_task(_worker(msg.chat_id, prompt))
 
     @authorized_only
     async def _chart(self, update: Update, context: CallbackContext) -> None:
@@ -3573,9 +3819,7 @@ class Telegram(RPCHandler):
                 os.unlink(tmp_file_path)
             else:
                 # 如果内容不超过限制，直接发送文本消息
-                await self._send_msg(f"```{prompt}```",reload_able=True,
-                        callback_path=callback_data,
-                        query=update.callback_query,)
+                await self._send_msg(f"```{prompt}```", reload_able=True, callback_path=callback_data, query=update.callback_query)
 
         except Exception as e:
             logger.exception('Error during prompt gen: %s', str(e))
@@ -3810,7 +4054,6 @@ class Telegram(RPCHandler):
             self._rpc._rpc_reload_config()
             await self._send_msg(f'交易对 {', '.join(pair)} 已从白名单移除')
 
-
     @authorized_only
     async def _set_pair_strategy_auto(self, update: Update, context: CallbackContext) -> None:
         """
@@ -3823,7 +4066,7 @@ class Telegram(RPCHandler):
         # 获取消息文本，删除命令本身
         message_text = update.message.text
         if message_text.startswith('/setpairstrategyauto'):
-            message_text = message_text[len(f'/setpairstrategyauto') :].strip()
+            message_text = message_text[len('/setpairstrategyauto') :].strip()
 
         # 检查是否有JSON内容
         if not message_text:
@@ -3884,7 +4127,6 @@ class Telegram(RPCHandler):
         except Exception as e:
             logger.exception('设置交易对策略时出错: %s', str(e))
             await self._send_msg(f"❌ 设置交易对策略时出错: {str(e)}")
-
 
     @authorized_only
     async def _set_pair_strategy(self, update: Update, context: CallbackContext) -> None:

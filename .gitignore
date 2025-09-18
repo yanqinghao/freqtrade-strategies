@@ -89,3 +89,5 @@ config_production.json
 logs
 *.csv
 plot
+pagination*
+*.json

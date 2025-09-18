@@ -1,15 +1,11 @@
 {
   "pair_strategy_mode": {
-    "POPCAT/USDT:USDT": "long",
-    "NKN/USDT:USDT": "short",
-    "NEIROETH/USDT:USDT": "long",
-    "1000BONK/USDT:USDT": "short",
-    "LPT/USDT:USDT": "long",
-    "ENJ/USDT:USDT": "short",
-    "XRP/USDT:USDT": "long",
-    "MAGIC/USDT:USDT": "short",
-    "TURBO/USDT:USDT": "short",
-    "GOAT/USDT:USDT": "long",
-    "VOXEL/USDT:USDT": "long"
+    "POL/USDT:USDT": "long",
+    "WLD/USDT:USDT": "long",
+    "PENGU/USDT:USDT": "long",
+    "EIGEN/USDT:USDT": "long",
+    "CRV/USDT:USDT": "long",
+    "FARTCOIN/USDT:USDT": "long",
+    "PYTH/USDT:USDT": "long"
   }
 }

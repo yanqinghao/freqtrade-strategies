@@ -953,53 +953,54 @@ class KamaFama_Dynamic(IStrategy):
     def check_price_monitoring(self, dataframe: DataFrame, pair: str):
         """
         三路并行通知（一次性拼接发送）：
-        1) 形态反转：15m 形态(Setup) + 1h 背景 + 确认(ATR)   <-- 不再要求靠近监控位
-        2) 监控位靠近/穿越：5m 价格 vs entry_points（ATR 距离）
-        3) 强趋势直通车：1h 趋势强时，直接“越过监控位 + ATR 余量”确认
+        1) 形态反转：1h 形态(Setup) + 4h 背景 + 确认(ATR)   <-- 不再要求靠近监控位
+        2) 监控位接近/穿越：5m 价格 vs entry_points（ATR 距离）
+        3) 强趋势直通车：4h 趋势强时，直接“越过监控位 + ATR(1h) 余量”确认
         """
         # ===== 参数 =====
         USE_LAST_CLOSED_CANDLE = True
 
-        # —— 形态线参数（放宽触发）
-        COOLDOWN_BARS_REVERSAL = 6  # 形态“确认通告”冷静期（单位：15m根数）
-        SETUP_EXPIRE_BARS = 2  # Setup 有效期（单位：15m根数）
-        CONFIRM_ATR_MULT = 0.25  # 确认阈值（收盘超出 anchor ± ATR*mult）
-        MIN_BODY_ATR_MULT = 0.15  # （放宽）最小实体：0.15 * ATR（原 0.25）
+        # —— 形态线参数（1h）
+        COOLDOWN_BARS_REVERSAL_1H = 6  # 形态确认冷静期（单位：1h K根）
+        SETUP_EXPIRE_BARS_1H = 2  # Setup 有效期（单位：1h K根）
+        CONFIRM_ATR_MULT = 0.25  # 确认阈值：收盘超出 anchor ± ATR*mult
+        MIN_BODY_ATR_MULT = 0.15  # 最小实体：0.15 * ATR(1h)
 
-        # —— 趋势直通车（独立冷静期）
+        # —— 趋势直通车（4h）
         TREND_BYPASS = True
-        ADX_TREND = 22
-        BYPASS_LEVEL_ATR_MULT = 0.25
-        COOLDOWN_BARS_TREND = 6  # 趋势直通车确认冷静期（单位：15m根数）
+        ADX_TREND = 22  # 4h ADX 阈值
+        BYPASS_LEVEL_ATR_MULT = 0.25  # 越级确认所需 ATR(1h) 余量倍数
+        COOLDOWN_BARS_TREND_4H = 2  # 趋势直通车确认冷静期（单位：4h K根）
 
-        # —— 监控位提示（5m）
+        # —— 4h 斜率归一化（百分比）
+        # SLOPE_MODE = 'pct'  # 固定使用百分比斜率
+        SLOPE_LOOKBACK_4H = 2  # t vs t-2（≈8小时）
+        SLOPE_PCT_MIN = 0.004  # 0.4%：多头>+0.004；空头<-0.004
+
+        # —— 监控位（5m）
         APPROACH_ATR_MULT = 0.35  # 接近判定：距离≤ ATR * 0.35（5m）
-        # 监控位提示不使用“时间冷静期”，用 per-level 状态机防抖
 
         if self.config.get('runmode', None) not in ('live', 'dry_run'):
             return
         if pair not in self.coin_monitoring:
             return
 
-        # ========= 状态（各路独立）=========
+        # ========= 状态 =========
         if not hasattr(self, 'monitoring_notification_sent'):
-            # {pair: {direction: {price_point: {'approaching': bool, 'crossed': bool}}}}
-            self.monitoring_notification_sent = {}
+            self.monitoring_notification_sent = (
+                {}
+            )  # {pair: {direction: {price_point: {'approaching','crossed'}}}}
         if not hasattr(self, 'reversal_setups'):
-            # {pair: {'long': {'ts','anchor','atr','label'}, 'short': {...}}}
-            self.reversal_setups = {}
+            self.reversal_setups = {}  # {pair: {'long': {...}, 'short': {...}}}
         if not hasattr(self, 'reversal_setup_notified'):
-            # {pair: {'long': ts, 'short': ts}}  ——“形态达成通告”去重
-            self.reversal_setup_notified = {}
+            self.reversal_setup_notified = {}  # {pair: {'long': ts, 'short': ts}}
         if not hasattr(self, 'reversal_confirm_sent'):
-            # {pair: {'long': ts, 'short': ts}}  ——“形态确认通告”冷静期
-            self.reversal_confirm_sent = {}
+            self.reversal_confirm_sent = {}  # {pair: {'long': ts, 'short': ts}}
         if not hasattr(self, 'trend_notification_sent'):
-            # {pair: {'long': ts, 'short': ts}}  ——“趋势直通车确认”冷静期（独立于形态）
-            self.trend_notification_sent = {}
+            self.trend_notification_sent = {}  # {pair: {'long': ts, 'short': ts}}
 
-        # ========= 小工具 =========
-        def _cooldown_ok(last_ts, current_ts, bars, tf_minutes=15):
+        # ========= 工具 =========
+        def _cooldown_ok(last_ts, current_ts, bars, tf_minutes=60):
             if last_ts is None:
                 return True
             try:
@@ -1011,7 +1012,7 @@ class KamaFama_Dynamic(IStrategy):
             if msg and isinstance(msg, str):
                 bag.append(msg)
 
-        # ========= 监控位集合（entry_points 仅供 ②/③ 使用）=========
+        # ========= 监控位集合 =========
         monitoring_configs = self.coin_monitoring.get(pair, [])
         levels_long, levels_short = [], []
         for cfg in monitoring_configs:
@@ -1021,7 +1022,6 @@ class KamaFama_Dynamic(IStrategy):
             else:
                 levels_short.extend(pts)
 
-        # ========= 批量消息容器（同轮只发一次）=========
         batch_msgs: list[str] = []
 
         # ========= ② 监控位接近/穿越（5m ATR）=========
@@ -1109,103 +1109,99 @@ class KamaFama_Dynamic(IStrategy):
                             state['approaching'] = False
                             state['crossed'] = False
 
-        # ========= ① 形态反转：15m + 1h 背景 + 确认 =========
-        df15m = self.get_ohlcv_history(pair, timeframe='15m', limit=200)
-        df1h = self.get_ohlcv_history(pair, timeframe='1h', limit=200)
-        if df15m is None or len(df15m) < 5:
-            # 尾声：统一发消息
+        # ========= ① 形态反转：1h + 4h 背景 + 确认 =========
+        df1h = self.get_ohlcv_history(pair, timeframe='1h', limit=300)
+        df4h = self.get_ohlcv_history(pair, timeframe='4h', limit=300)
+        if df1h is None or len(df1h) < 5:
             if batch_msgs and hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
                 self.dp.send_msg('\n'.join(batch_msgs))
             return
 
-        # 15m ATR 和索引
+        # 1h ATR
         try:
-            atr_15m_series = ta.ATR(df15m, timeperiod=14)
+            atr_1h_series = ta.ATR(df1h, timeperiod=14)
         except Exception:
-            atr_15m_series = pd.Series(index=df15m.index, dtype=float)
+            atr_1h_series = pd.Series(index=df1h.index, dtype=float)
 
-        idx15 = -2 if USE_LAST_CLOSED_CANDLE else -1
-        r15 = df15m.iloc[idx15]
-        atr15 = float(atr_15m_series.iloc[idx15]) if len(atr_15m_series) >= len(df15m) else np.nan
-        ts_15m = r15['date'] if 'date' in r15 else df15m.index[idx15]
+        idx1h = -2 if USE_LAST_CLOSED_CANDLE else -1
+        r1h = df1h.iloc[idx1h]
+        atr1h = float(atr_1h_series.iloc[idx1h]) if len(atr_1h_series) >= len(df1h) else np.nan
+        ts_1h = r1h['date'] if 'date' in r1h else df1h.index[idx1h]
 
-        # 1h 背景过滤（EMA20/EMA50）
-        bull_1h_ok, bear_1h_ok = True, True
-        if df1h is not None and len(df1h) >= 60:
-            idx1h = -2 if USE_LAST_CLOSED_CANDLE else -1
-            ema20 = df1h['close'].ewm(span=20, adjust=False).mean()
-            ema50 = df1h['close'].ewm(span=50, adjust=False).mean()
-            r1 = df1h.iloc[idx1h]
-            e20 = float(ema20.iloc[idx1h])
-            e50 = float(ema50.iloc[idx1h])
-            bull_1h_ok = (r1['close'] >= e20) or (e20 >= e50)
-            bear_1h_ok = (r1['close'] <= e20) or (e20 <= e50)
+        # 4h 背景过滤（EMA20/EMA50）
+        bull_4h_ok, bear_4h_ok = True, True
+        if df4h is not None and len(df4h) >= 60:
+            idx4h = -2 if USE_LAST_CLOSED_CANDLE else -1
+            ema20_4h = df4h['close'].ewm(span=20, adjust=False).mean()
+            ema50_4h = df4h['close'].ewm(span=50, adjust=False).mean()
+            r4h = df4h.iloc[idx4h]
+            e20_4h = float(ema20_4h.iloc[idx4h])
+            e50_4h = float(ema50_4h.iloc[idx4h])
+            bull_4h_ok = (r4h['close'] >= e20_4h) or (e20_4h >= e50_4h)
+            bear_4h_ok = (r4h['close'] <= e20_4h) or (e20_4h <= e50_4h)
         else:
-            idx1h = -1
-            ema20 = ema50 = None
+            idx4h = -1
+            ema20_4h = ema50_4h = None
 
-        # —— 形态识别（降低门槛：只看实体 + 形态，不再要求 swing）——
+        # —— 形态识别（1h）
         try:
-            eng = int(ta.CDLENGULFING(df15m).iloc[idx15])  # +100/-100
-            hammer = int(ta.CDLHAMMER(df15m).iloc[idx15])  # +100
-            invham = int(ta.CDLINVERTEDHAMMER(df15m).iloc[idx15])  # +100
-            shooting = int(ta.CDLSHOOTINGSTAR(df15m).iloc[idx15])  # -100
+            eng = int(ta.CDLENGULFING(df1h).iloc[idx1h])  # +100/-100
+            hammer = int(ta.CDLHAMMER(df1h).iloc[idx1h])  # +100
+            invham = int(ta.CDLINVERTEDHAMMER(df1h).iloc[idx1h])  # +100
+            shooting = int(ta.CDLSHOOTINGSTAR(df1h).iloc[idx1h])  # -100
             try:
-                morning_series = ta.CDLMORNINGSTAR(df15m, penetration=0.3)
+                morning_series = ta.CDLMORNINGSTAR(df1h, penetration=0.3)
             except TypeError:
-                morning_series = ta.CDLMORNINGSTAR(df15m)
-            morning = int(morning_series.iloc[idx15])  # +100
+                morning_series = ta.CDLMORNINGSTAR(df1h)
+            morning = int(morning_series.iloc[idx1h])  # +100
             try:
-                evening_series = ta.CDLEVENINGSTAR(df15m, penetration=0.3)
+                evening_series = ta.CDLEVENINGSTAR(df1h, penetration=0.3)
             except TypeError:
-                evening_series = ta.CDLEVENINGSTAR(df15m)
-            evening = int(evening_series.iloc[idx15])  # -100
+                evening_series = ta.CDLEVENINGSTAR(df1h)
+            evening = int(evening_series.iloc[idx1h])  # -100
         except Exception:
             eng = hammer = invham = shooting = morning = evening = 0
 
-        body = abs(float(r15['close']) - float(r15['open']))
-        quality_ok = (not np.isnan(atr15)) and (body >= MIN_BODY_ATR_MULT * atr15)
+        body = abs(float(r1h['close']) - float(r1h['open']))
+        quality_ok = (not np.isnan(atr1h)) and (body >= MIN_BODY_ATR_MULT * atr1h)
 
-        # ———放宽后的形态布尔：只需“实体合格 + 至少一个形态信号”———
-        bull_15m = quality_ok and ((eng > 0) or (hammer > 0) or (invham > 0) or (morning > 0))
-        bear_15m = quality_ok and ((eng < 0) or (shooting < 0) or (evening < 0))
+        bull_1h = quality_ok and ((eng > 0) or (hammer > 0) or (invham > 0) or (morning > 0))
+        bear_1h = quality_ok and ((eng < 0) or (shooting < 0) or (evening < 0))
 
-        # 形态标签
-        labels = []
+        label_parts = []
         if eng > 0:
-            labels.append('BullEngulf')
+            label_parts.append('BullEngulf')
         if hammer > 0:
-            labels.append('Hammer')
+            label_parts.append('Hammer')
         if invham > 0:
-            labels.append('InvHammer')
+            label_parts.append('InvHammer')
         if morning > 0:
-            labels.append('MorningStar')
+            label_parts.append('MorningStar')
         if eng < 0:
-            labels.append('BearEngulf')
+            label_parts.append('BearEngulf')
         if shooting < 0:
-            labels.append('ShootingStar')
+            label_parts.append('ShootingStar')
         if evening < 0:
-            labels.append('EveningStar')
-        label_15m = '+'.join(labels) if labels else 'None'
+            label_parts.append('EveningStar')
+        label_1h = '+'.join(label_parts) if label_parts else 'None'
 
-        # —— Setup 登记（不再要求靠近监控位）——
+        # —— Setup 登记（1h）
         pair_setups = self.reversal_setups.setdefault(pair, {})
-        if bull_15m and bull_1h_ok:
+        if bull_1h and bull_4h_ok:
             pair_setups['long'] = {
-                'ts': ts_15m,
-                'anchor': float(r15['high']),
-                'atr': float(atr15),
-                'label': label_15m,
+                'ts': ts_1h,
+                'anchor': float(r1h['high']),
+                'atr': float(atr1h),
+                'label': label_1h,
             }
-        if bear_15m and bear_1h_ok:
+        if bear_1h and bear_4h_ok:
             pair_setups['short'] = {
-                'ts': ts_15m,
-                'anchor': float(r15['low']),
-                'atr': float(atr15),
-                'label': label_15m,
+                'ts': ts_1h,
+                'anchor': float(r1h['low']),
+                'atr': float(atr1h),
+                'label': label_1h,
             }
 
-        # —— 形态话术与确认（达成就发；确认则追加“✅确认突破”）——
         def _rev_line(direction: str, setup: dict, confirmed: bool) -> str:
             icon = '📈' if direction == 'long' else '📉'
             label = setup.get('label', 'N/A')
@@ -1213,15 +1209,14 @@ class KamaFama_Dynamic(IStrategy):
             atr0 = float(setup.get('atr', 0.0)) if setup.get('atr', None) is not None else 0.0
             thr = CONFIRM_ATR_MULT * atr0
             base = (
-                f"{icon} Reversal {direction.upper()} Setup {pair} | "
-                f"Pattern: {label} | Anchor: {anchor:.6f} | ATR14: {atr0:.6f} | "
-                f"有效期: {SETUP_EXPIRE_BARS}x15m"
+                f"{icon} Reversal {direction.upper()} Setup {pair} | TF:1h | Pattern: {label} | "
+                f"Anchor: {anchor:.6f} | ATR14(1h): {atr0:.6f} | 有效期: {SETUP_EXPIRE_BARS_1H}x1h"
             )
             if confirmed:
                 cond = (
-                    f"Close > Anchor+{thr:.6f}"
+                    f"Close(1h) > Anchor+{thr:.6f}"
                     if direction == 'long'
-                    else f"Close < Anchor-{thr:.6f}"
+                    else f"Close(1h) < Anchor-{thr:.6f}"
                 )
                 base += f" | ✅ 确认突破: {cond}"
             return base
@@ -1231,37 +1226,38 @@ class KamaFama_Dynamic(IStrategy):
             if not setup:
                 return False
 
-            # 找 setup 的索引
+            # 找 setup 的 1h 索引
             setup_idx = None
-            if 'date' in df15m.columns:
-                for i in range(len(df15m)):
-                    if df15m.iloc[i]['date'] == setup['ts']:
+            if 'date' in df1h.columns:
+                for i in range(len(df1h)):
+                    if df1h.iloc[i]['date'] == setup['ts']:
                         setup_idx = i
                         break
             if setup_idx is None:
                 try:
-                    setup_idx = df15m.index.get_loc(setup['ts'])
+                    setup_idx = df1h.index.get_loc(setup['ts'])
                 except Exception:
                     return False
 
-            end_idx = min(len(df15m) - 1, setup_idx + SETUP_EXPIRE_BARS)
+            end_idx = min(len(df1h) - 1, setup_idx + SETUP_EXPIRE_BARS_1H)
             if end_idx <= setup_idx:
                 return False
 
             idx_chk = -2 if USE_LAST_CLOSED_CANDLE else -1
-            real_chk = len(df15m) + idx_chk if idx_chk < 0 else idx_chk
+            real_chk = len(df1h) + idx_chk if idx_chk < 0 else idx_chk
             if real_chk <= setup_idx:
                 return False
 
-            close_chk = float(df15m.iloc[idx_chk]['close'])
+            close_chk = float(df1h.iloc[idx_chk]['close'])
             anchor = float(setup['anchor'])
             atr0 = setup.get('atr', np.nan)
             thr = CONFIRM_ATR_MULT * (atr0 if not np.isnan(atr0) else 0.0)
 
-            if direction_key == 'long':
-                return close_chk > (anchor + thr)
-            else:
-                return close_chk < (anchor - thr)
+            return (
+                close_chk > (anchor + thr)
+                if direction_key == 'long'
+                else close_chk < (anchor - thr)
+            )
 
         def _maybe_emit_reversal(direction_key: str):
             setup = pair_setups.get(direction_key)
@@ -1271,114 +1267,130 @@ class KamaFama_Dynamic(IStrategy):
             last_confirm_ts = self.reversal_confirm_sent.setdefault(pair, {}).get(direction_key)
             confirmed_now = _confirm(direction_key)
 
-            # 1) 形态达成：若该 ts 尚未通告，立即发 Setup（若同轮确认，则在同条话术里追加“✅确认突破”）
             if notified_ts != setup['ts']:
                 _emit(_rev_line(direction_key, setup, confirmed_now), batch_msgs)
                 self.reversal_setup_notified.setdefault(pair, {})[direction_key] = setup['ts']
-
-                # 若同轮已确认 —— 记录确认冷静期 & 移除 setup
-                if confirmed_now and _cooldown_ok(last_confirm_ts, ts_15m, 0):
-                    self.reversal_confirm_sent[pair][direction_key] = ts_15m
+                if confirmed_now and _cooldown_ok(last_confirm_ts, ts_1h, 0, tf_minutes=60):
+                    self.reversal_confirm_sent[pair][direction_key] = ts_1h
                     self.reversal_setups.get(pair, {}).pop(direction_key, None)
                 return
 
-            # 2) 之前已发过 Setup，本轮“仅确认”
-            if confirmed_now and _cooldown_ok(last_confirm_ts, ts_15m, COOLDOWN_BARS_REVERSAL):
+            if confirmed_now and _cooldown_ok(
+                last_confirm_ts, ts_1h, COOLDOWN_BARS_REVERSAL_1H, tf_minutes=60
+            ):
                 _emit(_rev_line(direction_key, setup, True), batch_msgs)
-                self.reversal_confirm_sent[pair][direction_key] = ts_15m
+                self.reversal_confirm_sent[pair][direction_key] = ts_1h
                 self.reversal_setups.get(pair, {}).pop(direction_key, None)
                 return
 
-            # 3) 未确认则检查过期，过期清理
             if not confirmed_now:
                 setup_idx = None
-                if 'date' in df15m.columns:
-                    for i in range(len(df15m)):
-                        if df15m.iloc[i]['date'] == setup['ts']:
+                if 'date' in df1h.columns:
+                    for i in range(len(df1h)):
+                        if df1h.iloc[i]['date'] == setup['ts']:
                             setup_idx = i
                             break
                 if setup_idx is None:
                     try:
-                        setup_idx = df15m.index.get_loc(setup['ts'])
+                        setup_idx = df1h.index.get_loc(setup['ts'])
                     except Exception:
                         setup_idx = None
-                if setup_idx is not None and (len(df15m) - 1 - setup_idx) > SETUP_EXPIRE_BARS:
+                if setup_idx is not None and (len(df1h) - 1 - setup_idx) > SETUP_EXPIRE_BARS_1H:
                     self.reversal_setups[pair].pop(direction_key, None)
 
-        # 分别尝试发送 多头/空头 形态话术（达成 + 可选确认）
         _maybe_emit_reversal('long')
         _maybe_emit_reversal('short')
 
-        # ========= ③ 强趋势直通车（独立冷静期，不影响形态）=========
-        # 计算 1h ADX 与 EMA20 斜率（已在上方得到 idx1h、ema20）
+        # ========= ③ 强趋势直通车（4h 趋势 + 1h ATR 余量；斜率已归一化）=========
         try:
-            adx1h_series = (
-                ta.ADX(df1h, timeperiod=14) if (df1h is not None and len(df1h) >= 20) else None
+            adx4h_series = (
+                ta.ADX(df4h, timeperiod=14) if (df4h is not None and len(df4h) >= 20) else None
             )
-            adx1h = float(adx1h_series.iloc[idx1h]) if adx1h_series is not None else np.nan
+            adx4h = float(adx4h_series.iloc[idx4h]) if adx4h_series is not None else np.nan
         except Exception:
-            adx1h = np.nan
+            adx4h = np.nan
 
-        ema20_slope = 0.0
+        # 4h EMA20 百分比斜率（无量纲）
+        norm_slope_4h = 0.0
         try:
-            if df1h is not None and ema20 is not None and len(df1h) >= 5:
-                ema20_slope = float(ema20.iloc[idx1h] - ema20.iloc[idx1h - 3])
+            if (
+                df4h is not None
+                and ema20_4h is not None
+                and len(df4h) > abs(idx4h - SLOPE_LOOKBACK_4H)
+            ):
+                ema_now = float(ema20_4h.iloc[idx4h])
+                ema_prev = float(ema20_4h.iloc[idx4h - SLOPE_LOOKBACK_4H])
+                if ema_prev > 0:
+                    norm_slope_4h = (ema_now - ema_prev) / ema_prev
         except Exception:
-            pass
+            norm_slope_4h = 0.0
+
+        slope_up_ok = norm_slope_4h > SLOPE_PCT_MIN
+        slope_dn_ok = norm_slope_4h < -SLOPE_PCT_MIN
 
         trend_long_ok = (
-            bull_1h_ok and (not np.isnan(adx1h)) and (adx1h >= ADX_TREND) and (ema20_slope > 0)
+            bull_4h_ok and (not np.isnan(adx4h)) and (adx4h >= ADX_TREND) and slope_up_ok
         )
         trend_short_ok = (
-            bear_1h_ok and (not np.isnan(adx1h)) and (adx1h >= ADX_TREND) and (ema20_slope < 0)
+            bear_4h_ok and (not np.isnan(adx4h)) and (adx4h >= ADX_TREND) and slope_dn_ok
         )
 
         def _trend_bypass(direction: str) -> bool:
-            if not TREND_BYPASS or np.isnan(atr15):
+            if not TREND_BYPASS or np.isnan(atr1h):
                 return False
-            close_chk = float(df15m.iloc[idx15]['close'])
-            thr = BYPASS_LEVEL_ATR_MULT * atr15
+            idx4h_local = -2 if USE_LAST_CLOSED_CANDLE else -1
+            ts4h = (
+                df4h.iloc[idx4h_local]['date']
+                if ('date' in df4h.columns)
+                else df4h.index[idx4h_local]
+            )
+            close_1h_chk = float(df1h.iloc[idx1h]['close'])
+            thr = BYPASS_LEVEL_ATR_MULT * atr1h
 
-            # 独立冷静期
             last_ts = self.trend_notification_sent.setdefault(pair, {}).get(direction)
 
             if (
                 direction == 'long'
                 and trend_long_ok
-                and _cooldown_ok(last_ts, ts_15m, COOLDOWN_BARS_TREND)
+                and _cooldown_ok(last_ts, ts4h, COOLDOWN_BARS_TREND_4H, tf_minutes=240)
             ):
                 for lv in levels_long:
-                    if close_chk > (lv + thr):
-                        self.trend_notification_sent.setdefault(pair, {})['long'] = ts_15m
+                    if close_1h_chk > (lv + thr):
+                        self.trend_notification_sent.setdefault(pair, {})['long'] = ts4h
                         _emit(
-                            f"🚀 Trend LONG Confirmed {pair} | Break: {lv:.6f} (+{thr:.6f}) | ADX(1h): {adx1h:.1f} | "
-                            f"EMA20 slope: {ema20_slope:.6f} | Close(15m): {close_chk:.6f}",
+                            f"🚀 Trend LONG Confirmed {pair} | TF:4h | Break: {lv:.6f} (+{thr:.6f}) | "
+                            f"ADX(4h): {adx4h:.1f} | NormSlope(4h,pct,{SLOPE_LOOKBACK_4H}): {norm_slope_4h:.6f} | "
+                            f"Close(1h): {close_1h_chk:.6f}",
                             batch_msgs,
                         )
-                        logger.info(f"[TREND] LONG confirmed {pair} | break {lv} thr {thr}")
+                        logger.info(
+                            f"[TREND] LONG {pair} | break {lv} thr {thr} | slope {norm_slope_4h:.6f}"
+                        )
                         return True
                 return False
 
             if (
                 direction == 'short'
                 and trend_short_ok
-                and _cooldown_ok(last_ts, ts_15m, COOLDOWN_BARS_TREND)
+                and _cooldown_ok(last_ts, ts4h, COOLDOWN_BARS_TREND_4H, tf_minutes=240)
             ):
                 for lv in levels_short:
-                    if close_chk < (lv - thr):
-                        self.trend_notification_sent.setdefault(pair, {})['short'] = ts_15m
+                    if close_1h_chk < (lv - thr):
+                        self.trend_notification_sent.setdefault(pair, {})['short'] = ts4h
                         _emit(
-                            f"📉 Trend SHORT Confirmed {pair} | Break: {lv:.6f} (-{thr:.6f}) | ADX(1h): {adx1h:.1f} | "
-                            f"EMA20 slope: {ema20_slope:.6f} | Close(15m): {close_chk:.6f}",
+                            f"📉 Trend SHORT Confirmed {pair} | TF:4h | Break: {lv:.6f} (-{thr:.6f}) | "
+                            f"ADX(4h): {adx4h:.1f} | NormSlope(4h,pct,{SLOPE_LOOKBACK_4H}): {norm_slope_4h:.6f} | "
+                            f"Close(1h): {close_1h_chk:.6f}",
                             batch_msgs,
                         )
-                        logger.info(f"[TREND] SHORT confirmed {pair} | break {lv} thr {thr}")
+                        logger.info(
+                            f"[TREND] SHORT {pair} | break {lv} thr {thr} | slope {norm_slope_4h:.6f}"
+                        )
                         return True
                 return False
 
             return False
 
-        # 运行趋势直通车（不与形态共享冷静期）
         _ = _trend_bypass('long')
         _ = _trend_bypass('short')
 
