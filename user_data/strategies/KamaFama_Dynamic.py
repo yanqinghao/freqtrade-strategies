@@ -139,6 +139,7 @@ class KamaFama_Dynamic(IStrategy):
         初始化策略，加载外部策略模式配置
         """
         super().__init__(config)
+        self.should_not_init = os.environ.get('SHOULD_NOT_INIT') == 'true'
 
         # 尝试从外部JSON文件加载策略模式配置
         self.load_strategy_mode_config()
@@ -233,12 +234,22 @@ class KamaFama_Dynamic(IStrategy):
 
                         # 如果当前模式是short，仅保留short配置
                         if current_mode == 'short' and direction == 'short':
-                            valid_configs.append({**config, 'auto_initialized': False})
+                            valid_configs.append(
+                                {
+                                    **config,
+                                    'auto_initialized': True if self.should_not_init else False,
+                                }
+                            )
                             has_matching_config = True
 
                         # 多头配置总是被保留
                         if direction == 'long' and current_mode == 'long':
-                            valid_configs.append({**config, 'auto_initialized': False})
+                            valid_configs.append(
+                                {
+                                    **config,
+                                    'auto_initialized': True if self.should_not_init else False,
+                                }
+                            )
                             has_matching_config = True
 
                         if direction == 'long' and current_mode == 'short':
@@ -255,7 +266,7 @@ class KamaFama_Dynamic(IStrategy):
                                 'auto': True,
                                 'entry_points': [],
                                 'exit_points': [],
-                                'auto_initialized': False,
+                                'auto_initialized': True if self.should_not_init else False,
                             }
                         )
                         updated_configs = True
@@ -982,7 +993,7 @@ class KamaFama_Dynamic(IStrategy):
 
         if self.config.get('runmode', None) not in ('live', 'dry_run'):
             return
-        if pair not in self.coin_monitoring:
+        if pair not in self.coin_monitoring and not getattr(self, 'manual_open', None):
             return
 
         # ========= 状态 =========
@@ -998,6 +1009,10 @@ class KamaFama_Dynamic(IStrategy):
             self.reversal_confirm_sent = {}  # {pair: {'long': ts, 'short': ts}}
         if not hasattr(self, 'trend_notification_sent'):
             self.trend_notification_sent = {}  # {pair: {'long': ts, 'short': ts}}
+        # —— 新增：manual_open 状态
+        if not hasattr(self, 'manual_entry_notification_sent'):
+            # {pair: {'approaching': bool, 'crossed': bool}}
+            self.manual_entry_notification_sent = {}
 
         # ========= 工具 =========
         def _cooldown_ok(last_ts, current_ts, bars, tf_minutes=60):
@@ -1108,6 +1123,68 @@ class KamaFama_Dynamic(IStrategy):
                         if is_away and (state['approaching'] or state['crossed']):
                             state['approaching'] = False
                             state['crossed'] = False
+
+        # ========= （简化）④ manual_open：仅比较 entry_price（用于未开单前的提醒） =========
+        if not active_trades:
+            mo = (getattr(self, 'manual_open', {}) or {}).get(pair)
+            if mo and (mo.get('entry_price') is not None):
+                direction = str(mo.get('direction', 'long')).lower()
+                try:
+                    entry_price = float(mo.get('entry_price'))
+                except Exception:
+                    entry_price = float('nan')
+
+                if not np.isnan(entry_price):
+                    st = self.manual_entry_notification_sent.setdefault(
+                        pair, {'approaching': False, 'crossed': False}
+                    )
+
+                    if direction == 'long':
+                        # 习惯：做多通常在上方接近买入位时提醒；触达=价格 <= entry
+                        is_approaching = (
+                            (current_price > entry_price)
+                            and (not np.isnan(atr_5m))
+                            and ((current_price - entry_price) <= APPROACH_ATR_MULT * atr_5m)
+                        )
+                        has_crossed = current_price <= entry_price
+                        is_away = (not np.isnan(atr_5m)) and (
+                            current_price > entry_price + APPROACH_ATR_MULT * atr_5m
+                        )
+                    else:  # short
+                        # 做空通常在下方接近入场位；触达=价格 >= entry
+                        is_approaching = (
+                            (current_price < entry_price)
+                            and (not np.isnan(atr_5m))
+                            and ((entry_price - current_price) <= APPROACH_ATR_MULT * atr_5m)
+                        )
+                        has_crossed = current_price >= entry_price
+                        is_away = (not np.isnan(atr_5m)) and (
+                            current_price < entry_price - APPROACH_ATR_MULT * atr_5m
+                        )
+
+                    # —— 接近
+                    if is_approaching and not st['approaching']:
+                        _emit(
+                            f"🔔 MANUAL ENTRY approaching {pair} | Dir:{direction.upper()} | "
+                            f"Price: {current_price:.6f} | Entry: {entry_price:.6f}",
+                            batch_msgs,
+                        )
+                        st['approaching'] = True
+                        st['crossed'] = False
+
+                    # —— 触达 / 穿越
+                    if has_crossed and not st['crossed']:
+                        _emit(
+                            f"✅ MANUAL ENTRY hit {pair} | Dir:{direction.upper()} | "
+                            f"Price: {current_price:.6f} | Entry: {entry_price:.6f}",
+                            batch_msgs,
+                        )
+                        st['crossed'] = True
+                        st['approaching'] = True  # 命中后视作已接近
+
+                    # —— 离开接近区（且未命中）→ 复位
+                    if is_away and (st['approaching'] and not st['crossed']):
+                        st['approaching'] = False
 
         # ========= ① 形态反转：1h + 4h 背景 + 确认 =========
         df1h = self.get_ohlcv_history(pair, timeframe='1h', limit=300)

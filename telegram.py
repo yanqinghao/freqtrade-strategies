@@ -138,6 +138,44 @@ def _beautify_inequalities(html_text: str) -> str:
     html_text = re.sub(r'≥\s+', '≥', html_text)
     return html_text
 
+# 允许的模式集合
+ALLOWED_MODES = {0, 1, 2, 3, 4}  # 你用到几个就留几个
+
+MODE_PREFIX_PATTERNS = [
+    re.compile(r'^\s*\[(?P<mode>\d)\]\s*', re.I),     # [2] Prompt...
+    re.compile(r'^\s*(?P<mode>\d)\s*::\s*', re.I),    # 2:: Prompt...
+]
+MODE_SUFFIX_PATTERNS = [
+    re.compile(r'\s*::\s*(?P<mode>\d)\s*$', re.I),    # Prompt ... ::2
+]
+
+def extract_mode_and_prompt(raw: str, default_mode: int = 0):
+    """
+    仅在消息“开头/结尾”解析模式，避免误伤正文。
+    格式：
+      前缀:  [2] ...   或   2:: ...
+      后缀:  ... ::2
+    若无 → 使用 default_mode
+    """
+    text = raw or ''
+    # 1) 前缀
+    for rx in MODE_PREFIX_PATTERNS:
+        m = rx.match(text)
+        if m:
+            mode = int(m.group('mode'))
+            if mode in ALLOWED_MODES:
+                return mode, text[m.end():].strip()
+    # 2) 后缀
+    for rx in MODE_SUFFIX_PATTERNS:
+        m = rx.search(text)
+        if m:
+            mode = int(m.group('mode'))
+            if mode in ALLOWED_MODES:
+                # 去掉后缀
+                cleaned = text[:m.start()].rstrip()
+                return mode, cleaned
+    # 3) 默认
+    return default_mode, text.strip()
 
 def safe_async_db(func: Callable[..., Any]):
     """
@@ -3245,21 +3283,32 @@ class Telegram(RPCHandler):
         raw = (msg.text or '').strip()
         parts = raw.split(' ', 1)
         if len(parts) < 2 or not parts[1].strip():
-            await msg.reply_text('Usage: /ai <your prompt>\nExample: /ai ONDO/USDT short-term plan')
+            await msg.reply_text('Usage: /ai <prompt>\nExamples:\n'
+                                '/ai [0] BTC short-term trend plan\n'
+                                '/ai 1:: ETH reversal setup\n'
+                                '/ai ONDO/USDT short-term plan ::2\n'
+                                '0: normal, 1: reversal, 2: trend 3: market 4: postion dac\n')
             return
-        prompt = parts[1].strip()
 
-        await msg.reply_text(f"Got it. Analyzing:\n{prompt}\n\nI'll send the result here when it's ready.")
+        # 原始自由 prompt（包含可能的模式标记）
+        user_input = parts[1].strip()
 
-        async def _worker(chat_id: int, prompt: str):
+        # 只在开头或结尾解析模式；默认给 0
+        mode, cleaned_prompt = extract_mode_and_prompt(user_input, default_mode=0)
+
+        await msg.reply_text(
+            f"Got it. Analyzing (mode={mode}):\n{cleaned_prompt}\n\nI'll send the result here."
+        )
+
+        async def _worker(chat_id: int, prompt: str, mode: int):
             try:
-                html_result = await run_two_phase(prompt)  # 应返回 HTML 片段
+                html_result = await run_two_phase(prompt, mode)  # 返回 HTML 片段
                 key = f"{chat_id}:{int(time.time())}"
                 await self._send_html_paginated(chat_id, html_result, key)
             except Exception as e:
                 await self._app.bot.send_message(chat_id=chat_id, text=f"Analysis failed: {e}")
 
-        asyncio.create_task(_worker(msg.chat_id, prompt))
+        asyncio.create_task(_worker(msg.chat_id, cleaned_prompt, mode))
 
     @authorized_only
     async def _chart(self, update: Update, context: CallbackContext) -> None:
