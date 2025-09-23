@@ -43,6 +43,8 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 - Required indicators to fetch: **MA20, MA50, Bollinger Bands (basis/upper/lower), RSI, MACD, ADX, ATR, OBV**.
 - Also fetch **current price/ticker**; optionally **order book** and **recent trades** for breakout/volatility context.
 - For **Stop-Loss** sizing later, ensure you fetch an **ATR** (4h or 1d).
+- Fetch **Funding Rate** (current + history) for perp market bias and potential squeeze risk.
+- Fetch **Open Interest** (latest + series) for market positioning confirmation.
 - For **RRSR** later, attempt to fetch **historical analogs/backtests** (same horizon, side, HTF bias, indicator regime, entry archetype). If unavailable, note that **heuristic estimation** will be required.
 
 ---
@@ -51,18 +53,18 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 1. **Bias source**
    - Short-term: **4h + 1d** are primary.
    - Long-term: **1d + 1w** are primary.
-   - **OBV**: confirm trend direction on HTF (funds following or diverging).
+   - **OBV + OI + Funding Rate**: confirm trend direction / trader positioning on HTF.
 
 2. **Entry timing**
    - Short-term: refine with **15m + 1h**; confirm with 4h; flag potential **false signals**.
    - Long-term: refine with **1h + 4h**; never counter 1d/1w bias.
-   - **OBV**: confirm breakout/reversal on 1h/15m for entry validation.
+   - **OBV/OI/Funding Rate**: confirm breakout/reversal bias and sustainability.
 
 3. **Levels to fetch (no arbitrary %)**
    - **S/R** from swing highs/lows and session levels.
    - **MA20/MA50** as dynamic S/R; **BB** (basis/upper/lower) for channel edges.
    - Confirmation: **RSI** (OB/OS, divergence), **MACD** (cross/impulse), **ADX** (trend strength; range if <~20–22), **ATR** (volatility), **OBV** (volume flow confirmation).
-
+   - **Funding Rate spikes** + **Open Interest jumps/drops** = potential squeeze/reversal zones.
 ---
 
 ## Side Selection Logic (data needed)
@@ -76,8 +78,8 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 ---
 
 ## 🚨 Optimized Entry Constraint Rules (data implications)
-- **Long entries** must be **below current price** (buy-the-dip support), or **at market** only on a **confirmed breakout** (BB/RSI/MACD/OBV/Volume).
-- **Short entries** must be **above current price** (sell-the-rally resistance), or **at market** only on a **confirmed breakdown** (BB/RSI/MACD/OBV/Volume).
+- **Long entries** must be **below current price** (buy-the-dip support), or **at market** only on a **confirmed breakout** (BB/RSI/MACD/OBV/OI/Volume/Funding).
+- **Short entries** must be **above current price** (sell-the-rally resistance), or **at market** only on a **confirmed breakdown** (BB/RSI/MACD/OBV/OI/Volume/Funding).
 - Every entry must tie to **current price context** (nearby S/R or breakout) → fetch those levels explicitly.
 
 ---
@@ -86,8 +88,7 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 - SL will use **HTF invalidation + ATR buffer**:
   1) Nearest **HTF** invalidation (swing low for Long / swing high for Short).
   2) Add **0.5–1.0 × ATR (4h or 1d)** buffer.
-  - Conservative ≈ **1 ATR**, Moderate ≈ **0.7 ATR**, Aggressive ≈ **0.5 ATR**.
-- Ensure you have ATR values for later calculations and that SL width can be checked **≥ 0.7 × ATR**.
+- Ensure ATR values are fetched and SL width checked **≥ 0.7 × ATR**.
 
 ---
 
@@ -100,8 +101,7 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
   - **<50%** → cap **≤5%**.
 - **Stop-Loss width vs. Volatility:** SL distance must be **≥ 0.7 × ATR (4h or 1d)**.
 - **Reward-to-Risk requirement:** at least one TP must have **R/R ≥ 1.5**; if unmet, setup is invalid.
-- **OBV** influence: divergence reduces effective win probability by 5–10%.
-
+- **OBV + OI + Funding Rate** influence: divergences reduce effective win probability by 5–15%.
 ---
 
 ## RRSR Requirements (data acquisition)
@@ -128,26 +128,29 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 
 ---
 
-## Required Data & Tool Call Mapping (no examples)
+## Required Data & Tool Call Mapping
 - **Current price & ticker**
   - `crypto_tools_get_current_price(symbol)`
   - `crypto_tools_get_ticker(symbol)`
 - **OHLCV (per TF)**
-  - `crypto_tools_get_candles(symbol, timeframe, limit)` for: 15m / 1h / 4h / 1d (short-term); add 1w (long-term)
+  - `crypto_tools_get_candles(symbol, timeframe, limit)`
 - **Indicators**
-  - MA20/MA50: `crypto_tools_calculate_sma(symbol, timeframe, period=20|50, history_len>=60)`
-  - Bollinger Bands: `crypto_tools_calculate_bbands(symbol, timeframe, period=20, nbdevup=2.0, nbdevdn=2.0, history_len>=60)`
-  - RSI: `crypto_tools_calculate_rsi(symbol, timeframe, period=14, history_len>=60)`
-  - MACD: `crypto_tools_calculate_macd(symbol, timeframe, fast_period=12, slow_period=26, signal_period=9, history_len>=60)`
-  - ADX: `crypto_tools_calculate_adx(symbol, timeframe, period=14, history_len>=60)`
-  - ATR: `crypto_tools_calculate_atr(symbol, timeframe, period=14, history_len>=60)`
-  - OBV: `crypto_tools_calculate_obv(symbol, timeframe)`
+  - `crypto_tools_calculate_sma(symbol, timeframe, period=20|50, history_len>=60)`
+  - `crypto_tools_calculate_bbands(symbol, timeframe, period=20, nbdevup=2.0, nbdevdn=2.0, history_len>=60)`
+  - `crypto_tools_calculate_rsi(symbol, timeframe, period=14, history_len>=60)`
+  - `crypto_tools_calculate_macd(symbol, timeframe, fast_period=12, slow_period=26, signal_period=9, history_len>=60)`
+  - `crypto_tools_calculate_adx(symbol, timeframe, period=14, history_len>=60)`
+  - `crypto_tools_calculate_atr(symbol, timeframe, period=14, history_len>=60)`
+  - `crypto_tools_calculate_obv(symbol, timeframe)`
+- **Funding Rate**
+  - `crypto_tools_get_funding_rate(symbol, include_history=true, limit=50)`
+- **Open Interest**
+  - `crypto_tools_get_open_interest(symbol, timeframe="1h", limit=100)`
 - **Optional microstructure**
   - `crypto_tools_get_order_book(symbol, limit=20)`
   - `crypto_tools_get_recent_trades(symbol, limit=100)`
 - **Data status contract**
   - Always return a JSON object with keys: `symbol`, `horizon`, `calls[]`, and `data_status { fatal, missing[], analogs_status }`.
-  - Mark `fatal=true` if ATR(4h or 1d) cannot be planned/fetched, or core OHLCV is missing.
 
 """
 
