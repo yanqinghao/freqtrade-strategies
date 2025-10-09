@@ -40,12 +40,51 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 
 ## Tool Usage Rules (apply now)
 - Fetch: latest **OHLC** and **indicators** for required TFs (**15m/1h/4h/1d/1w**) per chosen horizon.
-- Required indicators to fetch: **MA20, MA50, Bollinger Bands (basis/upper/lower), RSI, MACD, ADX, ATR, OBV**.
+- Required indicators to fetch: **MA20, MA50, MA200, Bollinger Bands (basis/upper/lower), RSI, MACD, ADX, ATR, OBV**.
 - Also fetch **current price/ticker**; optionally **order book** and **recent trades** for breakout/volatility context.
 - For **Stop-Loss** sizing later, ensure you fetch an **ATR** (4h or 1d).
 - Fetch **Funding Rate** (current + history) for perp market bias and potential squeeze risk.
 - Fetch **Open Interest** (latest + series) for market positioning confirmation.
 - For **RRSR** later, attempt to fetch **historical analogs/backtests** (same horizon, side, HTF bias, indicator regime, entry archetype). If unavailable, note that **heuristic estimation** will be required.
+
+---
+
+## Budget & Relevance Rules (hard limits)
+
+- Horizon gating (STRICT):
+  - Short-term: allowed TFs = {15m, 1h, 4h, 1d}. ❌ Do NOT fetch 1w.
+  - Long-term:  allowed TFs = {1h, 4h, 1d, 1w}. ❌ Do NOT fetch 15m.
+
+- Tool-call budget (STRICT):
+  - MAX_TOOL_CALLS = 24 for the entire plan. If the plan would exceed this, drop the **lowest-priority** calls first per the priority list below.
+
+- Priority order (highest → lowest):
+  1) current price/ticker
+  2) OHLCV for **HTF bias TFs** (Short: 4h,1d | Long: 1d,1w)
+  3) ATR for SL sizing on an **HTF** (Short: 4h or 1d | Long: 1d or 1w)
+  4) S/R context indicators:
+     - MA20/50/200 on **bias TFs**
+     - BB/RSI/MACD/ADX on **bias TFs**
+     - OBV on **highest bias TF** (Short: 1d | Long: 1w)
+  5) Entry-timing TF indicators:
+     - Short-term: RSI/MACD/BB on {15m,1h} (⚠ treat as noisy)
+     - Long-term:  RSI/MACD/BB on {1h,4h}
+  6) Microstructure (order book, recent trades) — optional
+  7) Analogs/backtests — optional
+
+- Indicator scope (no overfetch):
+  - ATR: **HTF only** (Short: 4h/1d; Long: 1d/1w)
+  - MA200: **bias TFs only**
+  - OBV: **one HTF only** (Short: 1d; Long: 1w)
+  - Funding Rate & Open Interest: **one TF each** (OI TF = 1h), include short history.
+
+- Dedup & pruning:
+  - Do not duplicate the same indicator on multiple TFs unless listed above.
+  - If budget exceeded, remove entry-timing indicators first, then optional microstructure, then analogs.
+
+- Output contract:
+  - Return a JSON status with `calls_count` and assert `calls_count <= MAX_TOOL_CALLS`.
+  - If any item was pruned due to budget/horizon gating, list them in `data_status.pruned[]`.
 
 ---
 
@@ -62,7 +101,7 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 
 3. **Levels to fetch (no arbitrary %)**
    - **S/R** from swing highs/lows and session levels.
-   - **MA20/MA50** as dynamic S/R; **BB** (basis/upper/lower) for channel edges.
+   - **MA20/MA50/MA200** as dynamic S/R; **BB** (basis/upper/lower) for channel edges.
    - Confirmation: **RSI** (OB/OS, divergence), **MACD** (cross/impulse), **ADX** (trend strength; range if <~20–22), **ATR** (volatility), **OBV** (volume flow confirmation).
    - **Funding Rate spikes** + **Open Interest jumps/drops** = potential squeeze/reversal zones.
 ---
@@ -123,7 +162,7 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 
 ## What to output **in this phase**
 - Emit **only tool calls** with precise parameters to fetch:
-  - price/ticker; OHLC for **15m/1h/4h/1d/(1w for long-term)**; indicators (**MA20/50, BB, RSI, MACD, ADX, ATR, OBV**); optional **order book/trades**; optional **analogs/backtests**.
+  - price/ticker; OHLC for **15m/1h/4h/1d/(1w for long-term)**; indicators (**MA20/50/200, BB, RSI, MACD, ADX, ATR, OBV**); optional **order book/trades**; optional **analogs/backtests**.
 - If all necessary data is already present, output exactly: `READY`.
 
 ---
@@ -135,7 +174,7 @@ This phase is **tools-only**. Your job here is to output a **complete tool-call 
 - **OHLCV (per TF)**
   - `crypto_tools_get_candles(symbol, timeframe, limit)`
 - **Indicators**
-  - `crypto_tools_calculate_sma(symbol, timeframe, period=20|50, history_len>=60)`
+  - `crypto_tools_calculate_sma(symbol, timeframe, period=20|50|200, history_len>=60)`
   - `crypto_tools_calculate_bbands(symbol, timeframe, period=20, nbdevup=2.0, nbdevdn=2.0, history_len>=60)`
   - `crypto_tools_calculate_rsi(symbol, timeframe, period=14, history_len>=60)`
   - `crypto_tools_calculate_macd(symbol, timeframe, fast_period=12, slow_period=26, signal_period=9, history_len>=60)`
@@ -664,11 +703,9 @@ For any selected side (Long **or** Short), produce **four entry options**, each 
   Fastest; **near current price / shallow pullback** (e.g., 15m/1h BB midline or minor swing).
   Tighter SL; higher risk of drawdown.
 
-- **Reversal (Rating: High-Risk)**
-  Only when **≥2 reversal signals confirmed** (RSI/MACD divergence, engulfing candles, volume spike).
-  Entry may use **Market** near current price.
-  Stop-loss at reversal candle extreme ± ATR buffer.
-  Must explicitly label as **⚠️ Reversal Trade**.
+- **Opposite-Side Hedge Recommendation**
+  When the primary directional bias (e.g., Long) has been fully analyzed and its main strategies are produced,
+  the model must automatically generate one additional opposite-side hedge plan — designed as a defensive counter-trade, not a co-equal setup.
 
 **Leverage guidance (conservative):**
 - **Short-term:** 2x–3x
@@ -797,28 +834,29 @@ Same structure as Strong: Entry / TP1-3 / SL / Risk / Expected Fill / Duration /
 <b>🔴 Aggressive — Rating: Cautious</b>\n
 Same structure as Strong: Entry / TP1-3 / SL / Risk / Expected Fill / Duration / Patience Exit / Command / Metrics\n
 \n
-<b>⚠️ Reversal — Rating: High-Risk</b>\n
-<b>Entry</b>: <code>{{current_price}}</code> — {{Reason example: RSI/MACD divergence + engulfing candle + volume spike}}\n
-<b>TP1/TP2/TP3</b>: <code>{{…}}</code> / <code>{{…}}</code> / <code>{{…}}</code> — {{targets based on opposite trend levels}}\n
-<b>SL</b>: <code>{{extreme_candle ± ATR}}</code> — {{invalidation level}}\n
-<b>Risk</b>: <code>{{x%}} (~{{5-10}} USDT / 100)</code>\n
-<b>Expected Fill</b>: Immediate (Market order) or Price near current\n
-<b>Trade Duration</b>: ~{{x–xd}}\n
-<b>Patience Exit</b>: ~{{xh}} no progress\n
-<b>Command</b>:\n
-<pre><code>/force{{long|short}} {{SYMBOL}} {{stake:100}} {{leverage:int}} {{tp1}} {{tp2}} {{tp3}} {{sl}} #reversal</code></pre>\n
-<b>📊 Metrics</b>\n
-TP1R / TP2R / TP3R: <code>{{…}} / {{…}} / {{…}}</code>\n
-E[R|win] (50/30/20): <code>{{…R}}</code>\n
-Win Prob (n, confidence): <code>{{…}}</code>\n
-EV (R): <code>{{…R}}</code>\n
+<b>🔁 Opposite Hedge — Rating: Strong</b>
+<b>Entry</b>: <code>{{x}}</code> — Key {{resistance/support}} zone opposite to main bias
+<b>TP1/TP2</b>: <code>{{x}} / {{x}}</code> — Near-term {{support/resistance}} targets
+<b>SL</b>: <code>{{x}}</code> — Invalid if breakout confirmed (main bias confirmation level)
+<b>Risk</b>: <code>{{3.5%}} (~3.5 USDT / 100)</code>
+<b>Expected Fill</b>: ~{{few hours}}
+<b>Trade Duration</b>: Defensive short-term hedge (~1–2 days)
+<b>Patience Exit</b>: ~{{12 h}} no profit → consider exit
+<b>Command</b>:
+
+<pre><code>/force{{long|short}} {{SYMBOL}} 100 2 {{tp1}} {{tp2}} {{sl}} {{entry_price_if_limit}} #hedge</code></pre>
+
+<b>📊 Metrics</b>
+TP1R / TP2R: <code>{{…}} / {{…}}</code>
+Win Prob: <code>Heuristic, Low confidence</code>
+EV (R): <code>{{…R}}</code>
 ——————————————\n
 \n
 <b>Notes</b>\n
 1) SL distance ≥ 0.7×ATR(4h/1d), with at least one TP having R/R ≥ 1.5\n
 2) Recompute entry/targets if price moves significantly before execution\n
 3) If essential data is missing → skip trade, do not force entry\n
-4) Reversal trades must conform the signal criteria\n
+4) Always produce one Opposite-Side Hedge plan after the main directional setups.\n
 
 ---
 
@@ -1494,7 +1532,6 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
                     'since': {'type': 'integer', 'description': '历史起始时间戳（毫秒）。可选。'},
                 },
                 'required': ['symbol'],
-                'additionalProperties': False,
             },
         },
     },
@@ -1522,7 +1559,6 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
                     'since': {'type': 'integer', 'description': '序列起始时间戳（毫秒）。可选。'},
                 },
                 'required': ['symbol'],
-                'additionalProperties': False,
             },
         },
     },
@@ -1591,5 +1627,5 @@ async def run_two_phase(user_prompt: str, prompt_type: int = 0) -> str:
 
 
 if __name__ == '__main__':
-    prompt = 'ondo/USDT 短线策略。'
-    print(asyncio.run(run_two_phase(prompt)))
+    prompt = 'SOL/USDT 长期策略。'
+    print(asyncio.run(run_two_phase(prompt, prompt_type=3)))
