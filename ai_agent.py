@@ -836,7 +836,7 @@ Same structure as Strong: Entry / TP1-3 / SL / Risk / Expected Fill / Duration /
 \n
 <b>🔁 Opposite Hedge — Rating: Strong</b>
 <b>Entry</b>: <code>{{x}}</code> — Key {{resistance/support}} zone opposite to main bias
-<b>TP1/TP2</b>: <code>{{x}} / {{x}}</code> — Near-term {{support/resistance}} targets
+<b>TP1/TP2/TP3</b>: <code>{{x}} / {{x}} / {{x}}</code> — Near-term {{support/resistance}} targets
 <b>SL</b>: <code>{{x}}</code> — Invalid if breakout confirmed (main bias confirmation level)
 <b>Risk</b>: <code>{{3.5%}} (~3.5 USDT / 100)</code>
 <b>Expected Fill</b>: ~{{few hours}}
@@ -844,10 +844,10 @@ Same structure as Strong: Entry / TP1-3 / SL / Risk / Expected Fill / Duration /
 <b>Patience Exit</b>: ~{{12 h}} no profit → consider exit
 <b>Command</b>:
 
-<pre><code>/force{{long|short}} {{SYMBOL}} 100 2 {{tp1}} {{tp2}} {{sl}} {{entry_price_if_limit}} #hedge</code></pre>
+<pre><code>/force{{long|short}} {{SYMBOL}} {{stake:100}} {{leverage:int}} {{tp1}} {{tp2}} {{tp3}} {{sl}} {{entry_price_if_limit}}</code></pre>
 
 <b>📊 Metrics</b>
-TP1R / TP2R: <code>{{…}} / {{…}}</code>
+TP1R / TP2R / TP3R: <code>{{…}} / {{…}} / {{…}}</code>
 Win Prob: <code>Heuristic, Low confidence</code>
 EV (R): <code>{{…R}}</code>
 ——————————————\n

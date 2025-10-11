@@ -144,6 +144,12 @@ class KamaFama_Dynamic(IStrategy):
         # 尝试从外部JSON文件加载策略模式配置
         self.load_strategy_mode_config()
 
+        # --- 新增：价格监控节流配置与状态 ---
+        # 通过环境变量覆盖，单位：分钟；例如导出 MONITOR_CHECK_MINUTES=60 表示每小时检查一次
+        self.monitor_check_minutes = int(os.environ.get('MONITOR_CHECK_MINUTES', '60'))
+        # interval<=0 表示不节流（每根5m都检查）
+        self._last_monitor_check = {}  # {pair: datetime or pandas.Timestamp}
+
         # 存储上次检查止损的时间
         self.last_stoploss_check_time = datetime.now()
 
@@ -598,6 +604,35 @@ class KamaFama_Dynamic(IStrategy):
             logger.error(f"获取历史数据时出错: {str(e)}")
             return None
 
+    def _should_run_monitoring(self, pair: str, now_ts) -> bool:
+        """
+        只有当距离上次检查 >= monitor_check_minutes 才返回 True。
+        now_ts: 回测用 dataframe 的最后一根蜡烛时间（pd.Timestamp），
+                实盘/模拟用 datetime.now()。
+        """
+        try:
+            interval_min = getattr(self, 'monitor_check_minutes', 30)
+            if interval_min <= 0:
+                return True  # 关闭节流
+
+            last = self._last_monitor_check.get(pair)
+            if last is None:
+                self._last_monitor_check[pair] = now_ts
+                return True
+
+            # 统一成 pandas.Timestamp 来做差，兼容 datetime / Timestamp
+            now_ts_pd = pd.Timestamp(now_ts)
+            last_ts_pd = pd.Timestamp(last)
+            if now_ts_pd - last_ts_pd >= pd.Timedelta(minutes=interval_min):
+                self._last_monitor_check[pair] = now_ts
+                return True
+
+            return False
+        except Exception:
+            # 出错时不要卡住主流程，保守返回 True
+            self._last_monitor_check[pair] = now_ts
+            return True
+
     def calculate_coin_points(self, pair: str, direction: str):
         # 获取1小时K线数据用于支撑/阻力位识别
         df_1h = self.get_ohlcv_history(pair, timeframe='1h', limit=150)
@@ -957,7 +992,15 @@ class KamaFama_Dynamic(IStrategy):
         dataframe['r_14'] = williams_r(dataframe, period=14)
 
         # New price monitoring logic
-        self.check_price_monitoring(dataframe, pair)
+        # New price monitoring logic（增加节流）
+        if self.config.get('runmode', None) in ('live', 'dry_run'):
+            now_ts = datetime.now()
+        else:
+            # 回测用当前蜡烛时间，确保回测可重复
+            now_ts = dataframe.iloc[-1]['date'] if len(dataframe) else None
+
+        if now_ts is not None and self._should_run_monitoring(pair, now_ts):
+            self.check_price_monitoring(dataframe, pair)
 
         return dataframe
 
