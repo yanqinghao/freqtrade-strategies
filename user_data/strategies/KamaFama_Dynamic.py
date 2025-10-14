@@ -377,6 +377,81 @@ class KamaFama_Dynamic(IStrategy):
 
     #     return config
 
+    def _managed_open_count(self) -> int:
+        """只统计由策略托管的 open trades（不含手动/固定点位/外部导入）"""
+        manual_prefixes = 'manual_'
+        count = 0
+        for t in Trade.get_trades_proxy(is_open=True):
+            tag = (t.enter_tag or '').lower()
+            if not tag.startswith(manual_prefixes):
+                count += 1
+        return count
+
+    def _normalize_pair(self, p: str) -> str:
+        # 兼容 futures 形态：BTC/USDT:USDT -> BTC/USDT
+        return p.split(':')[0].upper()
+
+    def _has_exchange_position_for_pair(self, pair: str) -> bool:
+        """
+        仅在 futures 模式有意义；现货返回 False。
+        """
+        try:
+            # Freqtrade Exchange 层：从交易所取仓位（期货）
+            positions = self.exchange.fetch_positions(pair=self._normalize_pair(pair)) or []
+        except Exception as e:
+            logger.warning(f"[confirm_trade_entry] fetch_positions error: {e}")
+            return False
+
+        # 解析 size/positionAmt/contracts 等常见字段，>0 视为有仓
+        for pos in positions:
+            size = None
+            # 直接字段
+            for k in ('contracts', 'positionAmt', 'size', 'qty'):
+                if k in pos and pos[k] is not None:
+                    try:
+                        size = float(pos[k])
+                        break
+                    except Exception:
+                        pass
+            # 有些交易所只在 info 里
+            if size is None:
+                info = pos.get('info') or {}
+                for k in ('positionAmt', 'size', 'qty'):
+                    if k in info and info[k] is not None:
+                        try:
+                            size = float(info[k])
+                            break
+                        except Exception:
+                            pass
+            if size is not None and abs(size) > 0:
+                return True
+        return False
+
+    def _has_managed_open_trade_for_pair(self, pair: str) -> bool:
+        manual_prefix = 'manual_'
+        for t in Trade.get_trades_proxy(pair=pair, is_open=True):
+            tag = (t.enter_tag or '').lower()
+            if not tag.startswith(manual_prefix):
+                return True
+        return False
+
+    def confirm_trade_entry(
+        self, pair, order_type, amount, rate, time_in_force, current_time, **kwargs
+    ) -> bool:
+        # 1) 平台有仓但本地无“托管单” => 跳过开仓
+        if self._has_exchange_position_for_pair(pair) and not self._has_managed_open_trade_for_pair(
+            pair
+        ):
+            logger.warning(f"[confirm_trade_entry] Skip {pair}: exchange has unmanaged position.")
+            return False
+
+        # 2) 名额上限
+        max_open = int(self.config.get('max_open_trades', 0) or 0)
+        if max_open > 0 and self._managed_open_count() >= max_open:
+            return False
+
+        return True
+
     def find_support_resistance_levels(self, dataframe, n_levels=3):
         """
         识别主要支撑位和阻力位
@@ -1584,7 +1659,7 @@ class KamaFama_Dynamic(IStrategy):
                     direction = 'short' if trade.is_short else 'long'
                     current_time = datetime.now(trade.open_date_utc.tzinfo)
                     # 如果刚开仓成功（5分钟内的交易），关闭自动计算
-                    if (current_time - trade.open_date_utc).total_seconds() < 300:  # 5分钟内
+                    if (current_time - trade.open_date_utc).total_seconds() < 60 * 60:  # 5分钟内
                         self.disable_auto_calculation(pair, direction)
 
             # 根据最后一行数据的收盘价进行检查
@@ -1981,7 +2056,9 @@ class KamaFama_Dynamic(IStrategy):
         direction = 'short' if trade.is_short else 'long'
 
         # 初次遇到交易时，保存初始stake金额
-        if trade.get_custom_data('initial_stake') is None:
+        if trade.get_custom_data(
+            'initial_stake'
+        ) is None or trade.stake_amount != trade.get_custom_data('initial_stake'):
             trade.set_custom_data('initial_stake', trade.stake_amount)
 
         if trade.enter_tag and 'manual' in trade.enter_tag:
@@ -2149,9 +2226,9 @@ class KamaFama_Dynamic(IStrategy):
             # 如果没有last_dca_time，使用开仓时间作为参考时间
             if last_dca_time is None:
                 last_dca_time = self._datetime_to_timestamp(trade.open_date_utc)
-                logger.info(
-                    f"{pair}: 首次检查补仓冷却期，使用开仓时间: {trade.open_date_utc} (时间戳: {last_dca_time})"
-                )
+                # logger.info(
+                #     f"{pair}: 首次检查补仓冷却期，使用开仓时间: {trade.open_date_utc} (时间戳: {last_dca_time})"
+                # )
 
             if last_dca_time is not None:
                 cooldown_minutes = 60 * 24 * 7  # 30分钟冷却期 (可根据交易对波动性调整)

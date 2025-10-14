@@ -288,7 +288,7 @@ class Telegram(RPCHandler):
             ['/status', '/status table', '/performance'],
             ['/count', '/start', '/stop', '/help'],
             ['/chart', '/analysis', '/ai', '/prompt', '/promptjson', '/manual', '/monitor'],
-            ['/addpair', '/delpair'],
+            ['/addpair', '/delpair', '/setmanual'],
             ['/setpairstrategy', '/delpairstrategy', '/showpairstrategy', '/setpairstrategyauto'],
         ]
         # do not allow commands with mandatory arguments and critical cmds
@@ -352,6 +352,10 @@ class Telegram(RPCHandler):
             r'/setpairstrategyauto$',
             r'/delpairstrategy$',
             r'/showpairstrategy$',
+            r'/setmanual$',
+            r'/restoremanual$',
+            r'/coo$',
+            r'/fx$',
         ]
         # Create keys for generation
         valid_keys_print = [k.replace('$', '') for k in valid_keys]
@@ -453,6 +457,8 @@ class Telegram(RPCHandler):
             CommandHandler('manual', self._manual_open),
             CommandHandler('monitor', self._monitor_list),
             CommandHandler('monitoring', self._monitor_list),
+            CommandHandler('setmanual', self._set_manual),
+            CommandHandler('restoremanual', self._restore_manual),
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern='update_status_table'),
@@ -494,6 +500,79 @@ class Telegram(RPCHandler):
             [[x for x in sorted(h.commands)] for h in handles],
         )
         self._loop.run_until_complete(self._startup_telegram())
+
+    def _get_open_trade_by_pair_or_id(self, ident: str):
+        """
+        ident 可以是 'BTC/USDT' 这样的 pair，也可以是整数 trade_id。
+        返回: Trade 或 None
+        """
+        from freqtrade.persistence import Trade
+        q = Trade.query.filter(Trade.is_open.is_(True))
+        if '/' in ident.upper():
+            return q.filter(Trade.pair == ident.upper()).first()
+        else:
+            try:
+                tid = int(ident)
+                return q.filter(Trade.id == tid).first()
+            except ValueError:
+                return None
+
+    def _clear_manual_open_for_pair(self, pair: str):
+        """
+        从 strategy_state_production.json 删除 manual_open[pair]，并同步内存 strategy.manual_open
+        """
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r') as f:
+                strategy_state = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            strategy_state = {}
+
+        manual_open = strategy_state.get('manual_open', {})
+        changed = False
+        if pair in manual_open:
+            manual_open.pop(pair, None)
+            strategy_state['manual_open'] = manual_open
+            with open(state_file, 'w') as f:
+                json.dump(strategy_state, f, indent=4)
+            changed = True
+
+        # 同步到内存
+        if hasattr(self._rpc._freqtrade, 'strategy'):
+            self._rpc._freqtrade.strategy.manual_open = manual_open
+
+        return changed
+
+    def _find_monitor_first_entry(self, pair: str, side_str: str):
+        """
+        在内存中的 coin_monitoring[pair]（array）里，找到第一个 direction 匹配 side_str 的配置，
+        返回 config['entry_points'][0]；找不到返回 None
+        """
+        strat = getattr(self._rpc._freqtrade, 'strategy', None)
+        if not strat:
+            return None
+        cm = getattr(strat, 'coin_monitoring', {}) or {}
+        arr = cm.get(pair, [])
+        for conf in arr:
+            if (str(conf.get('direction', '')).lower() == side_str.lower()):
+                eps = conf.get('entry_points') or []
+                if eps:
+                    return eps[0]
+        return None
+
+    def _fmt_price_str(self, val) -> str:
+        """
+        将价格安全地转成字符串，避免 2.7101834999999994 这种长尾。
+        规则：尽量保留到 8 位小数，去掉尾部多余 0 和小数点。
+        """
+        try:
+            from decimal import Decimal, ROUND_DOWN, InvalidOperation
+            d = Decimal(str(val)).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+            s = format(d, 'f').rstrip('0').rstrip('.')
+            return s if s else '0'
+        except Exception:
+            # 兜底
+            return str(val)
 
     async def _startup_telegram(self) -> None:
         await self._app.initialize()
@@ -2345,6 +2424,140 @@ class Telegram(RPCHandler):
         buttons_aligned.append([InlineKeyboardButton(text='Cancel', callback_data='force_enter__cancel')])
 
         await self._send_msg(msg='Which pair?', keyboard=buttons_aligned, query=update.callback_query)
+
+    @authorized_only
+    async def _set_manual(self, update: Update, context: CallbackContext):
+        """
+        /setmanual <pair|trade_id> <long|short> <tp1> <tp2> <tp3> <sl> [entry_price]
+        作用：
+        1) 修改已开仓 Trade.enter_tag = manual_{long|short}
+        2) 将点位写入 strategy_state_production.json 并同步到内存
+        """
+        args = context.args or []
+        if not args:
+            await self._send_msg('用法：/setmanual <pair|trade_id> <long|short> <tp1> <tp2> <tp3> <sl> [entry_price]')
+            return
+
+        ident = args[0]
+        trade = self._get_open_trade_by_pair_or_id(ident)
+        if not trade:
+            await self._send_msg(f"未找到未平仓的订单：{ident}")
+            return
+
+        # A) 参数齐全：直接执行
+        if len(args) >= 6:
+            try:
+                side = args[1].lower()
+                if side not in ('long', 'short'):
+                    raise ValueError('第二个参数必须是 long 或 short')
+
+                tp1 = float(args[2]); tp2 = float(args[3]); tp3 = float(args[4])
+                sl  = float(args[5])
+                price = float(args[6]) if len(args) > 6 else None
+
+                # 从 trade 中取 size / leverage
+                # size 用 stake_amount（更贴近你手动下单的币本位/美金位资金规模）
+                size = float(getattr(trade, 'stake_amount', 0) or 0)
+                # Freqtrade 期货通常带 leverage 字段；若无则默认 1
+                leverage = float(getattr(trade, 'leverage', 1) or 1)
+
+                # 1) 修改 enter_tag 并保存
+                trade.enter_tag = f"manual_{side}"
+                trade.update()
+
+                # 2) 写入/更新配置（同时会更新内存 strategy.manual_open）
+                from freqtrade.enums import SignalDirection
+                order_side = SignalDirection.LONG if side == 'long' else SignalDirection.SHORT
+
+                await self._update_manual_trade_config(
+                    pair=trade.pair,
+                    size=size,
+                    leverage=leverage,
+                    tps=[tp1, tp2, tp3],
+                    sl=sl,
+                    order_side=order_side,
+                    entry_price=price if price is not None else float(getattr(trade, 'open_rate', 0) or 0)
+                )
+
+                await self._send_msg(f"已将 {trade.pair} 标记为 manual_{side}，并写入 TP/SL/入场价。")
+                return
+
+            except Exception as e:
+                logger.exception('Error in /setmanual')
+                await self._send_msg(f"参数或写入错误：{e}")
+                return
+
+        # B) 只给了 ident：进入引导输入
+        key = (update.effective_chat.id, update.effective_user.id)
+        self._pending_force[key] = {'pair': trade.pair, 'side': 'manual_set', 'ts': time.time()}
+        tip = ('请按格式回复以下参数：\n'
+            '<long|short> <tp1> <tp2> <tp3> <sl> [entry_price]\n'
+            '示例：long 71000 72000 73500 69500 70550')
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=tip, reply_markup=ForceReply(selective=True))
+
+    @authorized_only
+    async def _restore_manual(self, update: Update, context: CallbackContext):
+        """
+        /restoremanual <pair|trade_id> <auto|monitor>
+        1) auto:  enter_tag -> buy / short  (依据 trade.is_short)
+        2) monitor: enter_tag -> fixed_{long|short}_entry_{<entry_points[0]>}
+        其中 entry_points[0] 来自内存 strategy.coin_monitoring[pair] 中
+        “第一个 direction 匹配的配置”的第一个入场点
+        同时会清除 strategy_state_production.json 的 manual_open[pair]，并同步内存。
+        """
+        args = context.args or []
+        if len(args) != 2:
+            await self._send_msg('用法：/restoremanual <pair|trade_id> <auto|monitor>')
+            return
+
+        ident, mode = args[0], args[1].lower()
+        if mode not in ('auto', 'monitor'):
+            await self._send_msg('第二个参数必须是 auto 或 monitor')
+            return
+
+        trade = self._get_open_trade_by_pair_or_id(ident)
+        if not trade:
+            await self._send_msg(f"未找到未平仓的订单：{ident}")
+            return
+
+        try:
+            is_short = bool(getattr(trade, 'is_short', False))
+            side = 'short' if is_short else 'long'
+
+            if mode == 'auto':
+                # 恢复成自动量化买卖
+                new_tag = 'short' if is_short else 'buy'
+                trade.enter_tag = new_tag
+                trade.update()
+                cleared = self._clear_manual_open_for_pair(trade.pair)
+                msg = f"已将 {trade.pair} 恢复为自动量化（enter_tag='{new_tag}'）。"
+                if cleared:
+                    msg += ' 已清除手动托管配置。'
+                await self._send_msg(msg)
+                return
+
+            # mode == 'monitor'
+            # 恢复成自动点位监控：fixed_{long|short}_entry_{price}
+            first_entry = self._find_monitor_first_entry(trade.pair, side)
+            if first_entry is None:
+                await self._send_msg(f"未在内存 coin_monitoring 中找到 {trade.pair} 方向 {side} 的 entry_points。")
+                return
+
+            price_str = self._fmt_price_str(first_entry)
+            new_tag = f"fixed_{side}_entry_{price_str}"
+            trade.enter_tag = new_tag
+            trade.update()
+            cleared = self._clear_manual_open_for_pair(trade.pair)
+
+            msg = f"已将 {trade.pair} 恢复为自动点位监控（enter_tag='{new_tag}'）。"
+            if cleared:
+                msg += ' 已清除手动托管配置。'
+            await self._send_msg(msg)
+
+        except Exception as e:
+            logger.exception('Error in /restoremanual')
+            await self._send_msg(f"恢复失败：{e}")
+
 
     @authorized_only
     async def _trades(self, update: Update, context: CallbackContext) -> None:
