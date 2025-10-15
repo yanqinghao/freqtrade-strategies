@@ -396,8 +396,32 @@ class KamaFama_Dynamic(IStrategy):
         仅在 futures 模式有意义；现货返回 False。
         """
         try:
+            # 获取交易所名称
+            exchange_name = self.config['exchange']['name'].lower()
+
+            # 创建交易所实例
+            exchange_class = getattr(ccxt, exchange_name)
+
+            # 获取API凭证
+            api_config = {
+                'apiKey': self.config['original_config']['exchange'].get('key', ''),
+                'secret': self.config['original_config']['exchange'].get('secret', ''),
+                'enableRateLimit': True,
+                'options': {
+                    # 对 Binance：
+                    # 'spot' | 'margin' | 'future' | 'delivery' | 'option'
+                    'defaultType': 'future',  # USDT-M 永续/期货
+                    'defaultMarket': 'future',
+                },
+            }
+
+            # 过滤空值
+            api_config = {k: v for k, v in api_config.items() if v}
+
+            # 实例化交易所
+            exchange = exchange_class(api_config)
             # Freqtrade Exchange 层：从交易所取仓位（期货）
-            positions = self.exchange.fetch_positions(pair=self._normalize_pair(pair)) or []
+            positions = exchange.fetch_positions([pair]) or []
         except Exception as e:
             logger.warning(f"[confirm_trade_entry] fetch_positions error: {e}")
             return False
@@ -442,6 +466,10 @@ class KamaFama_Dynamic(IStrategy):
         if self._has_exchange_position_for_pair(pair) and not self._has_managed_open_trade_for_pair(
             pair
         ):
+            if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                self.dp.send_msg(
+                    f"[confirm_trade_entry] Skip {pair}: exchange has unmanaged position."
+                )
             logger.warning(f"[confirm_trade_entry] Skip {pair}: exchange has unmanaged position.")
             return False
 
