@@ -140,6 +140,7 @@ class KamaFama_Dynamic(IStrategy):
         """
         super().__init__(config)
         self.should_not_init = os.environ.get('SHOULD_NOT_INIT') == 'true'
+        os.environ['SHOULD_NOT_INIT'] = 'true'
 
         # 尝试从外部JSON文件加载策略模式配置
         self.load_strategy_mode_config()
@@ -459,9 +460,18 @@ class KamaFama_Dynamic(IStrategy):
                 return True
         return False
 
+    def _not_managed_open_count(self) -> int:
+        open_trades = Trade.get_trades_proxy(is_open=True)
+        keep_pairs = {
+            t.pair for t in open_trades if 'manual' not in (getattr(t, 'enter_tag', '') or '')
+        }
+        return len(keep_pairs)
+
     def confirm_trade_entry(
-        self, pair, order_type, amount, rate, time_in_force, current_time, **kwargs
+        self, pair, order_type, amount, rate, time_in_force, current_time, entry_tag, **kwargs
     ) -> bool:
+        if self._not_managed_open_count() >= 2 and 'manual' not in entry_tag:
+            return False
         # 1) 平台有仓但本地无“托管单” => 跳过开仓
         if self._has_exchange_position_for_pair(pair) and not self._has_managed_open_trade_for_pair(
             pair
@@ -473,8 +483,12 @@ class KamaFama_Dynamic(IStrategy):
             logger.warning(f"[confirm_trade_entry] Skip {pair}: exchange has unmanaged position.")
             return False
 
+        if 'manual_' in entry_tag:
+            logger.warning(f"[confirm_trade_entry] 强制下单触发: {pair}")
+            return True
+
         # 2) 名额上限
-        max_open = int(self.config.get('max_open_trades', 0) or 0)
+        max_open = 2
         if max_open > 0 and self._managed_open_count() >= max_open:
             return False
 
