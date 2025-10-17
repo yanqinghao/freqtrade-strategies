@@ -462,9 +462,7 @@ class KamaFama_Dynamic(IStrategy):
 
     def _not_managed_open_count(self) -> int:
         open_trades = Trade.get_trades_proxy(is_open=True)
-        keep_pairs = {
-            t.pair for t in open_trades if 'fixed' in (getattr(t, 'enter_tag', '') or '')
-        }
+        keep_pairs = {t.pair for t in open_trades if 'fixed' in (getattr(t, 'enter_tag', '') or '')}
         return len(keep_pairs)
 
     def _buy_short_open_count(self) -> int:
@@ -482,7 +480,7 @@ class KamaFama_Dynamic(IStrategy):
     ) -> bool:
         if self._buy_short_open_count() == 0 and ('buy' in entry_tag or 'short' in entry_tag):
             return True
-        
+
         if self._not_managed_open_count() >= 2 and 'fixed_' in entry_tag:
             if 'fixed_long_entry_' in entry_tag or 'fixed_short_entry_' in entry_tag:
                 for i in self.coin_monitoring[pair]:
@@ -491,7 +489,7 @@ class KamaFama_Dynamic(IStrategy):
                     self.reload_coin_monitoring(pair)
                     self.update_strategy_state_file()
             return False
-        
+
         if self._has_exchange_position_for_pair(pair) and not self._has_managed_open_trade_for_pair(
             pair
         ):
