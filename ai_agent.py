@@ -898,6 +898,30 @@ If a required call fails, proceed with what you have and log it in **Appendix (D
 7) **Risks & Calendar (if available)** — Liquidity windows, derivatives context (funding/OI), macro/event dates.
 8) **Bottom Line** — One concise synthesis paragraph with probabilities language (likely/at risk/if…then…) and **confidence levels** (High/Medium/Low).
 
+### Added: Pattern & Signal Analysis
+1. **Bearish Divergence:** Price makes new highs, but indicator (RSI/MACD) fails to make new highs → suggests weakening momentum and possible top formation.
+2. **Bullish Divergence:** Price makes new lows, but indicator does not → signals fading downside pressure, potential bottom formation.
+3. **Moving Average Crossovers (Trend Signals):**
+   - **Golden Cross:** Short-term MA crosses above long-term MA → bullish signal, potential start of uptrend.
+   - **Death Cross:** Short-term MA crosses below long-term MA → bearish signal, potential start of downtrend.
+4. **Candlestick Formations (Short-Term Reversal Signals):**
+   - **Bullish Engulfing:** A large bullish candle fully engulfs the previous bearish one → reversal to upside.
+   - **Bearish Engulfing:** A large bearish candle fully engulfs the previous bullish one → reversal to downside.
+   - **Doji:** Small real body with long shadows → indecision; when at top/bottom, warns of reversal.
+5. **Chart Pattern Breakouts (Mid-/Long-Term Signals):**
+   - **Double Bottom (W pattern):** Two similar lows followed by neckline breakout → bullish confirmation.
+   - **Double Top (M pattern):** Two similar highs followed by neckline breakdown → bearish confirmation.
+   - **Head and Shoulders / Inverse H&S:** Three-peak or three-trough pattern confirming a trend reversal.
+6. **Volume Confirmation Signals:**
+   - **High-Volume Breakout:** Breakout with volume surge → confirms strong trend participation.
+   - **Rising Price with Falling Volume:** Warns of weak rally or potential top.
+   - **Low Volume at Bottom:** Selling exhaustion, potential reversal base.
+7. **Overbought / Oversold Indicators:**
+   - **Overbought (RSI > 70 or 80):** Overextended buying pressure → possible short-term correction.
+   - **Oversold (RSI < 30 or 20):** Excessive selling → potential rebound setup.
+
+These pattern-based signals serve as **confirmation or early warning tools** for trend and momentum evaluations, complementing the broader technical structure.
+
 ## Output Format (Markdown report)
 Return a Markdown document with **these top-level sections** (no code blocks required):
 - `Executive Summary`
@@ -908,6 +932,7 @@ Return a Markdown document with **these top-level sections** (no code blocks req
   - `Mid-Term (4h / 1h)`
   - `Short-Term (1h / 15m)`
 - `Momentum & Volume`
+- `Pattern & Signal Analysis`
 - `Volatility`
 - `Key Levels (Descriptive)`
 - `Scenarios`
@@ -938,6 +963,7 @@ Example layout:\n
 3）Flows: Mid/short-term are <i>{supportive|choppy}</i>.\n
 4）Volatility: <i>{expanding|compressing}</i>.\n
 5）Confidence: <i>{High|Medium|Low}</i>.\n\n
+6）Pattern signals: <i>{bullish|bearish|mixed|none}</i> — <i>{divergence|MA cross (Golden/Death)|engulfing|Doji|W/M|Head & Shoulders}</i> context.\n\n
 
 <b>🙋 User Q&amp;A (Data-Grounded Answers)</b>\n
 • Q1: <i>{User question}</i>\n
@@ -973,6 +999,14 @@ Example layout:\n
 1) RSI(14): <i>{OB/OS bands; divergences—qualitative}</i>.\n
 2) MACD(12,26,9) Histogram: <i>{impulse building|fading; inflection}</i>.\n
 3) OBV/Volume vs SMA(volume): <i>{participation rising|falling; confirmation|dispersion}</i>.\n\n
+
+<b>📉 Pattern &amp; Signal Analysis</b>\n
+1) Divergences: <i>{bullish|bearish|none}; RSI/MACD behavior and price relation.</i>\n
+2) MA Crossovers: <i>{Golden|Death} Cross on {1d|4h}; signal {strengthening|weakening} trend.</i>\n
+3) Candlestick Formations: <i>{Bullish Engulfing|Bearish Engulfing|Doji}; short-term reversal warning.</i>\n
+4) Chart Patterns: <i>{Double Top|Double Bottom|Head &amp; Shoulders|Inverse H&amp;S}; breakout {confirmed|developing}.</i>\n
+5) Volume Confirmation: <i>{High-volume breakout|Price up volume down|Low volume bottom}; validates or questions move strength.</i>\n
+6) Overbought/Oversold: <i>RSI {>70|<30}; risk of {pullback|rebound}.</i>\n\n
 
 <b>🌪️ Volatility</b>\n
 1) ATR (4h/1d): <i>{rising|falling; recent trend}</i>.\n

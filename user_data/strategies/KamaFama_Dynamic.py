@@ -766,154 +766,184 @@ class KamaFama_Dynamic(IStrategy):
             return True
 
     def calculate_coin_points(self, pair: str, direction: str):
-        # 获取1小时K线数据用于支撑/阻力位识别
-        df_1h = self.get_ohlcv_history(pair, timeframe='1h', limit=150)
+        """
+        回踩/反抽 + 连续斐波那契延长线 + 双向防抖（多/空）
+        规则：
+        1) 错边必修正：long>current 或 short<current 即用延长线修正到允许区间内。
+        2) 多头防抖：entry > current*ANTI_CHOP_LONG 则拉深（远离现价）。
+        3) 空头防抖：entry < current*ANTI_CHOP_SHORT 则抬高（远离现价）。
+        """
 
+        # ===== 参数 =====
+        ANTI_CHOP_LONG = 0.995  # 多头防抖阈值：高于 current*0.995 认为太贴近，需要拉深
+        ANTI_CHOP_SHORT = 1.005  # 空头防抖阈值：低于 current*1.005 认为太贴近，需要抬高
+
+        EXT_BIAS_WRONGSIDE = 1.0  # 错边修正深度（0=近，1=最远）
+        EXT_BIAS_ANTI_CHOP_LONG = 0.8  # 多头防抖修正深度
+        EXT_BIAS_ANTI_CHOP_SHORT = 0.8  # 空头防抖修正深度
+
+        EPS_BAND = 0.005  # 修正时与现价至少留 0.5% 间距，避免过近
+
+        # ===== 连续“延长线目标”选择（不枚举0.618/1.618）=====
+        def fib_extension_targeted(curr, side, max_dist_pct, bias=1.0, eps=1e-4):
+            """
+            在允许区间内直接选目标价：
+            - long : [curr*(1-maxd), curr*(1-eps)]  更深 ←→ 更近
+            - short: [curr*(1+eps),  curr*(1+maxd)] 更近 ←→ 更远
+            bias∈[0,1]: 0=贴近现价端，1=靠近最远端
+            """
+            curr = float(curr)
+            md = max_dist_pct / 100.0
+            bias = max(0.0, min(1.0, float(bias)))
+
+            if side == 'long':
+                lo = curr * (1.0 - md)  # 最深端（更远离现价）
+                hi = curr * (1.0 - eps)  # 贴近现价端（仍 ≤ current）
+                if lo > hi:
+                    lo = hi
+                return float(lo * bias + hi * (1.0 - bias))
+            else:
+                lo = curr * (1.0 + eps)  # 贴近现价端（仍 ≥ current）
+                hi = curr * (1.0 + md)  # 最远端（更远离现价）
+                if lo > hi:
+                    hi = lo
+                return float(lo * (1.0 - bias) + hi * bias)
+
+        # ===== 数据 =====
+        df_1h = self.get_ohlcv_history(pair, timeframe='1h', limit=150)
         if df_1h is None or df_1h.empty:
             logger.warning(f"无法获取 {pair} 的1h数据，跳过计算支撑/阻力位")
             return None
 
-        # 获取5分钟数据用于更精确的进场点
         df_5m = self.get_ohlcv_history(pair, timeframe='5m', limit=350)
-
         if df_5m is None or df_5m.empty:
             df_5m, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
             if df_5m is None or df_5m.empty:
                 logger.warning(f"无法获取 {pair} 的5m数据，跳过自动设置")
                 return None
 
-        # 1. 从1小时图表识别主要支撑位和阻力位
-        supports_1h, resistances_1h = self.find_support_resistance_levels(
-            df_1h, n_levels=5
-        )  # 增加到5个点位以获取更多候选位置
-
-        # 2. 使用ZigZag过滤1小时图表上的噪音，找到重要转折点
+        supports_1h, resistances_1h = self.find_support_resistance_levels(df_1h, n_levels=5)
         highs_1h, lows_1h = self.zigzag_points(df_1h, deviation=5)
 
-        # 3. 分析近期5分钟数据的波动情况
-        recent_5m = df_5m.tail(288)  # 最近24小时
-        volatility = recent_5m['close'].pct_change().std() * 100  # 波动率百分比
+        recent_5m = df_5m.tail(288)
+        volatility = (
+            float(recent_5m['close'].pct_change().std() * 100) if len(recent_5m) > 1 else 0.0
+        )
+        current_price = float(df_5m.iloc[-1]['close'])
 
-        # 当前价格
-        current_price = df_5m.iloc[-1]['close']
-
-        # 设置基于预期利润的过滤参数
-        expected_profit_pct = 4.0  # 预期利润百分比
-        max_distance_pct = expected_profit_pct * 1.5  # 允许的最大距离百分比，稍大于预期利润
+        expected_profit_pct = 4.0
+        max_distance_pct = expected_profit_pct * 1.5
 
         logger.info(
             f"{pair} 当前价格: {current_price}, 24小时波动率: {volatility:.2f}%, 最大允许距离: {max_distance_pct:.2f}%"
         )
 
-        # 4. 整合不同时间周期的结果并基于预期利润过滤点位
+        # ===== 初步入场（回踩/反抽）=====
         if direction == 'long':
-            # 对于多头，我们关注支撑位
-            valid_supports = []
-
-            # 添加1小时图表的支撑位
-            for support in supports_1h:
-                # 计算支撑位与当前价格的距离百分比
-                distance_pct = (current_price - support) / current_price * 100
-                if 0 < distance_pct <= max_distance_pct:
-                    valid_supports.append(support)
-                    logger.info(f"有效支撑位: {support}, 距离当前价格: {distance_pct:.2f}%")
-
-            # 添加ZigZag低点
-            for low in lows_1h:
-                distance_pct = (current_price - low) / current_price * 100
-                if 0 < distance_pct <= max_distance_pct:
-                    valid_supports.append(low)
-                    logger.info(f"有效ZigZag低点: {low}, 距离当前价格: {distance_pct:.2f}%")
-
-            # 如果没有找到有效支撑位，则基于预期利润计算入场点
-            if not valid_supports:
-                valid_supports = [df_5m['low'].min()]
-                logger.info(f"{pair}没有找到合适距离内的支撑位，使用当日最低: {valid_supports[0]}")
-
-            # 根据接近当前价格的程度排序
-            valid_supports.sort(key=lambda x: abs(current_price - x))
-
-            # 选择最接近但低于当前价格的支撑位作为入场点
-            entry_point = min(valid_supports) * 1.005  # 略高于支撑位
-
-            # 根据波动率和预期利润动态调整止盈点位
-            # 如果波动率低，使用更接近预期利润的目标位
-            # 如果波动率高，允许更大的利润目标
-            volatility_factor = min(max(volatility / 10, 0.8), 1.5)  # 将波动率影响控制在0.8-1.5之间
-
-            tp1_pct = expected_profit_pct * 0.4 * volatility_factor  # 第一目标位
-            tp2_pct = expected_profit_pct * 0.8 * volatility_factor  # 第二目标位
-            tp3_pct = expected_profit_pct * 1.2 * volatility_factor  # 第三目标位
-
-            logger.info(
-                f"波动率因子: {volatility_factor:.2f}, TP1: {tp1_pct:.2f}%, TP2: {tp2_pct:.2f}%, TP3: {tp3_pct:.2f}%"
-            )
-
-            config = {
-                'entry_points': [entry_point],
-                'exit_points': [
-                    entry_point * (1 + tp1_pct / 100),  # 第一目标
-                    entry_point * (1 + tp2_pct / 100),  # 第二目标
-                    entry_point * (1 + tp3_pct / 100),  # 第三目标
-                ],
-                'stop_loss': entry_point * (1 - expected_profit_pct * 0.4 / 100),  # 止损位，预期利润的40%
-            }
+            cands = []
+            for s in supports_1h:
+                s = float(s)
+                d = (current_price - s) / current_price * 100
+                if 0 < d <= max_distance_pct:
+                    cands.append(s)
+            for l in lows_1h:
+                l = float(l)
+                d = (current_price - l) / current_price * 100
+                if 0 < d <= max_distance_pct:
+                    cands.append(l)
+            if not cands:
+                cands = [float(df_5m['low'].min())]
+            cands.sort(key=lambda x: abs(current_price - x))
+            entry_point = min(cands) * 1.001  # 略高于支撑（0.1%）
 
         elif direction == 'short':
-            # 对于空头，我们关注阻力位
-            valid_resistances = []
+            cands = []
+            for r in resistances_1h:
+                r = float(r)
+                d = (r - current_price) / current_price * 100
+                if 0 < d <= max_distance_pct:
+                    cands.append(r)
+            for h in highs_1h:
+                h = float(h)
+                d = (h - current_price) / current_price * 100
+                if 0 < d <= max_distance_pct:
+                    cands.append(h)
+            if not cands:
+                cands = [float(df_5m['high'].max())]
+            cands.sort(key=lambda x: abs(current_price - x))
+            entry_point = max(cands) * 0.999  # 略低于阻力（0.1%）
 
-            # 添加1小时图表的阻力位
-            for resistance in resistances_1h:
-                # 计算阻力位与当前价格的距离百分比
-                distance_pct = (resistance - current_price) / current_price * 100
-                if 0 < distance_pct <= max_distance_pct:
-                    valid_resistances.append(resistance)
-                    logger.info(f"有效阻力位: {resistance}, 距离当前价格: {distance_pct:.2f}%")
+        else:
+            logger.warning(f"未知方向: {direction}")
+            return None
 
-            # 添加ZigZag高点
-            for high in highs_1h:
-                distance_pct = (high - current_price) / current_price * 100
-                if 0 < distance_pct <= max_distance_pct:
-                    valid_resistances.append(high)
-                    logger.info(f"有效ZigZag高点: {high}, 距离当前价格: {distance_pct:.2f}%")
+        # ===== 错边必修正 =====
+        wrong_side = (direction == 'long' and entry_point > current_price) or (
+            direction == 'short' and entry_point < current_price
+        )
+        if wrong_side:
+            logger.info(f"[{pair}] 入场与方向错边（{direction}），执行延长线修正。")
+            if direction == 'long':
+                entry_point = fib_extension_targeted(
+                    current_price, 'long', max_distance_pct, bias=EXT_BIAS_WRONGSIDE, eps=EPS_BAND
+                )
+            else:
+                entry_point = fib_extension_targeted(
+                    current_price, 'short', max_distance_pct, bias=EXT_BIAS_WRONGSIDE, eps=EPS_BAND
+                )
+            logger.info(f"[{pair}] 错边修正后入场: {entry_point}")
 
-            # 如果没有找到有效阻力位，则基于预期利润计算入场点
-            if not valid_resistances:
-                valid_resistances = [df_5m['high'].max()]
-                logger.info(f"{pair}没有找到合适距离内的阻力位，使用当日最高: {valid_resistances[0]}")
-
-            # 根据接近当前价格的程度排序
-            valid_resistances.sort(key=lambda x: abs(current_price - x))
-
-            # 选择最接近但高于当前价格的阻力位作为入场点
-            entry_point = max(valid_resistances) * 0.995  # 略低于阻力位
-
-            # 同样基于波动率和预期利润动态调整止盈点位
-            volatility_factor = min(max(volatility / 10, 0.8), 1.5)
-
-            tp1_pct = expected_profit_pct * 0.4 * volatility_factor
-            tp2_pct = expected_profit_pct * 0.8 * volatility_factor
-            tp3_pct = expected_profit_pct * 1.2 * volatility_factor
-
+        # ===== 多/空 防抖（离现价太近则再拉远）=====
+        # 多头：entry 高于 current*0.995 ⇒ 拉深
+        if direction == 'long' and entry_point > current_price * ANTI_CHOP_LONG:
             logger.info(
-                f"波动率因子: {volatility_factor:.2f}, TP1: {tp1_pct:.2f}%, TP2: {tp2_pct:.2f}%, TP3: {tp3_pct:.2f}%"
+                f"[{pair}] 触发多头防抖: entry={entry_point:.6f} > current*{ANTI_CHOP_LONG}={current_price*ANTI_CHOP_LONG:.6f}，拉深修正。"
             )
+            entry_point = fib_extension_targeted(
+                current_price, 'long', max_distance_pct, bias=EXT_BIAS_ANTI_CHOP_LONG, eps=EPS_BAND
+            )
+            logger.info(f"[{pair}] 多头防抖修正入场: {entry_point}")
 
+        # 空头：entry 低于 current*1.005 ⇒ 抬高
+        if direction == 'short' and entry_point < current_price * ANTI_CHOP_SHORT:
+            logger.info(
+                f"[{pair}] 触发空头防抖: entry={entry_point:.6f} < current*{ANTI_CHOP_SHORT}={current_price*ANTI_CHOP_SHORT:.6f}，抬高修正。"
+            )
+            entry_point = fib_extension_targeted(
+                current_price,
+                'short',
+                max_distance_pct,
+                bias=EXT_BIAS_ANTI_CHOP_SHORT,
+                eps=EPS_BAND,
+            )
+            logger.info(f"[{pair}] 空头防抖修正入场: {entry_point}")
+
+        # ===== 动态 TP / SL =====
+        vol_factor = min(max(volatility / 10.0, 0.8), 1.5)
+        tp1_pct = expected_profit_pct * 0.4 * vol_factor
+        tp2_pct = expected_profit_pct * 0.8 * vol_factor
+        tp3_pct = expected_profit_pct * 1.2 * vol_factor
+
+        if direction == 'long':
             config = {
                 'entry_points': [entry_point],
                 'exit_points': [
-                    entry_point * (1 - tp1_pct / 100),  # 第一目标
-                    entry_point * (1 - tp2_pct / 100),  # 第二目标
-                    entry_point * (1 - tp3_pct / 100),  # 第三目标
+                    entry_point * (1 + tp1_pct / 100),
+                    entry_point * (1 + tp2_pct / 100),
+                    entry_point * (1 + tp3_pct / 100),
                 ],
-                'stop_loss': entry_point * (1 + expected_profit_pct * 0.4 / 100),  # 止损位，预期利润的40%
+                'stop_loss': entry_point * (1 - expected_profit_pct * 0.4 / 100),
             }
-
-        # 修复空头模式可能存在的错误
-        if direction == 'short' and 'valid_supports' in locals() and 'entry_point' not in locals():
-            logger.warning(f"{pair} 空头模式中错误使用了支撑位，重新计算...")
-            entry_point = valid_resistances[0] * 0.995  # 使用阻力位重新计算
+        else:
+            config = {
+                'entry_points': [entry_point],
+                'exit_points': [
+                    entry_point * (1 - tp1_pct / 100),
+                    entry_point * (1 - tp2_pct / 100),
+                    entry_point * (1 - tp3_pct / 100),
+                ],
+                'stop_loss': entry_point * (1 + expected_profit_pct * 0.4 / 100),
+            }
 
         return config
 
@@ -1768,9 +1798,11 @@ class KamaFama_Dynamic(IStrategy):
         Called right before executing a trade exit order.
         This method checks if the exit is due to ROI and re-enables auto calculation if needed.
         """
+        is_manual = False
         # Manual trade cleanup
         if trade.enter_tag and 'manual' in trade.enter_tag:
             # 'amount' 是卖出的标的数量；用 trade.amount 判定是否整仓
+            is_manual = True
             try:
                 full_close = (
                     trade.amount is not None
@@ -1789,6 +1821,11 @@ class KamaFama_Dynamic(IStrategy):
                 self.update_strategy_state_file()
 
         direction = 'short' if trade.is_short else 'long'
+
+        if is_manual and exit_reason.upper().startswith('ROI'):
+            # 记录一下，方便排查
+            logger.info(f"[{pair}] Block ROI exit for MANUAL trade at {rate}.")
+            return False  # 拦截这次 ROI 退出
 
         # Check if this is a ROI exit
         if exit_reason.upper().startswith('ROI'):
