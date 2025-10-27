@@ -95,6 +95,61 @@ def _temp_entry_type(strategy, new_type='limit'):
         strategy.order_types['force_entry'] = old_force
 
 
+def _parse_kv_tokens(tokens: list[str]) -> dict:
+    """
+    解析形如 ["price=2700", "sl=2500", "tps=71000,72000,73500", "tp1=...", "tp2=...", "tp3=..."]
+    的 KV 风格参数。返回 dict，未出现的键不包含。
+    """
+    out = {}
+    for t in tokens:
+        if '=' not in t:
+            continue
+        k, v = t.split('=', 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if not k:
+            continue
+        out[k] = v
+    return out
+
+
+def _maybe_float(x: str | None) -> float | None:
+    if x is None or x == '':
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _extract_tps_from_kv(kv: dict) -> list[float]:
+    """
+    从 kv 中提取 tps。支持：
+      - tps=71000,72000,73500
+      - tp1=..., tp2=..., tp3=...
+      - tp=...（单个）
+    返回: 已转成 float 的列表（未提供返回 []）
+    """
+    tps: list[float] = []
+
+    # tps=comma,separated
+    if 'tps' in kv:
+        parts = [p.strip() for p in kv['tps'].split(',') if p.strip() != '']
+        for p in parts:
+            v = _maybe_float(p)
+            if v is not None:
+                tps.append(v)
+
+    # 单个/分散的写法
+    for key in ('tp', 'tp1', 'tp2', 'tp3'):
+        if key in kv:
+            v = _maybe_float(kv[key])
+            if v is not None:
+                tps.append(v)
+
+    return tps
+
+
 def _normalize_pair(p: str) -> str:
     p = p.upper()
     if ':' in p:
@@ -1982,7 +2037,7 @@ class Telegram(RPCHandler):
 
             # 调用统一的保存逻辑（会更新 JSON 和内存，并提示）
             await self._update_manual_trade_config(
-                pair, size, lev, tps_clean, float(sl), side, entry_price=entry_price
+                pair, size, lev, tps_clean, float(sl), side, entry_price=entry_price, is_update=True
             )
 
             await msg.reply_text('已更新 ✅')
@@ -2153,15 +2208,15 @@ class Telegram(RPCHandler):
             pair = _normalize_pair(pending['pair'])
             order_side = SignalDirection(pending['side'])
 
+            # 写入 manual_open 配置
+            await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price)
+
             # 真正强制进场
             await self._force_enter_action(
                 pair, price, order_side,
                 stake_amount=size, leverage=leverage,
                 enter_tag=f'manual_{order_side.value}'
             )
-
-            # 写入 manual_open 配置
-            await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price)
 
             await msg.reply_text('手动开单已提交 ✅')
         except Exception as e:
@@ -2266,6 +2321,7 @@ class Telegram(RPCHandler):
                         leverage=leverage,
                         enter_tag=enter_tag,
                     )
+                    logger.info(f'Force enter called with args: {kwargs}')
                     if price is not None:
                         # 只对“提供了 price 的手动单”用限价
                         with _temp_entry_type(self._rpc._freqtrade.strategy, 'limit'):
@@ -2307,6 +2363,36 @@ class Telegram(RPCHandler):
                     reply_markup=ForceReply(selective=True)
                 )
 
+    def _has_open_trade(self, pair: str) -> bool:
+        """
+        判断是否存在指定交易对的未平仓单。
+        优先使用 RPC 的 open_trades；若不可用则回退到本地 Trade 模型。
+        """
+        # 1) RPC 路径（如果可用）
+        try:
+            if hasattr(self, '_rpc') and hasattr(self._rpc, '_rpc_open_trades'):
+                open_trades = self._rpc._rpc_open_trades() or []
+                for t in open_trades:
+                    p = t['pair'] if isinstance(t, dict) else getattr(t, 'pair', None)
+                    if p == pair:
+                        return True
+        except Exception:
+            # 不影响后续回退
+            logger.exception('RPC open_trades check failed.')
+
+        # 2) 本地 ORM 回退
+        try:
+            from freqtrade.persistence.models import Trade  # 若不可用会抛异常
+            # get_trades_proxy(is_open=True) 常见返回迭代器/列表
+            for t in Trade.get_trades_proxy(is_open=True):
+                if getattr(t, 'pair', None) == pair:
+                    return True
+        except Exception:
+            logger.exception('DB open_trades check failed.')
+
+        return False
+
+
     @staticmethod
     def _layout_inline_keyboard(
         buttons: list[InlineKeyboardButton], cols=3
@@ -2319,12 +2405,15 @@ class Telegram(RPCHandler):
         size: float,
         leverage: float,
         tps: list[float],
-        sl: float,
+        sl: float | None,
         order_side: SignalDirection,
-        entry_price: float | None = None,   # <== 新增
+        entry_price: float | None = None,   # 既有：新增记录
+        raw_submission: dict | None = None, # 新增：用于存放本次提交的原始内容
+        is_update: bool = False,          # 预留：未来可区分更新或新增
     ):
         """
         Updates strategy_state.json with manual trade configuration.
+        - 若当前有未平仓单，则在 manual_open[pair] 下追加 'scale_in' 记录（不改变当前主字段）。
         """
         state_file = 'user_data/strategy_state_production.json'
 
@@ -2337,15 +2426,64 @@ class Telegram(RPCHandler):
         if 'manual_open' not in strategy_state:
             strategy_state['manual_open'] = {}
 
-        strategy_state['manual_open'][pair] = {
-            'size': size,
-            'leverage': leverage,
-            'entry_price': entry_price,   # <== 新增记录
-            'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)),
-            'stop_loss': sl,
-            'direction': order_side.value,
-            'timestamp': datetime.now().timestamp(),  # Add timestamp to avoid using stale entries
-        }
+        if is_update and pair not in strategy_state['manual_open']:
+            raise ValueError(f"No existing manual_open entry for {pair} to update.")
+        if is_update and pair in strategy_state['manual_open']:
+            logger.info(f"Updating existing manual_open entry for {pair}.")
+            strategy_state['manual_open'][pair] = {
+                'size': size,
+                'leverage': leverage,
+                'entry_price': entry_price,
+                'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)) if tps else [],
+                'stop_loss': sl,  # 可以为 None
+                'direction': order_side.value,
+                'timestamp': datetime.now().timestamp(),  # 避免陈旧
+            }
+        else:
+            # ===== 新增：如果当前存在未平仓单，则追加 scale_in 记录 =====
+            try:
+                if self._has_open_trade(pair):
+                    payload = {
+                        'ts': datetime.now().timestamp(),
+                        'request': {
+                            'size': size,
+                            'leverage': leverage,
+                            'entry_price': entry_price,
+                            'tps': tps or [],
+                            'sl': sl,
+                            'direction': order_side.value,
+                        }
+                    }
+                    # 附带原始提交（更完整可追溯）
+                    if raw_submission:
+                        payload['raw'] = raw_submission
+
+                    mo = strategy_state['manual_open'].setdefault(pair, {})
+                    mo['scale_in'] = payload
+                else:
+                    # 主字段：保持你既有逻辑（覆盖/写入）
+                    strategy_state['manual_open'][pair] = {
+                        'size': size,
+                        'leverage': leverage,
+                        'entry_price': entry_price,
+                        'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)) if tps else [],
+                        'stop_loss': sl,  # 可以为 None
+                        'direction': order_side.value,
+                        'timestamp': datetime.now().timestamp(),  # 避免陈旧
+                    }
+            except Exception:
+                # scale_in 失败不影响主流程
+                logger.exception('Append scale_in failed.')
+                # 主字段：保持你既有逻辑（覆盖/写入）
+                strategy_state['manual_open'][pair] = {
+                    'size': size,
+                    'leverage': leverage,
+                    'entry_price': entry_price,
+                    'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)) if tps else [],
+                    'stop_loss': sl,  # 可以为 None
+                    'direction': order_side.value,
+                    'timestamp': datetime.now().timestamp(),  # 避免陈旧
+                }
 
         with open(state_file, 'w') as f:
             json.dump(strategy_state, f, indent=4)
@@ -2358,7 +2496,8 @@ class Telegram(RPCHandler):
         await self._send_msg(
             f"Manual trade config for {pair} has been set. The strategy will pick it up on the next tick."
         )
-        # 获取当前白名单
+
+        # 获取当前白名单（保留原逻辑）
         current_whitelist = self._rpc._rpc_whitelist()['whitelist']
 
         if pair in current_whitelist:
@@ -2375,11 +2514,12 @@ class Telegram(RPCHandler):
             self._rpc._rpc_reload_config()
             await self._send_msg(f'交易对 {pair} 已加入白名单')
 
+
     @authorized_only
     async def _force_enter(self, update: Update, context: CallbackContext, order_side: SignalDirection) -> None:
         args = context.args or []
 
-        # A) 全参：<pair> <size> <lev> <tp1> <tp2> <tp3> <sl> [price] -> 直接下单（保持你现在的“manual”逻辑）
+        # ===== A) 全参：<pair> <size> <lev> <tp1> <tp2> <tp3> <sl> [price] -> 保持原逻辑 =====
         if len(args) >= 7:
             try:
                 pair = _normalize_pair(args[0])
@@ -2391,30 +2531,100 @@ class Telegram(RPCHandler):
                 sl = float(args[6])
                 price = float(args[7]) if len(args) > 7 else None
 
+                await self._update_manual_trade_config(
+                    pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price,
+                    raw_submission={'mode': 'full_args', 'args': args}
+                )
+
                 await self._force_enter_action(
                     pair, price, order_side,
                     stake_amount=size, leverage=leverage,
                     enter_tag=f'manual_{order_side.value}'
                 )
-                await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price)
+
                 return
             except Exception as e:
                 await self._send_msg(f"参数或下单错误：{e}")
                 logger.exception('Error in _force_enter')
                 return
 
-        # B) 只有 pair（或用户只想手输参数）：直接进入 ForceReply
+        # ===== 新增：KV 模式（部分参数可缺省）：<pair> <size> <lev> key=value ... =====
+        # 例：/forcelong eth 10 10 price=2700 sl=2500
+        if len(args) >= 3 and any(('=' in a) for a in args[3:]):
+            try:
+                pair = _normalize_pair(args[0])
+                size = float(args[1])
+                leverage = float(args[2])
+
+                kv = _parse_kv_tokens(args[3:])
+                price = _maybe_float(kv.get('price'))
+                sl = _maybe_float(kv.get('sl'))
+                tps = _extract_tps_from_kv(kv)  # 可能为空 []
+
+                # 写入 manual_open：只把提供的内容写入（未提供的就留空/None/[]）
+                await self._update_manual_trade_config(
+                    pair, size, leverage, tps, sl, order_side, entry_price=price,
+                    raw_submission={'mode': 'kv_partial', 'args': args, 'kv': kv}
+                )
+
+                # 下单：若提供 price 即挂限价单；否则按你 _force_enter_action 的默认行为
+                await self._force_enter_action(
+                    pair, price, order_side,
+                    stake_amount=size, leverage=leverage,
+                    enter_tag=f'manual_{order_side.value}'
+                )
+
+                # 友好回执
+                tip_lines = [
+                    f"已接收 KV 模式下单：{pair} {order_side.value}",
+                    f"- size={size}, lev={leverage}",
+                    f"- price={'未提供' if price is None else price}",
+                    f"- sl={'未提供' if sl is None else sl}",
+                    f"- tps={'未提供' if not tps else ','.join(map(str, tps))}",
+                ]
+                await self._send_msg('\n'.join(tip_lines))
+                return
+            except Exception as e:
+                await self._send_msg(f"参数或下单错误(KV)：{e}")
+                logger.exception('Error in _force_enter (kv mode)')
+                return
+
+        # ===== 保持你现有的“3 参快速进场”分支 =====
+        if len(args) == 3:
+            try:
+                pair = _normalize_pair(args[0])
+                size = float(args[1])
+                leverage = float(args[2])
+
+                await self._update_manual_trade_config(
+                    pair, size, leverage, [], None, order_side, entry_price=None,
+                    raw_submission={'mode': 'quick3', 'args': args}
+                )
+
+                await self._force_enter_action(
+                    pair, None, order_side,
+                    stake_amount=size, leverage=leverage,
+                    enter_tag=f'manual_{order_side.value}'
+                )
+
+                return
+            except Exception as e:
+                await self._send_msg(f"参数或下单错误：{e}")
+                logger.exception('Error in _force_enter')
+                return
+
+        # ===== B) 只有 pair：保持原逻辑 =====
         if len(args) == 1:
             pair = _normalize_pair(args[0])
             key = (update.effective_chat.id, update.effective_user.id)
             self._pending_force[key] = {'pair': pair, 'side': order_side.value, 'ts': time.time()}
             tip = ('请按格式回复以下参数：\n'
-                   '<size> <leverage> <tp1> <tp2> <tp3> <sl> [price]\n'
-                   '示例：100 3 71000 72000 73500 69500')
+                '<size> <leverage> <tp1> <tp2> <tp3> <sl> [price]\n'
+                '示例：100 3 71000 72000 73500 69500')
             await context.bot.send_message(chat_id=update.effective_chat.id, text=tip, reply_markup=ForceReply(selective=True))
             return
 
-        # C) 无参数：弹出“选择交易对”的窗口（InlineKeyboard）
+        # ===== C) 无参数：保持原逻辑 =====
         whitelist = self._rpc._rpc_whitelist()['whitelist']
         pair_buttons = [
             InlineKeyboardButton(text=p, callback_data=f"force_enter__{p}_||_{order_side.value}")
@@ -2424,6 +2634,7 @@ class Telegram(RPCHandler):
         buttons_aligned.append([InlineKeyboardButton(text='Cancel', callback_data='force_enter__cancel')])
 
         await self._send_msg(msg='Which pair?', keyboard=buttons_aligned, query=update.callback_query)
+
 
     @authorized_only
     async def _set_manual(self, update: Update, context: CallbackContext):
@@ -2476,7 +2687,8 @@ class Telegram(RPCHandler):
                     tps=[tp1, tp2, tp3],
                     sl=sl,
                     order_side=order_side,
-                    entry_price=price if price is not None else float(getattr(trade, 'open_rate', 0) or 0)
+                    entry_price=price if price is not None else float(getattr(trade, 'open_rate', 0) or 0),
+                    is_update=True,
                 )
 
                 await self._send_msg(f"已将 {trade.pair} 标记为 manual_{side}，并写入 TP/SL/入场价。")

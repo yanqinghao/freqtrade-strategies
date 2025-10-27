@@ -1076,43 +1076,223 @@ class KamaFama_Dynamic(IStrategy):
 
     def _prune_manual_open_orphans(self):
         """
-        清理 manual_open 中没有对应“手动未平仓交易”的残留配置。
-        逻辑：取所有 is_open 的 trade 中 enter_tag 含 'manual' 的 pair，作为保留集合；
-            manual_open 里不在该集合的直接删除。
+        清理 manual_open 中没有对应“手动未平仓交易”的残留配置，
+        并在需要时回填市价进入单的 entry_price、以及自动补齐 TP/SL。
+
+        同时处理 scale_in（单笔补仓）：
+        - 若 trade.open_rate 相对 entry_price 方向变化（long 向上 / short 向下）=> 补仓成交；
+        合并该补仓单 TP/SL 到主配置并清空 scale_in。
+        - 若当前挂单中已不存在该币种 => 补仓取消，清空 scale_in。
         """
         try:
-            # 回测不清理，避免影响回测复现
+            # 回测不清理
             if self.config.get('runmode', None) not in ('live', 'dry_run'):
                 return
-            # 没有手动配置就不用做了
+
             if not getattr(self, 'manual_open', None):
                 return
 
-            # 收集所有“手动且未平仓”的交易对
+            # ---------- 工具函数（仅挑选“手动未平仓”的最新一笔） ----------
+            def _pick_manual_open_trade(pair: str):
+                try:
+                    trades = Trade.get_trades_proxy(is_open=True, pair=pair)
+                except TypeError:
+                    trades = [
+                        t
+                        for t in Trade.get_trades_proxy(is_open=True)
+                        if getattr(t, 'pair', None) == pair
+                    ]
+                manual_trades = [
+                    t for t in trades if ('manual' in (getattr(t, 'enter_tag', '') or '').lower())
+                ]
+                if not manual_trades:
+                    return None
+                manual_trades.sort(
+                    key=lambda t: (getattr(t, 'open_date', None) or 0, getattr(t, 'id', 0))
+                )
+                return manual_trades[-1]
+
+            # ---------- 1) 清理孤儿配置 ----------
             open_trades = Trade.get_trades_proxy(is_open=True)
             keep_pairs = {
                 t.pair
                 for t in open_trades
-                if (getattr(t, 'enter_tag', '') or '').find('manual') != -1
+                if ('manual' in (getattr(t, 'enter_tag', '') or '').lower())
             }
 
-            # 删掉 manual_open 里那些没有手动未平仓单的交易对
             to_delete = [p for p in list(self.manual_open.keys()) if p not in keep_pairs]
-            if not to_delete:
-                return
+            if to_delete:
+                for p in to_delete:
+                    del self.manual_open[p]
+                self.update_strategy_state_file()
+                msg = f"🧹 清理失效 manual 配置: {', '.join(to_delete)}"
+                logger.info(msg)
+                if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                    self.dp.send_msg(msg)
 
-            for p in to_delete:
-                # 如需顺便恢复自动点位计算，可用下面两行（若 manual_open 里带方向）：
-                # direction = (self.manual_open.get(p, {}).get('direction') or 'long').lower()
-                # self.enable_auto_calculation(p, 'short' if direction == 'short' else 'long')
-                del self.manual_open[p]
+            # ---------- 2) 回填/补齐主配置（全部使用原始浮点，不做 round） ----------
+            ratios = {
+                'long': {'tp': [0.015, 0.03, 0.05], 'sl': -0.02},
+                'short': {'tp': [-0.015, -0.03, -0.05], 'sl': 0.02},
+            }
 
-            self.update_strategy_state_file()
+            updated_pairs = []
 
-            msg = f"🧹 清理失效 manual 配置: {', '.join(to_delete)}"
-            logger.info(msg)
-            if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
-                self.dp.send_msg(msg)
+            for pair in keep_pairs:
+                mo = self.manual_open.get(pair)
+                if not isinstance(mo, dict):
+                    continue
+
+                direction = (mo.get('direction') or 'long').lower()
+                lev = int(mo.get('leverage') or 10)
+                if direction not in ('long', 'short'):
+                    direction = 'long'
+
+                t = _pick_manual_open_trade(pair)
+                if not t:
+                    continue
+
+                changed = False
+                entry_price = mo.get('entry_price', None)
+
+                # ---- 2.1 回填 entry_price（用原始 open_rate） ----
+                if entry_price in (None, 0):
+                    open_rate = getattr(t, 'open_rate', None)
+                    if open_rate:
+                        mo['entry_price'] = float(open_rate)
+                        entry_price = mo['entry_price']
+                        changed = True
+                    else:
+                        logger.warning(
+                            f"[manual_open] 无法为 {pair} 回填 entry_price：trade.open_rate 不可用"
+                        )
+                        continue
+
+                # ---- 2.2 自动补齐 TP/SL（原始浮点） ----
+                eps = mo.get('exit_points')
+                sl = mo.get('stop_loss')
+                need_tp = (not isinstance(eps, (list, tuple))) or len(eps) == 0
+                need_sl = sl in (None, 0)
+                if need_tp or need_sl:
+                    base = float(entry_price)
+                    if need_tp:
+                        mo['exit_points'] = [base * (1 + r) for r in ratios[direction]['tp']]
+                        changed = True
+                    if need_sl:
+                        # 给个随杠杆变动的默认 SL（与原逻辑一致，只是不用 round）
+                        mo['stop_loss'] = base * (1 + ratios[direction]['sl'] * (10 / lev))
+                        changed = True
+
+                # ---------- 3) 处理 scale_in（单个 dict） ----------
+                scale_item = mo.get('scale_in')
+                if isinstance(scale_item, dict) and scale_item:
+                    req = scale_item.get('request', {}) if isinstance(scale_item, dict) else {}
+                    tps_sub = req.get('tps') or []
+                    sl_sub = req.get('sl')
+
+                    current_open_rate = float(getattr(t, 'open_rate', 0) or 0)
+                    prev_entry = float(entry_price or 0)
+
+                    # ---- 成交：看 open_rate 是否相对 entry_price 按方向变化 ----
+                    filled = False
+                    try:
+                        if direction == 'long' and current_open_rate > prev_entry:
+                            filled = True
+                        elif direction == 'short' and current_open_rate < prev_entry:
+                            filled = True
+                    except Exception:
+                        filled = False
+
+                    # ---- 取消判断（优先交易所，其次本地DB）----
+                    canceled = False
+                    if not filled:
+                        try:
+                            # 1) 交易所：还有未成交订单就不取消
+                            still_exists = False
+                            if hasattr(self, '_rpc') and hasattr(self._rpc, '_rpc_open_orders'):
+                                open_orders = self._rpc._rpc_open_orders() or []
+                                still_exists = any(
+                                    (
+                                        o.get('pair') == pair
+                                        if isinstance(o, dict)
+                                        else getattr(o, 'pair', None) == pair
+                                    )
+                                    for o in open_orders
+                                )
+                            if still_exists:
+                                canceled = False
+                            else:
+                                # 2) 本地DB：检查该 trade 的 open 订单
+                                try:
+                                    from freqtrade.persistence.models import Order
+
+                                    # 若你手上有 trade 对象 t，直接按 trade_id 过滤最准
+                                    q = Order.query.filter(
+                                        Order.ft_trade_id == getattr(t, 'id', None)
+                                    )
+                                    # 没有 t.id 就退化为按 pair
+                                    if getattr(t, 'id', None) is None:
+                                        q = Order.query.filter(Order.ft_pair == pair)
+
+                                    orders = q.all()
+                                    has_open = any(
+                                        bool(getattr(o, 'ft_is_open', False)) for o in orders
+                                    )
+                                    canceled = not has_open
+                                except Exception:
+                                    # 再退一步：尝试用 t.orders（如果 ORM 已加载）
+                                    orders = getattr(t, 'orders', []) or []
+                                    has_open = any(
+                                        bool(getattr(o, 'ft_is_open', False)) for o in orders
+                                    )
+                                    canceled = not has_open
+                        except Exception:
+                            canceled = False
+
+                    if filled:
+                        # ==== 成交：合并 TP/SL 到主配置（用原始值） ====
+                        if tps_sub:
+                            mo['exit_points'] = [float(x) for x in tps_sub]
+                            logger.info(
+                                f"[scale_in] 使用新的 TP 替换旧值: pair={pair}, tps={mo['exit_points']}"
+                            )
+                        if sl_sub is not None:
+                            cur_sl = mo.get('stop_loss')
+                            if cur_sl is not None:
+                                if direction == 'long':
+                                    mo['stop_loss'] = max(float(cur_sl), float(sl_sub))
+                                else:
+                                    mo['stop_loss'] = min(float(cur_sl), float(sl_sub))
+                            else:
+                                mo['stop_loss'] = float(sl_sub)
+                        # 清空 scale_in
+                        mo.pop('scale_in', None)
+                        changed = True
+
+                        msg = f"🔁 {pair} 补仓成交：TP/SL 已合并至主配置"
+                        logger.info(msg)
+                        if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                            self.dp.send_msg(msg)
+
+                    elif canceled:
+                        mo.pop('scale_in', None)
+                        changed = True
+                        msg = f"🚫 {pair} 补仓挂单已取消，配置已清理"
+                        logger.info(msg)
+                        if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                            self.dp.send_msg(msg)
+
+                # ---------- 同步更新 ----------
+                if changed:
+                    self.manual_open[pair] = mo
+                    updated_pairs.append(pair)
+
+            if updated_pairs:
+                self.update_strategy_state_file()
+                msg = '🛠 已自动完善手动单配置：' + ', '.join(updated_pairs)
+                logger.info(msg)
+                if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+                    self.dp.send_msg(msg)
 
         except Exception as e:
             logger.warning(f"_prune_manual_open_orphans failed: {e}")
