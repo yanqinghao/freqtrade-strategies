@@ -52,6 +52,7 @@ from freqtrade.enums import (
     RPCMessageType,
     SignalDirection,
     TradingMode,
+    State,
 )
 from freqtrade.exceptions import OperationalException
 from freqtrade.misc import chunks, plural
@@ -411,6 +412,7 @@ class Telegram(RPCHandler):
             r'/restoremanual$',
             r'/coo$',
             r'/fx$',
+            r'/rtd$',
         ]
         # Create keys for generation
         valid_keys_print = [k.replace('$', '') for k in valid_keys]
@@ -471,6 +473,7 @@ class Telegram(RPCHandler):
             CommandHandler('trades', self._trades),
             CommandHandler('delete', self._delete_trade),
             CommandHandler(['coo', 'cancel_open_order'], self._cancel_open_order),
+            CommandHandler(['rtd', 'reset_trade_data'], self._reset_trade_data),
             CommandHandler('performance', self._performance),
             CommandHandler(['buys', 'entries'], self._enter_tag_performance),
             CommandHandler(['sells', 'exits'], self._exit_reason_performance),
@@ -2841,6 +2844,160 @@ class Telegram(RPCHandler):
         trade_id = int(context.args[0])
         self._rpc._rpc_cancel_open_order(trade_id)
         await self._send_msg('Open order canceled.')
+
+    def _reset_trade_data_core(
+        self,
+        trade_id: int,
+        exit_stage: int,
+        initial_stake: float | None = None,
+        use_current_stake: bool = False,
+    ) -> None:
+        """
+        在本类中直接重置 trade 的自定义数据（不通过 RPC）：
+        - 总是设置 exit_stage（若外部未传则按 Handler 默认 0）
+        - initial_stake：
+            * use_current_stake=True -> 取 trade.stake_amount
+            * initial_stake 显式传入 -> 用传入值
+            * 否则不修改
+        """
+        if self._rpc._freqtrade.state != State.RUNNING:
+            raise RPCException('trader is not running')
+
+        # 尽量沿用你在 cancel_open_order 中的加锁方式
+        with self._rpc._freqtrade._exit_lock:
+            trade = Trade.get_trades(
+                trade_filter=[
+                    Trade.id == trade_id,
+                    Trade.is_open.is_(True),
+                ]
+            ).first()
+
+            if not trade:
+                logger.warning('reset_trade_data: Invalid trade_id received.')
+                raise RPCException('Invalid trade_id.')
+
+            # 1) exit_stage（存自定义数据区）
+            try:
+                trade.set_custom_data('exit_stage', int(exit_stage))
+            except Exception as e:
+                logger.exception('Failed to set custom exit_stage', exc_info=True)
+                raise RPCException(f"Failed to set exit_stage: {e}")
+
+            # 2) initial_stake（按优先级修改或保持不变）
+            try:
+                if use_current_stake:
+                    trade.initial_stake = trade.stake_amount
+                elif initial_stake is not None:
+                    trade.initial_stake = float(initial_stake)
+                # 未显式要求则不修改
+            except Exception as e:
+                logger.exception('Failed to set initial_stake', exc_info=True)
+                raise RPCException(f"Failed to set initial_stake: {e}")
+
+            Trade.commit()
+            logger.info(
+                'Trade %s reset done: exit_stage=%s, initial_stake=%s',
+                trade_id,
+                exit_stage,
+                'stake_amount' if use_current_stake else ('unchanged' if initial_stake is None else initial_stake),
+            )
+
+
+    @authorized_only
+    async def _reset_trade_data(self, update: Update, context: CallbackContext) -> None:
+        """
+        /reset_trade_data <trade_id> [exit_stage] [initial_stake]
+        /reset_trade_data <trade_id> [exit_stage=<int>] [initial_stake[=<float>]]
+
+        支持示例：
+        /reset_trade_data 123               -> exit_stage=0；initial_stake不变
+        /reset_trade_data 123 2             -> exit_stage=2；initial_stake不变
+        /reset_trade_data 123 initial_stake -> exit_stage=0；initial_stake=stake_amount
+        /reset_trade_data 123 initial_stake=150
+                                            -> exit_stage=0；initial_stake=150
+        /reset_trade_data 123 3 initial_stake
+                                            -> exit_stage=3；initial_stake=stake_amount
+        /reset_trade_data 123 exit_stage=2 initial_stake=100
+                                            -> exit_stage=2；initial_stake=100
+        """
+        if not context.args:
+            await self._send_msg('用法：/reset_trade_data 123')
+            raise RPCException('Trade-id not set.')
+
+        # 解析 trade_id
+        try:
+            trade_id = int(context.args[0])
+        except ValueError:
+            await self._send_msg('用法：/reset_trade_data 123 exit_stage=2 initial_stake=100')
+            raise RPCException('Invalid trade_id.')
+
+        # 解析其余参数
+        exit_stage = None                # 未提供则默认 0
+        initial_stake = None             # 显式提供数值时使用
+        use_current_stake = False        # 用户写了 'initial_stake' 但未给值时 = True
+        pos = []
+
+        for raw in context.args[1:]:
+            if '=' in raw:
+                k, v = raw.split('=', 1)
+                k, v = k.strip().lower(), v.strip()
+                if k == 'exit_stage':
+                    try:
+                        exit_stage = int(v)
+                    except ValueError:
+                        raise RPCException('Invalid exit_stage value.')
+                elif k == 'initial_stake':
+                    if v == '':
+                        use_current_stake = True
+                    else:
+                        try:
+                            initial_stake = float(v)
+                        except ValueError:
+                            raise RPCException('Invalid initial_stake value.')
+                else:
+                    raise RPCException(f"Unknown parameter '{k}'.")
+            else:
+                pos.append(raw)
+
+        # 位置参数： [exit_stage] [initial_stake]
+        if len(pos) >= 1 and exit_stage is None:
+            if pos[0].lower() == 'initial_stake':
+                use_current_stake = True
+            else:
+                try:
+                    exit_stage = int(pos[0])
+                except ValueError:
+                    raise RPCException('Invalid exit_stage value.')
+
+        if len(pos) >= 2:
+            if pos[1].lower() == 'initial_stake':
+                use_current_stake = True
+            else:
+                try:
+                    initial_stake = float(pos[1])
+                except ValueError:
+                    raise RPCException('Invalid initial_stake value.')
+
+        if len(pos) > 2:
+            raise RPCException('Too many positional arguments.')
+
+        # 未传 exit_stage -> 默认 0
+        if exit_stage is None:
+            exit_stage = 0
+
+        # 直接在本类内执行业务逻辑（不走 RPC）
+        self._reset_trade_data_core(
+            trade_id=trade_id,
+            exit_stage=exit_stage,
+            initial_stake=initial_stake,
+            use_current_stake=use_current_stake,
+        )
+
+        await self._send_msg(
+            f"Trade {trade_id} 已重置：exit_stage={exit_stage}，"
+            f"initial_stake={'使用当前 stake_amount' if use_current_stake else ('未修改' if initial_stake is None else initial_stake)}"
+        )
+
 
     @authorized_only
     async def _performance(self, update: Update, context: CallbackContext) -> None:
