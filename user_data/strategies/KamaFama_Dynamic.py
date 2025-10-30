@@ -1156,7 +1156,7 @@ class KamaFama_Dynamic(IStrategy):
                 entry_price = mo.get('entry_price', None)
 
                 # ---- 2.1 回填 entry_price（用原始 open_rate） ----
-                if entry_price in (None, 0):
+                if entry_price in (None, 0) or entry_price != float(getattr(t, 'open_rate', None)):
                     open_rate = getattr(t, 'open_rate', None)
                     if open_rate:
                         mo['entry_price'] = float(open_rate)
