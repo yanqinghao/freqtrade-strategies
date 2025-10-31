@@ -1154,6 +1154,7 @@ class KamaFama_Dynamic(IStrategy):
 
                 changed = False
                 entry_price = mo.get('entry_price', None)
+                prev_entry = entry_price
 
                 # ---- 2.1 回填 entry_price（用原始 open_rate） ----
                 if entry_price in (None, 0) or entry_price != float(getattr(t, 'open_rate', None)):
@@ -1172,7 +1173,7 @@ class KamaFama_Dynamic(IStrategy):
                 eps = mo.get('exit_points')
                 sl = mo.get('stop_loss')
                 need_tp = (not isinstance(eps, (list, tuple))) or len(eps) == 0
-                need_sl = sl in (None, 0)
+                need_sl = sl == None
                 if need_tp or need_sl:
                     base = float(entry_price)
                     if need_tp:
@@ -1191,14 +1192,12 @@ class KamaFama_Dynamic(IStrategy):
                     sl_sub = req.get('sl')
 
                     current_open_rate = float(getattr(t, 'open_rate', 0) or 0)
-                    prev_entry = float(entry_price or 0)
+                    # prev_entry = float(entry_price or 0)
 
                     # ---- 成交：看 open_rate 是否相对 entry_price 按方向变化 ----
                     filled = False
                     try:
-                        if direction == 'long' and current_open_rate > prev_entry:
-                            filled = True
-                        elif direction == 'short' and current_open_rate < prev_entry:
+                        if current_open_rate != prev_entry:
                             filled = True
                     except Exception:
                         filled = False
@@ -1260,9 +1259,9 @@ class KamaFama_Dynamic(IStrategy):
                             cur_sl = mo.get('stop_loss')
                             if cur_sl is not None:
                                 if direction == 'long':
-                                    mo['stop_loss'] = max(float(cur_sl), float(sl_sub))
+                                    mo['stop_loss'] = float(cur_sl)
                                 else:
-                                    mo['stop_loss'] = min(float(cur_sl), float(sl_sub))
+                                    mo['stop_loss'] = float(cur_sl)
                             else:
                                 mo['stop_loss'] = float(sl_sub)
                         # 清空 scale_in
