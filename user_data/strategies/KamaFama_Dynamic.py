@@ -1174,6 +1174,9 @@ class KamaFama_Dynamic(IStrategy):
                 sl = mo.get('stop_loss')
                 need_tp = (not isinstance(eps, (list, tuple))) or len(eps) == 0
                 need_sl = sl == None
+                need_direction = mo.get('direction') == None
+                need_size = mo.get('size') == None
+                need_lev = mo.get('leverage') == None
                 if need_tp or need_sl:
                     base = float(entry_price)
                     if need_tp:
@@ -1183,6 +1186,15 @@ class KamaFama_Dynamic(IStrategy):
                         # 给个随杠杆变动的默认 SL（与原逻辑一致，只是不用 round）
                         mo['stop_loss'] = base * (1 + ratios[direction]['sl'] * (10 / lev))
                         changed = True
+                if need_direction:
+                    mo['direction'] = 'short' if t.is_short else 'long'
+                    changed = True
+                if need_lev:
+                    mo['leverage'] = t.leverage
+                    changed = True
+                if need_size:
+                    mo['size'] = t.stake_amount
+                    changed = True
 
                 # ---------- 3) 处理 scale_in（单个 dict） ----------
                 scale_item = mo.get('scale_in')
@@ -1957,7 +1969,8 @@ class KamaFama_Dynamic(IStrategy):
             if strategy_mode == 'long':
                 dataframe = self._populate_long_entry(dataframe, metadata)
             else:
-                dataframe = self._populate_short_entry(dataframe, metadata)
+                if self.config.get('runmode', None) not in ('live', 'dry_run'):
+                    dataframe = self._populate_short_entry(dataframe, metadata)
 
         return dataframe
 
