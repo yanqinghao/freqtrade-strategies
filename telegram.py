@@ -82,6 +82,56 @@ logger = logging.getLogger(__name__)
 
 logger.debug('Included module rpc.telegram ...')
 
+def _parse_overrides(args):
+    """解析 open_rate=xxx amount=xxx stake_amount=xxx"""
+    out = {}
+    for tok in args or []:
+        m = re.match(r'^(open_rate|amount|stake_amount)=([\d.]+)$', tok.strip())
+        if m:
+            out[m.group(1)] = float(m.group(2))
+    return out
+
+def _build_exchange_from_config(config):
+    """使用 self.config / original_config 构建 ccxt 实例（USDT-M 永续）"""
+    exchange_name = config['exchange']['name'].lower()
+    exchange_class = getattr(ccxt, exchange_name)
+    api_config = {
+        'apiKey': config['original_config']['exchange'].get('key', ''),
+        'secret': config['original_config']['exchange'].get('secret', ''),
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'future',
+            'defaultMarket': 'future',
+        },
+    }
+    # 过滤空值（和你提供的一致）
+    api_config = {k: v for k, v in api_config.items() if v}
+    return exchange_class(api_config)
+
+def _fetch_position(exchange, pair: str):
+    """
+    读取该 pair 的第一条非零仓位，返回:
+      {'pair','side','contracts','entryPrice'}
+    """
+    symbol = _normalize_pair(pair)
+    try:
+        positions = exchange.fetch_positions([symbol]) or []
+    except Exception as e:
+        print(f"[sync_trade] fetch_positions error: {e}")
+        return None
+
+    for pos in positions:
+        size = pos['contracts']
+        entry = pos['entryPrice']
+        side = pos['side']
+
+        return {
+            'pair': pair,
+            'side': side,
+            'contracts': float(size),
+            'entryPrice': float(entry),
+        }
+    return None
 
 @contextmanager
 def _temp_entry_type(strategy, new_type='limit'):
@@ -413,6 +463,7 @@ class Telegram(RPCHandler):
             r'/coo$',
             r'/fx$',
             r'/rtd$',
+            r'/st$',
         ]
         # Create keys for generation
         valid_keys_print = [k.replace('$', '') for k in valid_keys]
@@ -473,6 +524,7 @@ class Telegram(RPCHandler):
             CommandHandler('trades', self._trades),
             CommandHandler('delete', self._delete_trade),
             CommandHandler(['coo', 'cancel_open_order'], self._cancel_open_order),
+            CommandHandler(['st', 'sync_trade'], self._sync_trade),
             CommandHandler(['rtd', 'reset_trade_data'], self._reset_trade_data),
             CommandHandler('performance', self._performance),
             CommandHandler(['buys', 'entries'], self._enter_tag_performance),
@@ -2829,6 +2881,100 @@ class Telegram(RPCHandler):
             f"`{msg['result_msg']}`\n"
             'Please make sure to take care of this asset on the exchange manually.'
         )
+
+    @authorized_only
+    async def _sync_trade(self, update: Update, context: CallbackContext) -> None:
+        """
+        /sync_trade <trade_id|pair> [open_rate=..] [amount=..] [stake_amount=..]
+        - 若为 trade_id：按该单的 pair 同步
+        - 若为 pair：同步该 pair 最近一条未平仓 Trade
+        - 自动映射并允许用户覆盖
+        """
+        if not context.args or len(context.args) == 0:
+            raise RPCException('Usage: /sync_trade <trade_id|pair> [open_rate=..] [amount=..] [stake_amount=..]')
+
+        head, *rest = context.args
+        overrides = _parse_overrides(rest)
+
+        if self._rpc._freqtrade.state != State.RUNNING:
+            raise RPCException('trader is not running')
+
+        with self._rpc._freqtrade._exit_lock:
+            # 1) trade_id or pair
+            trade = None
+            if head.isdigit():
+                trade_id = int(head)
+                trade = Trade.get_trades(
+                    trade_filter=[Trade.id == trade_id, Trade.is_open.is_(True)]
+                ).first()
+                if not trade:
+                    raise RPCException(f"Invalid trade_id or trade closed: {trade_id}")
+                pair = trade.pair
+            else:
+                pair = head
+            pair = _normalize_pair(pair)
+            # 2) 交易所仓位
+            exchange = _build_exchange_from_config(self._rpc._freqtrade.config)
+            pos = _fetch_position(exchange, pair)
+            if not pos:
+                # 若是 pair 模式，可能本地也没有未平仓，这里统一提示
+                if trade is None:
+                    await self._send_msg(f"⚠️ No exchange position for {pair}.")
+                    return
+                raise RPCException(f"No exchange position for {pair}.")
+
+            # 3) 选择本地 Trade（pair 模式下找最近一条）
+            if trade is None:
+                trade = Trade.get_trades(
+                    trade_filter=[Trade.pair == pair, Trade.is_open.is_(True)]
+                ).first()
+                if not trade:
+                    snap = f"{pos['side']} size={pos['contracts']} entry={pos.get('entryPrice')} lev={pos.get('leverage')}"
+                    await self._send_msg(f"⚠️ No local open trade for {pair}.\nExchange position: {snap}")
+                    return
+
+            # 4) 计算写回值（支持覆盖）
+            entry = overrides.get('open_rate', pos.get('entryPrice'))
+            amount = overrides.get('amount', pos.get('contracts'))
+            lev = trade.leverage
+            stake_calc = (entry * amount / lev) if (entry is not None and amount is not None) else None
+            stake_amount = overrides.get('stake_amount', stake_calc)
+            max_stake_amount = stake_amount * lev
+
+            if entry is None or amount is None:
+                raise RPCException('Unable to resolve open_rate/amount (exchange value missing and no override given).')
+
+            # 5) 写回 + 提交
+            before = {
+                'open_rate': trade.open_rate,
+                'amount': trade.amount,
+                'stake_amount': getattr(trade, 'stake_amount', None),
+            }
+            trade.open_rate = float(entry)
+            trade.amount = float(amount)
+            trade.amount_requested = float(amount)
+            if hasattr(trade, 'stake_amount') and stake_amount is not None:
+                trade.stake_amount = float(stake_amount)
+                trade.max_stake_amount = float(max_stake_amount)
+                trade.open_trade_value = float(max_stake_amount)
+            Trade.commit()
+
+            after = {
+                'open_rate': trade.open_rate,
+                'amount': trade.amount,
+                'stake_amount': getattr(trade, 'stake_amount', None),
+            }
+
+        # 6) 汇报
+        msg = (
+            '✅ 同步完成\n'
+            f"Pair         : {pair}\n"
+            f"Side         : {pos['side']}\n"
+            f"open_rate    : {before['open_rate']} -> {after['open_rate']}\n"
+            f"amount       : {before['amount']} -> {after['amount']}\n"
+            f"stake_amount : {before['stake_amount']} -> {after['stake_amount']}"
+        )
+        await self._send_msg(msg)
 
     @authorized_only
     async def _cancel_open_order(self, update: Update, context: CallbackContext) -> None:
