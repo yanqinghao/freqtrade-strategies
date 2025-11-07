@@ -685,6 +685,23 @@ All outputs must be **actionable** and follow the **formatting rules** below.
 - Purpose: prevent meaningless initial entries against the live market context.
 - Subsequent scale-in entries (pyramiding) are exempt from this restriction.
 
+
+---
+
+## Three-Stage Entry Spacing Rules
+To avoid clustering entries into a single volatility candle:
+
+### Minimum Spacing
+Each stage’s entry must be at least:
+**max(0.9% of price, 0.7 × ATR(1h))**
+away from the previous stage.
+
+If spacing cannot be achieved, skip the stage.
+
+Purpose:
+- Avoid dense pyramiding
+- Ensure true HTF structural placement
+
 ---
 
 # ✅ Three-Stage Entry Model (for both main bias and hedge)
@@ -715,6 +732,9 @@ Then produce a full **Opposite-Side Hedge** setup using the same structure but s
   - Stage 3: ≈0.5×ATR (tightest, near invalidation)
 - **Final Hard SL**: once Stage 3 fills, calculate blended entry ± ATR; must be enforced strictly.
 
+### Hedge SL Distancing Requirement
+Hedge SL must be **≥ 0.8 × ATR(4h)** beyond the main SL and never overlap with the HTF invalidation zone.
+
 ---
 
 ## 🔒 Risk Management Rules
@@ -726,6 +746,55 @@ Then produce a full **Opposite-Side Hedge** setup using the same structure but s
 - **At least one TP R/R ≥ 1.5** based on blended entry.
 - Weighted average entry and final hard SL are used for R/R and EV calculations.
 - Display: Risk %, USDT loss, TP R ratios, E[R|win], Win Prob, and EV.
+
+### Hedge TP Depth Requirement
+- TP2 ≥ 1.3R
+- TP3 ≥ 2.0R
+
+Ensures hedges can offset multi-stage losses.
+
+---
+
+## ⚔️ Dynamic Hedge Rules
+
+- **Purpose:**
+  Each stage supports an independent, reactive **Dynamic Hedge Command** that opens an opposite-side position when the market **breaks through that stage’s own support/resistance boundary**.
+  The hedge uses the **stage’s entry level ± ATR offset** as its trigger, ensuring protection is tied directly to each layer’s structural invalidation.
+
+- **Trigger Logic:**
+  - For **Long** positions: activate a short hedge **after confirmed breakdown** below that stage’s entry/support level
+    (close < level AND volume ≥ 1.5× 20-period mean AND momentum negative).
+  - For **Short** positions: activate a long hedge **after confirmed breakout** above that stage’s entry/resistance level
+    (close > level AND volume ≥ 1.5× 20-period mean AND momentum positive).
+  - Hedge trigger price is dynamically computed as:<br>
+    • **Long hedge** (against Short main): `hg_entryX = entryX + αX × ATR(4h)`
+    • **Short hedge** (against Long main): `hg_entryX = entryX − αX × ATR(4h)`
+    Suggested default multipliers: `α1 = 0.6`, `α2 = 0.5`, `α3 = 0.4`.
+  - Confirmation timeframe: same as entry (1h / 4h), but aligned with HTF trend (4h / 1d).
+
+- **Behavior:**
+  - The dynamic hedge is a **separate and reactive trade**, not pre-placed.
+  - Its **TP/SL are always re-computed** based on breakout direction, next HTF target, and ATR(4h/1d):
+    - Example TP template (Long hedge):
+      • `tp1_hgX = hg_entryX + 0.8 × ATR`
+      • `tp2_hgX = hg_entryX + 1.3 × ATR`
+      • `tp3_hgX = hg_entryX + 2.0 × ATR`
+    - Example SL template (Long hedge):
+      • `sl_hgX = hg_entryX − 0.6 × ATR`
+    (Short hedge mirrors these formulas with inverse direction.)
+  - **Stake** defaults to the corresponding stage’s total stake allocation (50 / 30 / 20%).
+  - The hedge is closed when:
+    • TP/SL is reached, or
+    • price re-enters the main directional bias zone.
+
+- **Command Structure:**
+  Each stage outputs **two commands**:
+  1. **Main Entry Command** — the intended trade direction.
+  2. **Dynamic Hedge Command (reactive)** — a fully independent opposite-side trade with **new TP/SL and new ATR-based trigger price**.
+
+- **Design Objective:**
+    Dynamic Hedge Commands provide **fine-grained, stage-specific defensive protection**.
+    Even if the market invalidates the stage’s level before reaching the Final Hard SL, the reactive hedge captures continuation momentum, offsetting losses and stabilizing performance in strong trending or volatile environments.
 
 ---
 
@@ -763,84 +832,97 @@ Then produce a full **Opposite-Side Hedge** setup using the same structure but s
 <b>🟢 Stage 1 — Initial Probe (Rating: Strong)</b>\n
 <b>Entry</b>: <code>{{entry1}}</code> — Near strongest HTF support/resistance (4h/1d MA20/50, BB edge, major swing)\n
 <b>TP1/TP2/TP3</b>: <code>{{tp1}} / {{tp2}} / {{tp3}}</code>\n
-<b>SL</b>: <code>{{sl_stage1}}</code> — 1.0×ATR buffer; switches to Final Hard SL after Stage 3\n
-<b>Risk</b>: <code>{{risk_total%}} (~{{loss_total}} USDT / {{stake_total}})</code>\n
+<b>SL</b>: <code>{{sl_stage1}}</code> — 1.0×ATR buffer; switches to Final Hard SL after Stage 3\n
+<b>Risk</b>: <code>{{risk_total%}} (~{{loss_total}} USDT / {{stake_total}})</code>\n
 <b>Expected Fill</b>: ~{{x–xh}}\n
 <b>Trade Duration</b>: ~{{x–xd}}\n
 <b>Patience Exit</b>: ~{{xh}} no profit → exit\n
 <b>Command</b>:\n
 <code>/force{{long|short}} {{SYMBOL}} 50 3 {{tp1}} {{tp2}} {{tp3}} {{sl_final}} {{entry1}}</code>\n
+<b>Dynamic Hedge Command (reactive)</b>:\n
+<code>/hg{{opposite_side}} {{SYMBOL}} 50 3 {{tp1_hg}} {{tp2_hg}} {{tp3_hg}} {{sl_hg_final}} {{hedge_entry1}}</code>\n
 <b>📊 Metrics</b>\n
-TP1R / TP2R / TP3R: <code>{{…}} / {{…}} / {{…}}</code>\n
-E[R|win] (50/30/20): <code>{{…R}}</code>\n
-Win Prob (n, confidence): <code>{{…}}</code>\n
-EV (R): <code>{{…R}}</code>\n\n
+TP1R / TP2R / TP3R: <code>{{…}} / {{…}} / {{…}}</code>\n
+E[R|win] (50/30/20): <code>{{…R}}</code>\n
+Win Prob (n, confidence): <code>{{…}}</code>\n
+EV (R): <code>{{…R}}</code>\n\n
 
 <b>🟡 Stage 2 — Add-on Entry (Rating: Medium)</b>\n
-<b>Entry</b>: <code>{{entry2}}</code> — Retest/mid-zone (1h/4h MA20, 0.382–0.5 retrace)\n
+<b>Entry</b>: <code>{{entry2}}</code> — Retest/mid-zone (1h/4h MA20, 0.382–0.5 retrace)\n
 <b>TP1/TP2/TP3</b>: <code>{{tp1}} / {{tp2}} / {{tp3}}</code>\n
 <b>SL</b>: <code>{{sl_stage2}}</code> — 0.7×ATR buffer\n
-<b>Risk</b>: <code>{{risk_total%}} (~{{loss_total}} USDT / {{stake_total}})</code>\n
+<b>Risk</b>: <code>{{risk_total%}} (~{{loss_total}} USDT / {{stake_total}})</code>\n
 <b>Expected Fill</b>: ~{{x–xh}}\n
 <b>Trade Duration</b>: ~{{x–xd}}\n
 <b>Patience Exit</b>: ~{{xh}} no profit → exit\n
 <b>Command</b>:\n
 <code>/force{{long|short}} {{SYMBOL}} 30 3 {{tp1}} {{tp2}} {{tp3}} {{sl_final}} {{entry2}}</code>\n
+<b>Dynamic Hedge Command (reactive)</b>:\n
+<code>/hg{{opposite_side}} {{SYMBOL}} 30 3 {{tp1_hg}} {{tp2_hg}} {{tp3_hg}} {{sl_hg_final}} {{hedge_entry2}}</code>\n
 <b>📊 Metrics</b>\n
-TP1R / TP2R / TP3R: <code>{{…}} / {{…}} / {{…}}</code>\n
-E[R|win] (50/30/20): <code>{{…R}}</code>\n
-Win Prob (n, confidence): <code>{{…}}</code>\n
-EV (R): <code>{{…R}}</code>\n\n
+TP1R / TP2R / TP3R: <code>{{…}} / {{…}} / {{…}}</code>\n
+E[R|win] (50/30/20): <code>{{…R}}</code>\n
+Win Prob (n, confidence): <code>{{…}}</code>\n
+EV (R): <code>{{…R}}</code>\n\n
 
 <b>🔴 Stage 3 — Final Add (Rating: Cautious)</b>\n
 <b>Entry</b>: <code>{{entry3}}</code> — Final key support/resistance before invalidation\n
 <b>TP1/TP2/TP3</b>: <code>{{tp1}} / {{tp2}} / {{tp3}}</code>\n
-<b>SL</b>: <code>{{sl_final}}</code> — <strong>Final Hard Stop</strong> (blended entry ± ATR)\n
-<b>Risk</b>: <code>{{risk_total%}} (~{{loss_total}} USDT / {{stake_total}})</code>\n
+<b>SL</b>: <code>{{sl_final}}</code> — <strong>Final Hard Stop</strong> (blended entry ± ATR)\n
+<b>Risk</b>: <code>{{risk_total%}} (~{{loss_total}} USDT / {{stake_total}})</code>\n
 <b>Expected Fill</b>: ~{{x–xh}}\n
 <b>Trade Duration</b>: ~{{x–xd}}\n
 <b>Patience Exit</b>: ~{{xh}} no profit → exit\n
 <b>Command</b>:\n
 <code>/force{{long|short}} {{SYMBOL}} 20 3 {{tp1}} {{tp2}} {{tp3}} {{sl_final}} {{entry3}}</code>\n
+<b>Dynamic Hedge Command (reactive)</b>:\n
+<code>/hg{{opposite_side}} {{SYMBOL}} 20 3 {{tp1_hg}} {{tp2_hg}} {{tp3_hg}} {{sl_hg_final}} {{hedge_entry3}}</code>\n
 <b>📊 Metrics</b>\n
-TP1R / TP2R / TP3R: <code>{{…}} / {{…}} / {{…}}</code>\n
-E[R|win] (50/30/20): <code>{{…R}}</code>\n
-Win Prob (n, confidence): <code>{{…}}</code>\n
-EV (R): <code>{{…R}}</code>\n\n
+TP1R / TP2R / TP3R: <code>{{…}} / {{…}} / {{…}}</code>\n
+E[R|win] (50/30/20): <code>{{…R}}</code>\n
+Win Prob (n, confidence): <code>{{…}}</code>\n
+EV (R): <code>{{…R}}</code>\n\n
 
 <b>🧩 Combined Execution — Full 3-Stage Deployment</b>\n
-<b>Description</b>: Executes all three stages (<i>Initial Probe + Add-on Entry + Final Add</i>) automatically in a single command. The system will manage each entry independently as price reaches its trigger level (50 / 30 / 20 allocation).\n
+<b>Description</b>: Executes all three stages (<i>Initial Probe + Add-on Entry + Final Add</i>) automatically in a single command. The system arms each entry independently upon price reach (50 / 30 / 20 allocation).\n
 <b>Command</b>:\n
-<code>/force{{long|short}} {{SYMBOL}} {{100:stake}} {{3:lev}} {{tp1}} {{tp2}} {{tp3}} {{sl_final}} {{entry1}},{{entry2}},{{entry3}}</code>\n
+<code>/force{{long|short}} {{SYMBOL}} {{stake_total}} {{lev}} {{tp1}} {{tp2}} {{tp3}} {{sl_final}} {{entry1}},{{entry2}},{{entry3}}</code>\n
+<b>Dynamic Hedge Command (reactive, Stage-1 reference)</b>:\n
+<code>/hg{{opposite_side}} {{SYMBOL}} {{stake_total}} {{lev}} {{tp1_hg}} {{tp2_hg}} {{tp3_hg}} {{sl_hg_final}} {{hedge_entry1}}</code>\n
 
 ——————————————\n\n
 
 <b>🔁 Opposite Hedge — Three-Stage Defensive Plan</b>\n
-(Use lighter exposure; still follow 50/30/20 allocation. Main purpose = hedge risk.)\n\n
+(Use lighter exposure; still follow 50/30/20 allocation. Main purpose = hedge risk.)\n\n
 
-<b>🟢 Stage 1 — Defensive Probe</b>\n
-Entry <code>{{hedge_entry1}}</code> — Opposite key resistance/support\n
-TP1/TP2/TP3 <code>{{h_tp1}} / {{h_tp2}} / {{h_tp3}}</code>\n
-SL <code>{{h_sl1}}</code> — initial 0.8×ATR\n
-Command <code>/force{{opposite_side}} {{SYMBOL}} 50 2 {{h_tp1}} {{h_tp2}} {{h_tp3}} {{h_sl_final}} {{hedge_entry1}}</code>\n\n
+<b>🟢 Stage 1 — Defensive Probe</b>\n
+Entry <code>{{hedge_entry1}}</code> — Opposite key resistance/support\n
+TP1/TP2/TP3 <code>{{h_tp1}} / {{h_tp2}} / {{h_tp3}}</code>\n
+SL <code>{{h_sl1}}</code> — initial 0.8×ATR\n
+<b>Command</b> <code>/force{{opposite_side}} {{SYMBOL}} 50 2 {{h_tp1}} {{h_tp2}} {{h_tp3}} {{h_sl_final}} {{hedge_entry1}}</code>\n
+<b>Dynamic Hedge Command (reactive)</b> <code>/hg{{long|short}} {{SYMBOL}} 50 2 {{h_tp1_hg}} {{h_tp2_hg}} {{h_tp3_hg}} {{h_sl_hg_final}} {{hedge_reentry1}}</code>\n\n
 
-<b>🟡 Stage 2 — Add-on Hedge</b>\n
-Entry <code>{{hedge_entry2}}</code> — Mid-zone confirm break\n
-Command <code>/force{{opposite_side}} {{SYMBOL}} 30 2 {{h_tp1}} {{h_tp2}} {{h_tp3}} {{h_sl_final}} {{hedge_entry2}}</code>\n\n
+<b>🟡 Stage 2 — Add-on Hedge</b>\n
+Entry <code>{{hedge_entry2}}</code> — Mid-zone confirm break\n
+<b>Command</b> <code>/force{{opposite_side}} {{SYMBOL}} 30 2 {{h_tp1}} {{h_tp2}} {{h_tp3}} {{h_sl_final}} {{hedge_entry2}}</code>\n
+<b>Dynamic Hedge Command (reactive)</b> <code>/hg{{long|short}} {{SYMBOL}} 30 2 {{h_tp1_hg}} {{h_tp2_hg}} {{h_tp3_hg}} {{h_sl_hg_final}} {{hedge_reentry2}}</code>\n\n
 
-<b>🔴 Stage 3 — Final Defensive Add</b>\n
-Entry <code>{{hedge_entry3}}</code> — Final limit before main trend reversal\n
-SL <code>{{h_sl_final}}</code> — Final Hard Stop (hedge)\n
-Command <code>/force{{opposite_side}} {{SYMBOL}} 20 2 {{h_tp1}} {{h_tp2}} {{h_tp3}} {{h_sl_final}} {{hedge_entry3}}</code>\n
+<b>🔴 Stage 3 — Final Defensive Add</b>\n
+Entry <code>{{hedge_entry3}}</code> — Final limit before main trend reversal\n
+SL <code>{{h_sl_final}}</code> — Final Hard Stop (hedge)\n
+<b>Command</b> <code>/force{{opposite_side}} {{SYMBOL}} 20 2 {{h_tp1}} {{h_tp2}} {{h_tp3}} {{h_sl_final}} {{hedge_entry3}}</code>\n
+<b>Dynamic Hedge Command (reactive)</b> <code>/hg{{long|short}} {{SYMBOL}} 20 2 {{h_tp1_hg}} {{h_tp2_hg}} {{h_tp3_hg}} {{h_sl_hg_final}} {{hedge_reentry3}}</code>\n
 <b>📊 Metrics</b>\n
-TP1R/TP2R/TP3R <code>{{…}} / {{…}} / {{…}}</code>\n
-Win Prob: <code>Heuristic, Low confidence</code>\n
-EV (R): <code>{{…R}}</code>\n\n
+TP1R/TP2R/TP3R <code>{{…}} / {{…}} / {{…}}</code>\n
+Win Prob: <code>Heuristic, Low confidence</code>\n
+EV (R): <code>{{…R}}</code>\n\n
 
-<b>🧩 Combined Execution — Full 3-Stage Deployment</b>\n
-<b>Description</b>: Executes all three stages (<i>Initial Probe + Add-on Entry + Final Add</i>) automatically in a single command. The system will manage each entry independently as price reaches its trigger level (50 / 30 / 20 allocation).\n
+<b>🧩 Combined Execution — Full 3-Stage Deployment (Hedge)</b>\n
+<b>Description</b>: Mirrors the main plan on the opposite side with lighter exposure. All three hedge entries are armed in one command (50 / 30 / 20). Includes a reactive Dynamic Hedge based on Stage 1’s breakout reference.\n
 <b>Command</b>:\n
-<code>/force{{opposite_side}} {{SYMBOL}} {{100:stake}} {{3:lev}} {{h_tp1}} {{h_tp2}} {{h_tp3}} {{h_sl_final}} {{hedge_entry1}},{{hedge_entry2}},{{hedge_entry3}}</code>\n
+<code>/force{{opposite_side}} {{SYMBOL}} {{stake_total}} {{lev}} {{h_tp1}} {{h_tp2}} {{h_tp3}} {{h_sl_final}} {{hedge_entry1}},{{hedge_entry2}},{{hedge_entry3}}</code>\n
+<b>Dynamic Hedge Command (reactive, Stage-1 reference)</b>:\n
+<code>/hg{{long|short}} {{SYMBOL}} {{stake_total}} {{lev}} {{h_tp1_hg}} {{h_tp2_hg}} {{h_tp3_hg}} {{h_sl_hg_final}} {{hedge_reentry1}}</code>\n
 
 ——————————————\n\n
 
