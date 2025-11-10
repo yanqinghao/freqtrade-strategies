@@ -76,6 +76,7 @@ class KamaFama_Dynamic(IStrategy):
     # 固定点位监控
     coin_monitoring = {}
     manual_open = {}
+    hedge_open = {}
 
     # For price monitoring notifications
     monitoring_notification_sent = {}
@@ -209,6 +210,9 @@ class KamaFama_Dynamic(IStrategy):
 
             if 'manual_open' in state_data:
                 self.manual_open = state_data['manual_open']
+
+            if 'hedge_open' in state_data:
+                self.hedge_open = state_data['hedge_open']
 
             # 加载并处理固定点位监控配置
             if 'coin_monitoring' in state_data:
@@ -2347,6 +2351,87 @@ class KamaFama_Dynamic(IStrategy):
         ) is None or trade.stake_amount != trade.get_custom_data('initial_stake'):
             trade.set_custom_data('initial_stake', trade.stake_amount)
 
+        # === 新增：初始化/维护 entry_stage（首段视为已完成=1） ===
+        if trade.get_custom_data('entry_stage') is None:
+            trade.set_custom_data('entry_stage', 1)
+
+        # === 新增：基于 entries 的分段推进（不依赖盈亏，只看下一阶段价格 + 约束）===
+        # - 数据来源优先 manual_open，其次 hedge_open
+        # - 分配规则：3段=50/30/20；2段=60/40；1段=100
+        # - 价格触发：long 到价/更低 或 相对价差<=阈值；short 到价/更高 或 相对价差<=阈值
+        try:
+            cfg = (self.manual_open or {}).get(pair)
+            entries = cfg.get('entries') or []
+            base_size = float(cfg.get('size') or 0.0)
+        except Exception:
+            cfg, entries, base_size = {}, [], 0.0
+
+        if entries and base_size > 0:
+            # 当前已完成阶段（首段记为1），下一段索引 = entry_stage（entries 从0开始）
+            es = int(trade.get_custom_data('entry_stage') or 1)
+            next_idx = es
+            if 0 <= next_idx < len(entries):
+                next_price = entries[next_idx]  # 可为 None 表示市价段
+                cur = float(current_rate)
+                gap_ratio = getattr(self, 'ENTRY_GAP_MAX_RATIO', 0.0005)  # 0.05%
+
+                def _should_trigger(dirn: str, curp: float, nxp) -> bool:
+                    if nxp is None:
+                        return True
+                    nxp = float(nxp)
+                    if dirn == 'long':
+                        crossed = curp <= nxp
+                    else:
+                        crossed = curp >= nxp
+                    close_ok = abs(curp - nxp) / max(abs(nxp), 1e-9) <= gap_ratio
+                    return crossed or close_ok
+
+                if _should_trigger(direction, cur, next_price):
+                    # 分配权重
+                    n = len(entries)
+                    if n == 3:
+                        allocs = [50, 30, 20]
+                    elif n == 2:
+                        allocs = [60, 40]
+                    elif n <= 1:
+                        allocs = [100]
+                    else:
+                        base = 100 // n
+                        allocs = [base] * n
+                        allocs[0] += 100 - base * n
+
+                    # 本阶段计划金额
+                    plan_amt = base_size * (allocs[next_idx] / 100.0)
+                    dca_amount = float(plan_amt)
+
+                    # === 严格约束：不超过 1000、遵守 min/max_stake ===
+                    # 先限制“总额不超过1000”
+                    if trade.stake_amount + dca_amount > 1000:
+                        dca_amount = max(0.0, 1000 - trade.stake_amount)
+
+                    # 再套 min/max（和你下方保持一致）
+                    if min_stake and dca_amount < min_stake:
+                        if trade.stake_amount + min_stake > 1000:
+                            dca_amount = 0.0
+                        else:
+                            dca_amount = float(min_stake)
+                    if dca_amount > max_stake:
+                        dca_amount = float(max_stake)
+
+                    if dca_amount > 0:
+                        # 记录 pending（与原有 pending_dca_amount 机制对齐）
+                        trade.set_custom_data('last_stake_amount', trade.stake_amount)
+                        trade.set_custom_data('pending_dca_amount', dca_amount)
+                        # 补仓成功后由下方“检查并更新补仓后的initial_stake”区块把 entry_stage 提升
+                        trade.set_custom_data('pending_entry_stage', es + 1)
+
+                        tag = f"{direction}_entries_stage_{next_idx}"
+                        logger.info(
+                            f"{pair} entries触发: stage={es}->{es+1}, idx={next_idx}, "
+                            f"cur={cur}, next={next_price}, amount={dca_amount}, alloc={allocs[next_idx]}%, base={base_size}"
+                        )
+                        return dca_amount, tag
+
         if trade.enter_tag and 'manual' in trade.enter_tag:
             manual_cfg = self.manual_open.get(trade.pair, {})
             sl_price = manual_cfg.get('stop_loss')
@@ -2745,6 +2830,12 @@ class KamaFama_Dynamic(IStrategy):
                 trade.set_custom_data('last_stake_amount', 0)
                 trade.set_custom_data('pending_dca_amount', 0)
                 logger.info(f"{pair}: 补仓后更新initial_stake为 {trade.stake_amount}")
+
+                # === 新增：若存在 pending_entry_stage，则将 entry_stage 前进并清空 pending ===
+                pes = trade.get_custom_data('pending_entry_stage')
+                if pes is not None:
+                    trade.set_custom_data('entry_stage', int(pes))
+                    trade.set_custom_data('pending_entry_stage', None)
 
                 # 新增: 补仓成功后，重新计算止盈点位
                 direction = 'short' if trade.is_short else 'long'

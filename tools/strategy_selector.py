@@ -100,6 +100,7 @@ def main(threshold=-50):
 
     coin_monitoring = strategy_state['coin_monitoring']
     manual_open = strategy_state['manual_open']
+    hedge_open = strategy_state['hedge_open']
     price_range_thresholds = strategy_state['price_range_thresholds']
 
     # Parse the data
@@ -110,7 +111,12 @@ def main(threshold=-50):
     strategies = select_strategies(long_data, short_data, threshold=threshold)
 
     pairs = list(
-        set(list(strategies.keys()) + list(coin_monitoring.keys()) + list(manual_open.keys()))
+        set(
+            list(strategies.keys())
+            + list(coin_monitoring.keys())
+            + list(manual_open.keys())
+            + list(hedge_open.keys())
+        )
     )
 
     # Build the output JSON
@@ -121,6 +127,7 @@ def main(threshold=-50):
         'coin_monitoring': coin_monitoring,
         'price_range_thresholds': price_range_thresholds,
         'manual_open': manual_open,
+        'hedge_open': hedge_open,
     }
 
     # Print to console

@@ -82,6 +82,25 @@ logger = logging.getLogger(__name__)
 
 logger.debug('Included module rpc.telegram ...')
 
+def _parse_price_list(token: str) -> list[float | None]:
+    parts = [p.strip() for p in str(token).split(',')]
+    out: list[float | None] = []
+    for p in parts:
+        if p == '' or p.lower() in ('none', 'null', 'market'):
+            out.append(None)
+        else:
+            out.append(float(p))
+    return out
+
+def _allocations_for(n: int) -> list[int]:
+    if n == 3: return [50, 30, 20]
+    if n == 2: return [60, 40]
+    if n <= 1: return [100]
+    base = 100 // n
+    arr = [base] * n
+    arr[0] += 100 - base * n
+    return arr
+
 def _parse_overrides(args):
     """解析 open_rate=xxx amount=xxx stake_amount=xxx"""
     out = {}
@@ -376,6 +395,7 @@ class Telegram(RPCHandler):
         self._pending_force: dict[tuple[int, int], dict] = {}
         self._pending_manual_edit: dict[tuple[int, int], dict] = {}
         self._pending_monitor_edit: dict[tuple[int, int], dict] = {}
+        self._pending_hedge_edit: dict[tuple[int, int], dict] = {}
 
     def _start_thread(self):
         """
@@ -464,6 +484,9 @@ class Telegram(RPCHandler):
             r'/fx$',
             r'/rtd$',
             r'/st$',
+            r'/hglong$',
+            r'/hgshort$',
+            r'/hedge$',
         ]
         # Create keys for generation
         valid_keys_print = [k.replace('$', '') for k in valid_keys]
@@ -515,11 +538,16 @@ class Telegram(RPCHandler):
             CommandHandler(['forcesell', 'forceexit', 'fx'], self._force_exit),
             CommandHandler(
                 ['forcebuy', 'forcelong'],
-                partial(self._force_enter, order_side=SignalDirection.LONG),
+                partial(self._force_enter, order_side=SignalDirection.LONG, is_hedge=False),
             ),
             CommandHandler(
-                'forceshort', partial(self._force_enter, order_side=SignalDirection.SHORT)
+                'forceshort', partial(self._force_enter, order_side=SignalDirection.SHORT, is_hedge=False)
             ),
+            # hedge：只写配置，不下单
+            CommandHandler('hglong',
+                partial(self._force_enter, order_side=SignalDirection.LONG, is_hedge=True)),
+            CommandHandler('hgshort',
+                partial(self._force_enter, order_side=SignalDirection.SHORT, is_hedge=True)),
             CommandHandler('reload_trade', self._reload_trade_from_exchange),
             CommandHandler('trades', self._trades),
             CommandHandler('delete', self._delete_trade),
@@ -565,6 +593,7 @@ class Telegram(RPCHandler):
             CommandHandler('showpairstrategy', self._show_pair_strategy),
             CommandHandler('manualopen', self._manual_open),
             CommandHandler('manual', self._manual_open),
+            CommandHandler('hedge', self._hedge_open),
             CommandHandler('monitor', self._monitor_list),
             CommandHandler('monitoring', self._monitor_list),
             CommandHandler('setmanual', self._set_manual),
@@ -597,6 +626,10 @@ class Telegram(RPCHandler):
             CallbackQueryHandler(self._monitor_list, pattern='update_monitor_list'),
             CallbackQueryHandler(self._monitor_view, pattern=r'monitor_select__.+'),
             CallbackQueryHandler(self._monitor_edit_inline, pattern=r'monitor_edit__.+'),
+            CallbackQueryHandler(self._hedge_open,        pattern='update_hedge_list'),
+            CallbackQueryHandler(self._hedge_open_view,   pattern=r'hedge_select__.+'),
+            CallbackQueryHandler(self._hedge_edit_inline, pattern=r'hedge_edit__.+'),
+            CallbackQueryHandler(self._hedge_delete,      pattern=r'hedge_delete__.+'),
             CallbackQueryHandler(self._ai_pagination_handler, pattern=r'^ai_(page|copy):'),
         ]
         for handle in handles:
@@ -1701,6 +1734,283 @@ class Telegram(RPCHandler):
                 else:
                     await query.edit_message_text(text=f"Trade {trade_id} not found.")
 
+
+    @authorized_only
+    async def _hedge_open(self, update: Update, context: CallbackContext) -> None:
+        """
+        列出所有 hedge_open 的对冲配置，点击进入详情
+        """
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        data = st.get('hedge_open', {}) or {}
+        if not data:
+            await self._send_msg('当前没有对冲配置（hedge_open）。')
+            return
+
+        buttons = []
+        for pair, v in sorted(data.items()):
+            side = v.get('direction', 'long')
+            ep = v.get('entry_price') or v.get('entries')[0] if v.get('entries') else None
+            ep_txt = f"{ep}" if isinstance(ep, (int, float)) else '—'
+            btn_text = f"{pair} [hedge:{side}] EP:{ep_txt}"
+            buttons.append(
+                InlineKeyboardButton(text=btn_text, callback_data=f"hedge_select__{pair}")
+            )
+        rows = self._layout_inline_keyboard(buttons, cols=1)
+        rows.append([InlineKeyboardButton(text='刷新', callback_data='update_hedge_list')])
+
+        await self._send_msg(
+            '请选择一个对冲配置查看 / 编辑：',
+            keyboard=rows,
+            query=getattr(update, 'callback_query', None),
+        )
+
+    @authorized_only
+    async def _hedge_open_view(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        _, pair = query.data.split('__', 1)
+
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        it = (st.get('hedge_open', {}) or {}).get(pair)
+        if not it:
+            await self._send_msg('未找到该对冲配置（可能已被删除）。', query=query)
+            return
+
+        side = it.get('direction', 'long')
+        size = it.get('size', 0)
+        lev  = it.get('leverage', 1)
+        ep   = it.get('entry_price')
+        eps  = it.get('entries') or []
+        tps  = it.get('exit_points') or []
+        sl   = it.get('stop_loss')
+        ts   = it.get('timestamp')
+        ts   = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else '—'
+
+        def fmt_list(a):
+            if not a:
+                return '（未设）'
+            out = []
+            for x in a:
+                out.append('—' if x is None else f'{x:g}')
+            return escape(', '.join(out))
+
+        # 所有插值 escape
+        pair_e = escape(pair)
+        side_e = escape(str(side))
+        size_e = escape(f'{size:g}')
+        lev_e  = escape(f'{lev:g}')
+        ep_e   = escape('—' if ep is None else f'{ep:g}')
+        eps_e  = fmt_list(eps)
+        tps_e  = fmt_list(tps)
+        sl_e   = escape('（未设）' if sl is None else f'{sl:g}')
+        ts_e   = escape(ts)
+
+        # ✅ 不使用 <br>，全部用 \n
+        msg = (
+            f"🛡 <b>{pair_e}</b> 对冲配置\n"
+            f"• 方向：<code>{side_e}</code>   • 仓位：<code>{size_e}</code>   • 杠杆：<code>{lev_e}</code>\n"
+            f"• 最新 entry_price：<code>{ep_e}</code>\n"
+            f"• entries（多点位）：<code>{eps_e}</code>\n"
+            f"• TP1/2/3：<code>{tps_e}</code>\n"
+            f"• SL：<code>{sl_e}</code>\n"
+            f"• 更新时间：<code>{ts_e}</code>\n\n"
+            f"<b>修改方法（回消息）：</b>\n"
+            f"1）五值（单入场）：<code>entry tp1 tp2 tp3 sl</code>\n"
+            f"2）键值对：<code>entries=...</code>（或 <code>ep=</code> 支持多值，逗号分隔/[]） "
+            f"<code>tp=...</code> / <code>tp1=</code>/<code>tp2=</code>/<code>tp3=</code> <code>sl=</code>\n"
+            f"   例：<code>entries=[100750,99550,98250] tp=103050,104350,105850 sl=97450</code>\n"
+            f"⚠ 对冲不会立即下单，机器人在运行中自行判断是否开启。"
+        )
+
+        kb = [
+            [InlineKeyboardButton('✏️ 修改参数', callback_data=f"hedge_edit__{pair}")],
+            [InlineKeyboardButton('🗑 删除对冲配置', callback_data=f"hedge_delete__{pair}")],
+            [InlineKeyboardButton('⬅️ 返回列表', callback_data='update_hedge_list')],
+            [InlineKeyboardButton('🔁 刷新本页', callback_data=f"hedge_select__{pair}")],
+        ]
+
+        await self._send_msg(msg, parse_mode=ParseMode.HTML, keyboard=kb, query=query)
+
+
+    @authorized_only
+    async def _hedge_edit_inline(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        _, pair = query.data.split('__', 1)
+
+        key = (query.message.chat_id, query.from_user.id)
+        if not hasattr(self, '_pending_hedge_edit'):
+            self._pending_hedge_edit = {}
+        self._pending_hedge_edit[key] = {'pair': pair, 'ts': time.time()}
+
+        tip = (
+            '请回复新的参数以更新对冲配置：\n'
+            '• 五值（单入场）：`entry tp1 tp2 tp3 sl`\n'
+            '• 或键值对：`entries=...`（或 `ep=` 支持多值） `tp=...`/`tp1=`/`tp2=`/`tp3=` `sl=`\n'
+            '示例：\n'
+            '  `entries=[100750,99550,98250] tp=103050,104350,105850 sl=97450`\n'
+            '  `100750 103050 104350 105850 97450`\n'
+            '⚠ 注意：对冲只写配置，不会立即下单。'
+        )
+        await query.message.reply_text(tip, parse_mode=ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
+
+    @authorized_only
+    async def on_hedge_edit_reply(self, update: Update, context: CallbackContext) -> None:
+        msg = update.message
+        key = (msg.chat_id, msg.from_user.id)
+        pending = getattr(self, '_pending_hedge_edit', {}).get(key)
+        if not pending:
+            return
+
+        # 超时 3 分钟
+        if time.time() - pending['ts'] > 180:
+            self._pending_hedge_edit.pop(key, None)
+            await msg.reply_text('编辑已超时，请重新点击“✏️ 修改参数”。')
+            return
+
+        pair = pending['pair']
+
+        # 读取当前
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+        current = (st.get('hedge_open', {}) or {}).get(pair)
+        if not current:
+            self._pending_hedge_edit.pop(key, None)
+            await msg.reply_text('未找到该对冲配置，可能已被删除。')
+            return
+
+        try:
+            # 解析输入（沿用你已有的解析器）
+            entry_price, tps, sl = self._parse_edit_input(msg.text, current)
+
+            # 读取旧值（保留 size/lev/方向）
+            size = float(current.get('size', 0))
+            lev  = float(current.get('leverage', 1))
+            side = SignalDirection(current.get('direction', 'long'))
+
+            # TP 清洗与排序（long 升序 / short 降序），不足 3 个用旧值补齐
+            tps_clean = [x for x in tps if x is not None]
+            if len(tps_clean) != 3:
+                old = current.get('exit_points', [])
+                while len(tps_clean) < 3 and len(old) > len(tps_clean):
+                    tps_clean.append(old[len(tps_clean)])
+                if len(tps_clean) != 3:
+                    raise ValueError('TP 数量不足（需要 3 个）。')
+            tps_clean = sorted(tps_clean, reverse=(side == SignalDirection.SHORT))
+
+            # entries：从 free-text 中抽。优先 ep= / entries= / 五值第一位
+            entries = self._extract_entries_from_text(msg.text, fallback_entry=entry_price)
+
+            # 保存（仅写配置，不会触发下单）
+            await self._update_manual_trade_config(
+                pair, size, lev, tps_clean, float(sl), side,
+                entry_price=entry_price, is_update=True, is_hedge=True, entries=entries
+            )
+
+            await msg.reply_text('对冲配置已更新 ✅')
+
+            # 回到详情页
+            class _Q:
+                pass
+            q = _Q()
+            q.data = f"hedge_select__{pair}"
+            q.message = msg
+            fake_cb = Update(update.update_id, callback_query=q)
+            await self._hedge_open_view(update=fake_cb, context=context)
+
+        except Exception as e:
+            await msg.reply_text(f'解析或保存失败：{e}\n'
+                                '示例：`100750 103050 104350 105850 97450` 或 `entries=[100750,99550] tp=103050,104350,105850 sl=97450`',
+                                parse_mode=ParseMode.MARKDOWN)
+        finally:
+            self._pending_hedge_edit.pop(key, None)
+
+    def _extract_entries_from_text(self, text: str, fallback_entry: float | None) -> list[float | None]:
+        """
+        支持 entries=[a,b] / ep=a,b / 五值第一位 / 'null'/'market' 视为 None
+        """
+        s = text.strip().lower()
+        # entries=[...]
+        m = re.search(r'entries\s*=\s*\[([^\]]*)\]', s)
+        if m:
+            items = [x.strip() for x in m.group(1).split(',') if x.strip()!='']
+            out = []
+            for x in items:
+                if x in ('null', 'none', 'market'): out.append(None)
+                else: out.append(float(x))
+            return out
+
+        # ep=a,b,c
+        m = re.search(r'\b(ep|entries)\s*=\s*([^\s\]]+)', s)
+        if m:
+            seq = m.group(2).strip().strip('[]')
+            items = [x.strip() for x in seq.split(',') if x.strip()!='']
+            out = []
+            for x in items:
+                if x in ('null','none','market'): out.append(None)
+                else: out.append(float(x))
+            return out
+
+        # 五值（entry tp1 tp2 tp3 sl）
+        toks = re.split(r'[\s,]+', s)
+        if len(toks) >= 1:
+            try:
+                first = toks[0]
+                if first in ('null','none','market'):
+                    return [None]
+                return [float(first)]
+            except Exception:
+                pass
+
+        # 兜底：如果有 fallback_entry，就用它作为单一 entries
+        return [fallback_entry] if fallback_entry is not None else []
+
+    @authorized_only
+    async def _hedge_delete(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        _, pair = query.data.split('__', 1)
+
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        hedge = st.get('hedge_open', {}) or {}
+        if pair not in hedge:
+            await self._send_msg(f'{pair} 的对冲配置不存在或已删除。', query=query)
+            return
+
+        # 删除并落盘
+        hedge.pop(pair, None)
+        st['hedge_open'] = hedge
+        with open(state_file, 'w') as f:
+            json.dump(st, f, indent=4)
+
+        # 同步内存
+        if hasattr(self._rpc._freqtrade, 'strategy'):
+            self._rpc._freqtrade.strategy.hedge_open = hedge
+
+        await self._send_msg(f'已删除 {pair} 的对冲配置。', query=query)
+
+        # 返回列表
+        await self._hedge_open(update=update, context=context)
+
     @authorized_only
     async def _manual_open(self, update: Update, context: CallbackContext) -> None:
         """
@@ -1900,6 +2210,11 @@ class Telegram(RPCHandler):
         # ② /monitor 编辑其次
         if getattr(self, '_pending_monitor_edit', None) and self._pending_monitor_edit.get(key):
             await self.on_monitor_edit_reply(update, context)
+            return
+
+        # ④ hedge 编辑
+        if getattr(self, '_pending_hedge_edit', None) and self._pending_hedge_edit.get(key):
+            await self.on_hedge_edit_reply(update, context)
             return
 
         # ③ 手动开单参数填写
@@ -2462,13 +2777,19 @@ class Telegram(RPCHandler):
         tps: list[float],
         sl: float | None,
         order_side: SignalDirection,
-        entry_price: float | None = None,   # 既有：新增记录
-        raw_submission: dict | None = None, # 新增：用于存放本次提交的原始内容
-        is_update: bool = False,          # 预留：未来可区分更新或新增
+        entry_price: float | None = None,   # 既有：新增记录/或继承旧值
+        raw_submission: dict | None = None, # 既有
+        is_update: bool = False,            # 既有
+        # ==== 新增：保持默认不动老逻辑 ====
+        is_hedge: bool = False,                     # 新增：对冲写入 hedge_open，默认 False
+        entries: list[float | None] | None = None,  # 新增：极简多点位数组（可含 None 表示市价）
     ):
         """
-        Updates strategy_state.json with manual trade configuration.
-        - 若当前有未平仓单，则在 manual_open[pair] 下追加 'scale_in' 记录（不改变当前主字段）。
+        Updates strategy_state.json with manual/hedge trade configuration.
+        - 若当前有未平仓单：在 <root_key>[pair] 下追加 'scale_in'（不改主字段）。
+        - 若无未平仓单：写/更新主字段（保留 entry_price 继承）。
+        - root_key = 'manual_open'（默认）或 'hedge_open'（is_hedge=True）。
+        - 完全保留原有行为；仅新增 entries/is_hedge 能力。
         """
         state_file = 'user_data/strategy_state_production.json'
 
@@ -2478,101 +2799,170 @@ class Telegram(RPCHandler):
         except (FileNotFoundError, json.JSONDecodeError):
             strategy_state = {}
 
-        if 'manual_open' not in strategy_state:
-            strategy_state['manual_open'] = {}
+        root_key = 'hedge_open' if is_hedge else 'manual_open'
+        if root_key not in strategy_state:
+            strategy_state[root_key] = {}
 
-        if is_update and pair not in strategy_state['manual_open']:
-            raise ValueError(f"No existing manual_open entry for {pair} to update.")
-        if is_update and pair in strategy_state['manual_open']:
-            logger.info(f"Updating existing manual_open entry for {pair}.")
-            strategy_state['manual_open'][pair] = {
+        # 旧值（用于继承 entry_price / entries / scale_in）
+        old = strategy_state[root_key].get(pair, {})
+
+        if is_update and pair not in strategy_state[root_key]:
+            raise ValueError(f"No existing {root_key} entry for {pair} to update.")
+        if is_update and pair in strategy_state[root_key]:
+            # ======= 保持你原来的“更新主字段”逻辑 =======
+            logger.info(f"Updating existing {root_key} entry for {pair}.")
+            strategy_state[root_key][pair] = {
                 'size': size,
                 'leverage': leverage,
-                'entry_price': entry_price,
-                'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)) if tps else [],
+                'entry_price': entry_price if entry_price is not None else old.get('entry_price'),
+                'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)) if tps else (old.get('exit_points') or []),
                 'stop_loss': sl,  # 可以为 None
                 'direction': order_side.value,
                 'timestamp': datetime.now().timestamp(),  # 避免陈旧
+                # 兼容：若传了 entries 就更新；否则保留旧 entries
+                **({'entries': entries} if entries else ({'entries': old.get('entries')} if 'entries' in old else {})),
+                # 保留旧的 scale_in（如果有）
+                **({'scale_in': old.get('scale_in')} if 'scale_in' in old else {}),
             }
         else:
-            # ===== 新增：如果当前存在未平仓单，则追加 scale_in 记录 =====
+            # ======= 新增/覆盖主字段 或 仅追加 scale_in（保留老逻辑） =======
             try:
-                if self._has_open_trade(pair):
-                    payload = {
-                        'ts': datetime.now().timestamp(),
-                        'request': {
-                            'size': size,
-                            'leverage': leverage,
-                            'entry_price': entry_price,
-                            'tps': tps or [],
-                            'sl': sl,
-                            'direction': order_side.value,
-                        }
-                    }
-                    # 附带原始提交（更完整可追溯）
-                    if raw_submission:
-                        payload['raw'] = raw_submission
+                has_open = self._has_open_trade(pair)
+            except Exception:
+                has_open = False
 
-                    mo = strategy_state['manual_open'].setdefault(pair, {})
-                    mo['scale_in'] = payload
-                else:
-                    # 主字段：保持你既有逻辑（覆盖/写入）
-                    strategy_state['manual_open'][pair] = {
+            if has_open and is_hedge:
+                # ---- A) 有未平仓单：只追加 scale_in，不动主字段（保留你的老逻辑） ----
+                payload = {
+                    'ts': datetime.now().timestamp(),
+                    'request': {
                         'size': size,
                         'leverage': leverage,
-                        'entry_price': entry_price,
-                        'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)) if tps else [],
-                        'stop_loss': sl,  # 可以为 None
+                        'entry_price': entry_price,  # 仅记录本次请求；真实成交后你有回写
+                        'tps': tps or [],
+                        'sl': sl,
                         'direction': order_side.value,
-                        'timestamp': datetime.now().timestamp(),  # 避免陈旧
+                        # 新增：把 entries 也带入 scale_in（可选，便于多点位补仓）
+                        'entries': entries or [],
                     }
-            except Exception:
-                # scale_in 失败不影响主流程
-                logger.exception('Append scale_in failed.')
-                # 主字段：保持你既有逻辑（覆盖/写入）
-                strategy_state['manual_open'][pair] = {
+                }
+                if raw_submission:
+                    payload['raw'] = raw_submission
+
+                mo = strategy_state[root_key].setdefault(pair, {})
+                mo['scale_in'] = payload  # ★ 保持你原来“单条 scale_in”语义
+                # 不覆盖任何主字段
+                strategy_state[root_key][pair] = mo
+
+            else:
+                # ---- B) 无未平仓单：写主字段（完全保留你既有逻辑） ----
+                base = {
                     'size': size,
                     'leverage': leverage,
-                    'entry_price': entry_price,
-                    'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)) if tps else [],
+                    'entry_price': entry_price if entry_price is not None else old.get('entry_price'),
+                    'exit_points': sorted(tps, reverse=(order_side == SignalDirection.SHORT)) if tps else (old.get('exit_points') or []),
                     'stop_loss': sl,  # 可以为 None
                     'direction': order_side.value,
                     'timestamp': datetime.now().timestamp(),  # 避免陈旧
                 }
+                # 新增：如有 entries，用极简数组写入；否则保留旧 entries
+                if entries is not None and len(entries) > 0:
+                    base['entries'] = entries
+                elif 'entries' in old:
+                    base['entries'] = old['entries']
 
+                # 保留旧的 scale_in（若之前写过）
+                if 'scale_in' in old:
+                    base['scale_in'] = old['scale_in']
+
+                strategy_state[root_key][pair] = base
+
+        # ---- 落盘 ----
         with open(state_file, 'w') as f:
             json.dump(strategy_state, f, indent=4)
 
-        # Update in-memory strategy attribute
+        # ---- 同步内存（保持你的老逻辑）----
         if hasattr(self._rpc._freqtrade, 'strategy'):
-            self._rpc._freqtrade.strategy.manual_open = strategy_state['manual_open']
+            setattr(self._rpc._freqtrade.strategy, root_key, strategy_state[root_key])
 
-        logger.info(f"Updated manual trade config for {pair} in {state_file} and in-memory.")
+        logger.info(f"Updated {root_key} for {pair} in {state_file} and in-memory.")
         await self._send_msg(
-            f"Manual trade config for {pair} has been set. The strategy will pick it up on the next tick."
+            f"{'HEDGE' if is_hedge else 'Manual'} trade config for {pair} has been set. The strategy will pick it up on the next tick."
         )
 
-        # 获取当前白名单（保留原逻辑）
+        # ---- 白名单（保留你的老逻辑）----
         current_whitelist = self._rpc._rpc_whitelist()['whitelist']
-
         if pair in current_whitelist:
             await self._send_msg(f'交易对 {pair} 已在当前白名单中')
         else:
             with open('/freqtrade/config_production.json', 'r') as f:
                 config = json.load(f)
-
             config['exchange']['pair_whitelist'].append(pair)
-
             with open('/freqtrade/config_production.json', 'w') as f:
                 json.dump(config, f, indent=4)
-
             self._rpc._rpc_reload_config()
             await self._send_msg(f'交易对 {pair} 已加入白名单')
 
 
     @authorized_only
-    async def _force_enter(self, update: Update, context: CallbackContext, order_side: SignalDirection) -> None:
+    async def _force_enter(self, update: Update, context: CallbackContext, order_side: SignalDirection, is_hedge: bool=False) -> None:
         args = context.args or []
+
+        if len(args) >= 8:
+            try:
+                pair = _normalize_pair(args[0])
+                size = float(args[1])
+                leverage = float(args[2])
+                tp1, tp2, tp3 = float(args[3]), float(args[4]), float(args[5])
+                sl = float(args[6])
+                entries = _parse_price_list(args[7])
+
+                # 写配置（注意：entry_price 参数不传 -> 继承旧值）
+                await self._update_manual_trade_config(
+                    pair=pair, size=size, leverage=leverage,
+                    tps=[tp1, tp2, tp3], sl=sl, order_side=order_side,
+                    entry_price=None,
+                    raw_submission={'mode': 'full_args_entries', 'args': args},
+                    is_update=False, is_hedge=is_hedge, entries=entries,
+                )
+
+                if is_hedge:
+                    await self._send_msg(f"{pair} 对冲计划已写入（entries={len(entries)}）。由策略自动判断是否开启。")
+                    return
+
+                # === 主方向首段执行 ===
+                allocs = _allocations_for(len(entries))
+                if not entries:
+                    await self._send_msg(f"{pair} entries 为空，已仅写入配置，不执行下单。")
+                    return
+
+                price0 = entries[0]
+                stake0 = round(size * allocs[0] / 100.0, 8)
+
+                if price0 is None:
+                    # 市价首段
+                    await self._force_enter_action(
+                        pair, None, order_side,
+                        stake_amount=stake0, leverage=leverage,
+                        enter_tag=('manual_' + order_side.value)
+                    )
+                    # entry_price 由成交回调 set_entry_price() 更新
+                    await self._send_msg(f"{pair} 第一段【市价】已执行（{allocs[0]}%），其余段位仅写配置等待触发。")
+                else:
+                    # 限价首段（价格必须为数值）
+                    p0 = float(price0)
+                    await self._force_enter_action(
+                        pair, p0, order_side,
+                        stake_amount=stake0, leverage=leverage,
+                        enter_tag=('manual_' + order_side.value)
+                    )
+                    await self._send_msg(f"{pair} 第一段【限价 {p0}】已挂单（{allocs[0]}%），其余段位仅写配置等待触发。")
+
+                return
+            except Exception as e:
+                await self._send_msg(f"参数或下单错误（entries）：{e}")
+                logger.exception('Error in _force_enter (entries)')
+                return
 
         # ===== A) 全参：<pair> <size> <lev> <tp1> <tp2> <tp3> <sl> [price] -> 保持原逻辑 =====
         if len(args) >= 7:

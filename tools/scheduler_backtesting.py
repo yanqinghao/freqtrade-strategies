@@ -462,6 +462,9 @@ class FreqtradeScheduler:
 
             print('每日任务执行完成')
         except Exception as e:
+            import traceback
+
+            traceback.print_exc()
             error_message = f"每日任务执行失败: {str(e)}"
             print(error_message)
             self.send_telegram_message(error_message)
