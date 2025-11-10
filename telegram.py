@@ -626,6 +626,7 @@ class Telegram(RPCHandler):
             CallbackQueryHandler(self._monitor_list, pattern='update_monitor_list'),
             CallbackQueryHandler(self._monitor_view, pattern=r'monitor_select__.+'),
             CallbackQueryHandler(self._monitor_edit_inline, pattern=r'monitor_edit__.+'),
+            CallbackQueryHandler(self._monitor_recalculate_inline, pattern=r'monitor_recalculate__.+'),
             CallbackQueryHandler(self._hedge_open,        pattern='update_hedge_list'),
             CallbackQueryHandler(self._hedge_open_view,   pattern=r'hedge_select__.+'),
             CallbackQueryHandler(self._hedge_edit_inline, pattern=r'hedge_edit__.+'),
@@ -2478,6 +2479,7 @@ class Telegram(RPCHandler):
 
         kb = [
             [InlineKeyboardButton('✏️ 修改参数', callback_data=f"monitor_edit__{pair}__{idx}")],
+            [InlineKeyboardButton('⚙️ 重新计算', callback_data=f"monitor_recalculate__{pair}__{idx}")],
             [InlineKeyboardButton('⬅️ 返回列表', callback_data='update_monitor_list')],
             [InlineKeyboardButton('🔁 刷新本页', callback_data=f"monitor_select__{pair}__{idx}")],
         ]
@@ -2516,6 +2518,17 @@ class Telegram(RPCHandler):
             '  `71000 72000 73500 75000 69500`'
         )
         await query.message.reply_text(tip, parse_mode=ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
+
+    @authorized_only
+    async def _monitor_recalculate_inline(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        _, pair, idx_s = query.data.split('__', 2)
+        idx = int(idx_s)
+        for config in self._rpc._freqtrade.strategy.coin_monitoring[pair]:
+            config['auto_initialized'] = False
+        self._rpc._freqtrade.strategy.reload_coin_monitoring(pair)
+        await self._send_msg('已更新 ✅')
+
 
     @authorized_only
     async def _monitor_list(self, update: Update, context: CallbackContext) -> None:
