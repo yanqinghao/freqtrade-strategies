@@ -12,3 +12,4 @@ COPY pagination_utils.py /freqtrade/freqtrade/freqllm/pagination_utils.py
 COPY html_sanitizer.py /freqtrade/freqtrade/freqllm/html_sanitizer.py
 COPY key_level_agent.py /freqtrade/freqtrade/freqllm/key_level_agent.py
 COPY db_manager.py /freqtrade/freqtrade/freqllm/db_manager.py
+COPY hedge_manager.py /freqtrade/freqtrade/rpc/hedge_manager.py

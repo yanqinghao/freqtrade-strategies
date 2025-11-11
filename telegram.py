@@ -2844,7 +2844,7 @@ class Telegram(RPCHandler):
             except Exception:
                 has_open = False
 
-            if has_open and is_hedge:
+            if has_open and not is_hedge and pair in strategy_state.get('manual_open', {}):
                 # ---- A) 有未平仓单：只追加 scale_in，不动主字段（保留你的老逻辑） ----
                 payload = {
                     'ts': datetime.now().timestamp(),

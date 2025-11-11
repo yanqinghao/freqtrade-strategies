@@ -19,6 +19,7 @@ import os
 import json
 import time
 import ccxt
+from freqtrade.rpc.hedge_manager import HedgeManager
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,13 @@ class KamaFama_Dynamic(IStrategy):
                 )
                 if monitoring_count > 0:
                     logger.info(f"已加载固定点位监控: 共 {monitoring_count} 个交易对")
+        try:
+            self.hedge = HedgeManager(self)
+        except Exception as e:
+            logger.error(f"HedgeManager 初始化失败: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     def load_strategy_mode_config(self):
         """
@@ -1359,6 +1367,95 @@ class KamaFama_Dynamic(IStrategy):
         if now_ts is not None and self._should_run_monitoring(pair, now_ts):
             self.check_price_monitoring(dataframe, pair)
 
+        # ====== populate_indicators() 末尾：对冲 TP/SL & 回撤止损 ======
+        try:
+            pair = metadata.get('pair') or metadata.get('pair_safe')
+            if not pair:
+                return dataframe
+
+            # 有配置才管；再校验 DB 是否真的有在途对冲
+            cfg = (self.hedge_open or {}).get(pair)
+            if not cfg:
+                return dataframe
+            if not self.hedge.has_active(pair):
+                return dataframe
+
+            act = self.hedge.get_active(
+                pair
+            )  # {direction, leverage, entry_price, remaining_notional, hedge_exit_stage, meta}
+            if not act:
+                return dataframe
+
+            direction = str(act['direction']).lower()  # 'long'|'short'
+            leverage = float(act['leverage'])
+            entry_price = float(act.get('entry_price') or 0.0)
+            stage = int(act.get('hedge_exit_stage') or 0)
+            meta = act.get('meta') or {}
+            tps = list(meta.get('exit_points') or [])
+            sl = meta.get('stop_loss', None)
+
+            # 最新价
+            close = float(dataframe.iloc[-1]['close'])
+
+            # 统一排序的 TP 列表
+            if direction == 'long':
+                tps_sorted = sorted(tps)
+            else:
+                tps_sorted = sorted(tps, reverse=True)
+
+            # 命中函数
+            def _hit_tp(i):
+                if i >= len(tps_sorted):
+                    return False
+                tgt = float(tps_sorted[i])
+                return (close >= tgt) if direction == 'long' else (close <= tgt)
+
+            def _pullback_to(px):
+                if px is None:
+                    return False
+                x = float(px)
+                return (close <= x) if direction == 'long' else (close >= x)
+
+            # 1) SL 优先
+            if sl is not None:
+                x = float(sl)
+                if (close <= x) if direction == 'long' else (close >= x):
+                    self.hedge.close_all(pair, direction, leverage, 100, close)
+                    # 标记关闭（可选）：
+                    self.hedge.set_exit_stage(pair, max(stage, 3))
+                    return dataframe
+
+            # 2) 分段 TP：30%/50%/100%（按剩余名义额）
+            #    命中一档推进一档（幂等：只推进一档）
+            if stage == 0 and _hit_tp(0):
+                self.hedge.close_partial(pair, direction, leverage, 30, close)
+                self.hedge.set_exit_stage(pair, 1)
+                return dataframe
+
+            if stage == 1 and _hit_tp(1):
+                self.hedge.close_partial(pair, direction, leverage, 50, close)
+                self.hedge.set_exit_stage(pair, 2)
+                return dataframe
+
+            if stage == 2 and _hit_tp(2):
+                self.hedge.close_all(pair, direction, leverage, 100, close)
+                self.hedge.set_exit_stage(pair, 3)
+                return dataframe
+
+            # 3) 你要求的“回撤止损”：
+            #    - 已经到达 stage>=1：回撤至成本(entry_price) => 全平
+            #    - 已经到达 stage>=2：回撤至 TP1 => 全平
+            if stage >= 1 and _pullback_to(entry_price):
+                self.hedge.close_all(pair, direction, leverage, 100, close)
+                return dataframe
+
+            if stage >= 2 and len(tps_sorted) >= 1 and _pullback_to(tps_sorted[0]):
+                self.hedge.close_all(pair, direction, leverage, 100, close)
+                return dataframe
+
+        except Exception as e:
+            logger.exception(f"[HEDGE] PI exit error: {e}")
+
         return dataframe
 
     def check_price_monitoring(self, dataframe: DataFrame, pair: str):
@@ -2344,6 +2441,57 @@ class KamaFama_Dynamic(IStrategy):
 
         pair = trade.pair
         direction = 'short' if trade.is_short else 'long'
+
+        # === 进入对冲（亏损时才考虑；命中 entries；DB 无活动对冲） ===
+        try:
+            hcfg = (self.hedge_open or {}).get(pair) or {}
+            if hcfg:
+                # 只在亏损时考虑
+                if current_profit is not None and current_profit < 0:
+                    # 若数据库已有对冲 open，直接跳过
+                    if not self.hedge.has_active(pair):
+                        h_dir = str(hcfg.get('direction') or '').lower()  # 'long' | 'short'
+                        h_lev = float(hcfg.get('leverage') or 1.0)
+                        h_size = float(hcfg.get('size') or 0.0)  # 名义额 USDT
+                        h_entries = list(hcfg.get('entries') or [])
+                        h_tps = list(hcfg.get('exit_points') or [])
+                        h_sl = hcfg.get('stop_loss')  # 可为 None
+
+                        if h_dir in ('long', 'short') and h_size > 0:
+                            # 触发条件：命中下一 entry（允许 None 表示立即）
+                            def _hit_entry(dirn, curp, ent):
+                                if ent is None:
+                                    return True
+                                ent = float(ent)
+                                if dirn == 'long':
+                                    return curp <= ent or abs(curp - ent) / max(ent, 1e-9) <= 0.0005
+                                else:
+                                    return curp >= ent or abs(curp - ent) / max(ent, 1e-9) <= 0.0005
+
+                            hit = False
+                            if len(h_entries) == 0:
+                                hit = True
+                            else:
+                                # 只看第一个未成交 entry（单档即可）
+                                ent0 = h_entries[0]
+                                hit = _hit_entry(h_dir, float(current_rate), ent0)
+
+                            if hit:
+                                meta = {
+                                    'exit_points': sorted(h_tps)
+                                    if h_dir == 'long'
+                                    else sorted(h_tps, reverse=True),
+                                    'stop_loss': h_sl,
+                                }
+                                # 用当前价开对冲，并落库
+                                self.hedge.open(
+                                    pair, h_dir, h_lev, h_size, float(current_rate), meta
+                                )
+                                logger.info(
+                                    f"[HEDGE] open {pair} {h_dir} notional={h_size} lev={h_lev} @ {current_rate}"
+                                )
+        except Exception as e:
+            logger.exception(f"[HEDGE] enter error {pair}: {e}")
 
         # 初次遇到交易时，保存初始stake金额
         if trade.get_custom_data(

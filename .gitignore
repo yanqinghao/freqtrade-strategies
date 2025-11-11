@@ -91,3 +91,4 @@ logs
 plot
 pagination*
 *.json
+*.sqlite
