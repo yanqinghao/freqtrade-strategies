@@ -3,7 +3,6 @@
 """
 This module manage Telegram communication
 """
-
 import asyncio
 import json
 import logging
@@ -487,6 +486,9 @@ class Telegram(RPCHandler):
             r'/hglong$',
             r'/hgshort$',
             r'/hedge$',
+            r'/fehg$',
+            r'/fxhg$',
+            r'/statushg$',
         ]
         # Create keys for generation
         valid_keys_print = [k.replace('$', '') for k in valid_keys]
@@ -598,6 +600,9 @@ class Telegram(RPCHandler):
             CommandHandler('monitoring', self._monitor_list),
             CommandHandler('setmanual', self._set_manual),
             CommandHandler('restoremanual', self._restore_manual),
+            CommandHandler('fehg', self._hedge_force_open),
+            CommandHandler('fxhg', self._hedge_force_close),
+            CommandHandler('statushg', self._hedge_status),
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern='update_status_table'),
@@ -3093,6 +3098,99 @@ class Telegram(RPCHandler):
 
         await self._send_msg(msg='Which pair?', keyboard=buttons_aligned, query=update.callback_query)
 
+    @authorized_only
+    async def _hedge_force_open(self, update: Update, context: CallbackContext) -> None:
+        """
+        /fehg <pair> <long|short> <lev> <size> [entry] [sl] [tp1,tp2,tp3]
+        例：/fehg BTC/USDT:USDT short 2 100 103150 104769 100350,98950,95550
+        """
+        try:
+            args = context.args or []
+            if len(args) < 4:
+                raise RPCException('Usage: /fehg <pair> <long|short> <lev> <size> [sl] [tp1,tp2,...] [entry]')
+
+            pair = _normalize_pair(args[0])
+            direction = args[1].lower()
+            lev = float(args[2]); size = float(args[3])
+            sl = float(args[4]) if len(args) >= 5 and args[4].lower() != 'none' else None
+            tps = []
+            if len(args) >= 6 and args[5].lower() != 'none':
+                tps = [float(x) for x in str(args[5]).split(',') if x]
+            entry = float(args[6]) if len(args) >= 7 else self._rpc._freqtrade.strategy.hedge.fetch_last_price(pair)
+
+            meta = {'stop_loss': sl, 'exit_points': sorted(tps, reverse=(direction=='short'))}
+            self._rpc._freqtrade.strategy.hedge.open(pair, direction, lev, size, entry, meta)
+            await self._update_manual_trade_config(
+                pair=pair, size=size, leverage=lev,
+                tps=tps, sl=sl, order_side=direction,
+                entry_price=None,
+                raw_submission={'mode': 'full_args_entries', 'args': args},
+                is_update=False, is_hedge=True, entries=[entry],
+            )
+            await self._send_msg(f'✅ HEDGE OPEN {pair} {direction} lev={lev} size={size} @ {entry}\nSL={sl} TP={tps}')
+        except Exception as e:
+            await self._send_msg(f'❌ fehg error: {e}')
+
+    @authorized_only
+    async def _hedge_force_close(self, update: Update, context: CallbackContext) -> None:
+        """
+        /fxhg <pair> [percent]  —— 不填 percent 则 100%
+        例：/fxhg BTC/USDT:USDT 50     # 关一半
+            /fxhg BTC/USDT:USDT       # 全关
+        direction 自动按活动单方向反向 reduceOnly
+        """
+        try:
+            args = context.args or []
+            if len(args) < 1:
+                raise RPCException('Usage: /fxhg <pair> [percent]')
+            pair = _normalize_pair(args[0])
+            pct  = float(args[1]) if len(args) >= 2 else 100.0
+
+            st = self._rpc._freqtrade.strategy
+            act = st.hedge.get_active(pair)
+            if not act:
+                await self._send_msg('⚠️ no active hedge for this pair.')
+                return
+            direction = act['direction'].lower()
+            lev = float(act['leverage'] or 1.0)
+            px  = st.hedge.fetch_last_price(pair)
+
+            if pct >= 100.0:
+                st.hedge.close_all(pair, direction, lev, 100, px)
+                await self._send_msg(f'✅ HEDGE CLOSE-ALL {pair} ({direction}) @ {px}')
+            else:
+                st.hedge.close_partial(pair, direction, lev, pct, px)
+                await self._send_msg(f'✅ HEDGE CLOSE-PART {pair} {pct:.2f}% ({direction}) @ {px}')
+        except Exception as e:
+            await self._send_msg(f'❌ fxhg error: {e}')
+
+    @authorized_only
+    async def _hedge_status(self, update: Update, context: CallbackContext) -> None:
+        """
+        /statushg
+        不带参数：列出所有 open hedge 的盈亏快照
+        """
+        try:
+            st = self._rpc._freqtrade.strategy
+            rows = st.hedge.list_open_with_pnl()
+            if not rows:
+                await self._send_msg('ℹ️ No active hedge orders.')
+                return
+            lines = []
+            for r in rows:
+                pnl_pct = r['pnl_pct'] * 100.0
+                tps = r['meta'].get('exit_points') or []
+                sl  = r['meta'].get('stop_loss', None)
+                lines.append(
+                    f"#{r['id']} {r['pair']} {r['direction']}/lev{r['leverage']} "
+                    f"rem={r['remaining_notional']:.2f} USDT "
+                    f"EP={r['entry_price']} MP={r['mark_price']} "
+                    f"PnL={r['pnl']:.2f} ({pnl_pct:+.2f}%) stage={r['hedge_exit_stage']} "
+                    f"SL={sl} TP={tps}"
+                )
+            await self._send_msg('📊 HEDGE STATUS\n' + '\n'.join(lines))
+        except Exception as e:
+            await self._send_msg(f'❌ statushg error: {e}')
 
     @authorized_only
     async def _set_manual(self, update: Update, context: CallbackContext):

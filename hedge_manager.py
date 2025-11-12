@@ -88,7 +88,7 @@ class HedgeManager:
 
     # --- helpers ---
     def _to_symbol(self, pair: str) -> str:
-        return pair.replace(':USDT', '')
+        return pair
 
     def _market_info(self, symbol: str):
         return (
@@ -268,3 +268,82 @@ class HedgeManager:
                 (int(to_stage), time.time(), int(act['id'])),
             )
             con.commit()
+
+    # ====== 新增：获取所有 open 订单（用于 statushg / 管控） ======
+    def list_open(self):
+        with self._conn() as con:
+            rows = con.execute(
+                """
+                SELECT id, pair, direction, leverage, entry_price, remaining_notional, status, hedge_exit_stage, meta_json
+                FROM hedge_orders WHERE status='open' ORDER BY id DESC;
+            """
+            ).fetchall()
+        out = []
+        for r in rows:
+            oid, p, d, lev, ep, rem, st, stg, mj = r
+            out.append(
+                {
+                    'id': oid,
+                    'pair': p,
+                    'direction': d,
+                    'leverage': float(lev or 0.0),
+                    'entry_price': float(ep or 0.0),
+                    'remaining_notional': float(rem or 0.0),
+                    'status': st,
+                    'hedge_exit_stage': int(stg or 0),
+                    'meta': json.loads(mj or '{}'),
+                }
+            )
+        return out
+
+    # ====== 新增：取最新价格（优先 ccxt ticker.last，退化到 mid） ======
+    def fetch_last_price(self, pair: str) -> float:
+        symbol = self._to_symbol(pair)
+        try:
+            t = self.ex.fetch_ticker(symbol) or {}
+            # last 优先，其次 bid/ask/mid
+            if 'last' in t and t['last']:
+                return float(t['last'])
+            b = float(t.get('bid') or 0.0)
+            a = float(t.get('ask') or 0.0)
+            if b > 0 and a > 0:
+                return (a + b) / 2.0
+        except Exception:
+            pass
+        # 兜底：用 entry_price（不理想，但不至于崩）
+        act = self.get_active(pair)
+        return float((act or {}).get('entry_price') or 0.0)
+
+    # ====== 新增：计算单条活动单 PnL 快照（剩余头寸维度） ======
+    def pnl_snapshot(self, active_row: dict, mark_price: float) -> dict:
+        """
+        以 remaining_notional 为基准的盈亏估算：
+        qty_remaining = remaining_notional * leverage / entry_price
+        PnL(USDT) = (mark - entry) * qty_remaining  (long)
+                    (entry - mark) * qty_remaining  (short)
+        PnL% ≈ PnL / remaining_notional
+        """
+        entry = float(active_row['entry_price'] or 0.0)
+        rem_notional = float(active_row['remaining_notional'] or 0.0)
+        lev = float(active_row['leverage'] or 0.0)
+        if entry <= 0 or rem_notional <= 0 or lev <= 0:
+            return {'pnl': 0.0, 'pnl_pct': 0.0}
+        qty = rem_notional * lev / entry
+        if active_row['direction'] == 'long':
+            pnl = (float(mark_price) - entry) * qty
+        else:
+            pnl = (entry - float(mark_price)) * qty
+        pnl_pct = pnl / max(rem_notional, 1e-9)
+        return {'pnl': float(pnl), 'pnl_pct': float(pnl_pct)}
+
+    # ====== 新增：列出所有 open 的盈亏（statushg 用） ======
+    def list_open_with_pnl(self):
+        rows = self.list_open()
+        out = []
+        for r in rows:
+            px = self.fetch_last_price(r['pair'])
+            snap = self.pnl_snapshot(r, px)
+            r2 = dict(r)
+            r2.update({'mark_price': px, 'pnl': snap['pnl'], 'pnl_pct': snap['pnl_pct']})
+            out.append(r2)
+        return out
