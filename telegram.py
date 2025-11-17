@@ -2597,7 +2597,7 @@ class Telegram(RPCHandler):
             order_side = SignalDirection(pending['side'])
 
             # 写入 manual_open 配置
-            await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price)
+            await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price, lock=True)
 
             # 真正强制进场
             await self._force_enter_action(
@@ -2605,6 +2605,8 @@ class Telegram(RPCHandler):
                 stake_amount=size, leverage=leverage,
                 enter_tag=f'manual_{order_side.value}'
             )
+
+            await self._update_manual_trade_config(pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price, is_update=True)
 
             await msg.reply_text('手动开单已提交 ✅')
         except Exception as e:
@@ -2801,6 +2803,7 @@ class Telegram(RPCHandler):
         # ==== 新增：保持默认不动老逻辑 ====
         is_hedge: bool = False,                     # 新增：对冲写入 hedge_open，默认 False
         entries: list[float | None] | None = None,  # 新增：极简多点位数组（可含 None 表示市价）
+        lock: bool = False,                        # 预留：未来可加锁定功能
     ):
         """
         Updates strategy_state.json with manual/hedge trade configuration.
@@ -2882,6 +2885,7 @@ class Telegram(RPCHandler):
                     'stop_loss': sl,  # 可以为 None
                     'direction': order_side.value,
                     'timestamp': datetime.now().timestamp(),  # 避免陈旧
+                    'lock': lock,  # 预留字段
                 }
                 # 新增：如有 entries，用极简数组写入；否则保留旧 entries
                 if entries is not None and len(entries) > 0:
@@ -2913,13 +2917,13 @@ class Telegram(RPCHandler):
         if pair in current_whitelist:
             await self._send_msg(f'交易对 {pair} 已在当前白名单中')
         else:
-            with open('/freqtrade/config_production.json', 'r') as f:
-                config = json.load(f)
-            config['exchange']['pair_whitelist'].append(pair)
-            with open('/freqtrade/config_production.json', 'w') as f:
-                json.dump(config, f, indent=4)
-            self._rpc._rpc_reload_config()
-            await self._send_msg(f'交易对 {pair} 已加入白名单')
+            # with open('/freqtrade/config_production.json', 'r') as f:
+            #     config = json.load(f)
+            # config['exchange']['pair_whitelist'].append(pair)
+            # with open('/freqtrade/config_production.json', 'w') as f:
+            #     json.dump(config, f, indent=4)
+            # self._rpc._rpc_reload_config()
+            await self._send_msg(f'请手动将 {pair} 加入白名单， <code>/addpair {pair}</code>', parse_mode=ParseMode.HTML)
 
 
     @authorized_only
@@ -2941,7 +2945,7 @@ class Telegram(RPCHandler):
                     tps=[tp1, tp2, tp3], sl=sl, order_side=order_side,
                     entry_price=None,
                     raw_submission={'mode': 'full_args_entries', 'args': args},
-                    is_update=False, is_hedge=is_hedge, entries=entries,
+                    is_update=False, is_hedge=is_hedge, entries=entries, lock=True
                 )
 
                 if is_hedge:
@@ -2964,6 +2968,13 @@ class Telegram(RPCHandler):
                         stake_amount=stake0, leverage=leverage,
                         enter_tag=('manual_' + order_side.value)
                     )
+                    await self._update_manual_trade_config(
+                        pair=pair, size=size, leverage=leverage,
+                        tps=[tp1, tp2, tp3], sl=sl, order_side=order_side,
+                        entry_price=None,
+                        raw_submission={'mode': 'full_args_entries', 'args': args},
+                        is_update=True, is_hedge=is_hedge, entries=entries
+                    )
                     # entry_price 由成交回调 set_entry_price() 更新
                     await self._send_msg(f"{pair} 第一段【市价】已执行（{allocs[0]}%），其余段位仅写配置等待触发。")
                 else:
@@ -2973,6 +2984,13 @@ class Telegram(RPCHandler):
                         pair, p0, order_side,
                         stake_amount=stake0, leverage=leverage,
                         enter_tag=('manual_' + order_side.value)
+                    )
+                    await self._update_manual_trade_config(
+                        pair=pair, size=size, leverage=leverage,
+                        tps=[tp1, tp2, tp3], sl=sl, order_side=order_side,
+                        entry_price=None,
+                        raw_submission={'mode': 'full_args_entries', 'args': args},
+                        is_update=True, is_hedge=is_hedge, entries=entries
                     )
                     await self._send_msg(f"{pair} 第一段【限价 {p0}】已挂单（{allocs[0]}%），其余段位仅写配置等待触发。")
 
@@ -2996,13 +3014,18 @@ class Telegram(RPCHandler):
 
                 await self._update_manual_trade_config(
                     pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price,
-                    raw_submission={'mode': 'full_args', 'args': args}
+                    raw_submission={'mode': 'full_args', 'args': args}, lock=True
                 )
 
                 await self._force_enter_action(
                     pair, price, order_side,
                     stake_amount=size, leverage=leverage,
                     enter_tag=f'manual_{order_side.value}'
+                )
+
+                await self._update_manual_trade_config(
+                    pair, size, leverage, [tp1, tp2, tp3], sl, order_side, entry_price=price,
+                    raw_submission={'mode': 'full_args', 'args': args}, is_update=True
                 )
 
                 return
@@ -3027,7 +3050,7 @@ class Telegram(RPCHandler):
                 # 写入 manual_open：只把提供的内容写入（未提供的就留空/None/[]）
                 await self._update_manual_trade_config(
                     pair, size, leverage, tps, sl, order_side, entry_price=price,
-                    raw_submission={'mode': 'kv_partial', 'args': args, 'kv': kv}
+                    raw_submission={'mode': 'kv_partial', 'args': args, 'kv': kv}, lock=True
                 )
 
                 # 下单：若提供 price 即挂限价单；否则按你 _force_enter_action 的默认行为
@@ -3035,6 +3058,11 @@ class Telegram(RPCHandler):
                     pair, price, order_side,
                     stake_amount=size, leverage=leverage,
                     enter_tag=f'manual_{order_side.value}'
+                )
+
+                await self._update_manual_trade_config(
+                    pair, size, leverage, tps, sl, order_side, entry_price=price,
+                    raw_submission={'mode': 'kv_partial', 'args': args, 'kv': kv}, is_update=True
                 )
 
                 # 友好回执
@@ -3061,13 +3089,18 @@ class Telegram(RPCHandler):
 
                 await self._update_manual_trade_config(
                     pair, size, leverage, [], None, order_side, entry_price=None,
-                    raw_submission={'mode': 'quick3', 'args': args}
+                    raw_submission={'mode': 'quick3', 'args': args}, lock=True
                 )
 
                 await self._force_enter_action(
                     pair, None, order_side,
                     stake_amount=size, leverage=leverage,
                     enter_tag=f'manual_{order_side.value}'
+                )
+
+                await self._update_manual_trade_config(
+                    pair, size, leverage, [], None, order_side, entry_price=None,
+                    raw_submission={'mode': 'quick3', 'args': args}, is_update=True
                 )
 
                 return
@@ -3196,13 +3229,19 @@ class Telegram(RPCHandler):
     async def _set_manual(self, update: Update, context: CallbackContext):
         """
         /setmanual <pair|trade_id> <long|short> <tp1> <tp2> <tp3> <sl> [entry_price]
-        作用：
-        1) 修改已开仓 Trade.enter_tag = manual_{long|short}
-        2) 将点位写入 strategy_state_production.json 并同步到内存
+
+        新增：
+        也支持 KV 模式，例如：
+        /setmanual BTC/USDT side=long tp=71000,72000 sl=69500 entry=70550
+        /setmanual BTC/USDT side=short tp1=71000 tp2=72000 sl=69500
         """
         args = context.args or []
         if not args:
-            await self._send_msg('用法：/setmanual <pair|trade_id> <long|short> <tp1> <tp2> <tp3> <sl> [entry_price]')
+            await self._send_msg(
+                '用法：\n'
+                '/setmanual <pair|trade_id> <long|short> <tp1> <tp2> <tp3> <sl> [entry_price]\n'
+                '或：/setmanual <pair|trade_id> side=<long|short> tp=71000,72000 sl=69500 [entry=70550] entries=70500,70600'
+            )
             return
 
         ident = args[0]
@@ -3211,21 +3250,19 @@ class Telegram(RPCHandler):
             await self._send_msg(f"未找到未平仓的订单：{ident}")
             return
 
-        # A) 参数齐全：直接执行
-        if len(args) >= 6:
+        # A) 提供了后续参数：尝试解析（自动支持位置参数模式 + KV 模式）
+        if len(args) >= 2:
             try:
-                side = args[1].lower()
-                if side not in ('long', 'short'):
-                    raise ValueError('第二个参数必须是 long 或 short')
+                side, tps, sl, price, entries = self._parse_setmanual_params(args[1:])
 
-                tp1 = float(args[2]); tp2 = float(args[3]); tp3 = float(args[4])
-                sl  = float(args[5])
-                price = float(args[6]) if len(args) > 6 else None
+                if side not in ('long', 'short'):
+                    raise ValueError('方向必须是 long 或 short')
+
+                if not tps:
+                    raise ValueError('至少需要一个 TP')
 
                 # 从 trade 中取 size / leverage
-                # size 用 stake_amount（更贴近你手动下单的币本位/美金位资金规模）
                 size = float(getattr(trade, 'stake_amount', 0) or 0)
-                # Freqtrade 期货通常带 leverage 字段；若无则默认 1
                 leverage = float(getattr(trade, 'leverage', 1) or 1)
 
                 # 1) 修改 enter_tag 并保存
@@ -3240,14 +3277,27 @@ class Telegram(RPCHandler):
                     pair=trade.pair,
                     size=size,
                     leverage=leverage,
-                    tps=[tp1, tp2, tp3],
+                    tps=tps,   # 这里 tps 是 list[float]，长度可变（1~3 或更多，看你策略怎么用）
                     sl=sl,
                     order_side=order_side,
-                    entry_price=price if price is not None else float(getattr(trade, 'open_rate', 0) or 0),
+                    entry_price=(
+                        float(price)
+                        if price is not None
+                        else float(getattr(trade, 'open_rate', 0) or 0)
+                    ),
+                    entries=entries,
                     is_update=True,
                 )
 
-                await self._send_msg(f"已将 {trade.pair} 标记为 manual_{side}，并写入 TP/SL/入场价。")
+                # 友好提示，把 TP/SL 列一下
+                tps_str = ', '.join(f"{x:g}" for x in tps)
+                msg = (
+                    f"✅ 已将 {trade.pair} 标记为 manual_{side}。\n"
+                    f"TP: {tps_str}\n"
+                    f"SL: {sl:g}\n"
+                    f"入场价: {price if price is not None else getattr(trade, 'open_rate', '—')}"
+                )
+                await self._send_msg(msg)
                 return
 
             except Exception as e:
@@ -3258,10 +3308,138 @@ class Telegram(RPCHandler):
         # B) 只给了 ident：进入引导输入
         key = (update.effective_chat.id, update.effective_user.id)
         self._pending_force[key] = {'pair': trade.pair, 'side': 'manual_set', 'ts': time.time()}
-        tip = ('请按格式回复以下参数：\n'
-            '<long|short> <tp1> <tp2> <tp3> <sl> [entry_price]\n'
-            '示例：long 71000 72000 73500 69500 70550')
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=tip, reply_markup=ForceReply(selective=True))
+
+        tip = (
+            '请按格式回复以下参数（支持位置参数 或 KV 模式）：\n'
+            '1) 位置参数：\n'
+            '   <long|short> <tp1> <tp2> <tp3> <sl> [entry_price]\n'
+            '   示例：long 71000 72000 73500 69500 70550\n\n'
+            '2) KV 模式（TP 数量可变）：\n'
+            '   side=<long|short> tp=71000,72000 sl=69500 [entry=70550]\n'
+            '   或：side=short tp1=71000 tp2=72000 sl=69500'
+        )
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=tip,
+            reply_markup=ForceReply(selective=True),
+        )
+
+    def _parse_setmanual_params(self, tokens):
+        """
+        统一解析 /setmanual 的参数部分（去掉第一个 ident 后的那一段）：
+
+        返回：
+            side: str ('long' / 'short')
+            tps: List[float]
+            sl: float
+            price: Optional[float]      # 主入场价（如果有）
+            entries: Optional[List[float]]  # 如果有逗号分隔的多入场价，则这里返回列表
+        """
+
+        if not tokens:
+            raise ValueError('缺少参数')
+
+        # ---------- KV 模式 ----------
+        # 例如：
+        #   side=long tp=71000,72000 sl=69500 entry=70550,70600
+        #   side=short tp1=71000 tp2=72000 sl=69500 entries=70550,70600
+        if any('=' in t for t in tokens):
+            kv = {}
+            for t in tokens:
+                if '=' not in t:
+                    raise ValueError(f'KV 模式下参数必须是 key=value 形式，收到：{t}')
+                k, v = t.split('=', 1)
+                k = k.strip().lower()
+                v = v.strip()
+                if not k:
+                    raise ValueError(f'非法参数：{t}')
+                kv[k] = v
+
+            side = kv.get('side') or kv.get('s')
+            if not side:
+                raise ValueError('缺少 side=long|short')
+
+            def _parse_float_list(s: str):
+                return [float(x) for x in s.split(',') if x.strip()]
+
+            # ---- TP 解析 ----
+            tps: list[float] = []
+            if 'tp' in kv:
+                tps.extend(_parse_float_list(kv['tp']))
+
+            for i in range(1, 10):  # 预留 tp1~tp9
+                key = f'tp{i}'
+                if key in kv:
+                    tps.append(float(kv[key]))
+
+            if not tps:
+                raise ValueError('缺少 TP 参数（tp=... 或 tp1=...）')
+
+            # ---- SL ----
+            if 'sl' not in kv:
+                raise ValueError('缺少 sl= 止损参数')
+            sl = float(kv['sl'])
+
+            # ---- entries & 主 price ----
+            entries = None
+            price = None
+
+            # 优先解析 entries=...
+            if 'entries' in kv:
+                entries = _parse_float_list(kv['entries'])
+                if not entries:
+                    raise ValueError('entries= 中没有有效价格')
+                price = entries[0]
+            else:
+                # 兼容 entry / entry_price / price
+                for ek in ('entry', 'entry_price', 'price'):
+                    if ek in kv:
+                        raw = kv[ek]
+                        if ',' in raw:
+                            entries = _parse_float_list(raw)
+                            if not entries:
+                                raise ValueError(f'{ek}= 中没有有效价格')
+                            price = entries[0]
+                        else:
+                            price = float(raw)
+                            entries = [price]
+                        break
+
+            return side.lower(), tps, sl, price, entries
+
+        # ---------- 位置参数模式（兼容旧用法） ----------
+        # <long|short> <tp1> <tp2> <tp3> <sl> [entry_price 或 entry1,entry2...]
+        if len(tokens) < 5:
+            raise ValueError(
+                '位置参数模式下至少需要：<long|short> <tp1> <tp2> <tp3> <sl> [entry_price]'
+            )
+
+        side = tokens[0].lower()
+        if side not in ('long', 'short'):
+            raise ValueError('第一个参数必须是 long 或 short')
+
+        tp1 = float(tokens[1])
+        tp2 = float(tokens[2])
+        tp3 = float(tokens[3])
+        sl = float(tokens[4])
+
+        price = None
+        entries = None
+
+        if len(tokens) > 5:
+            raw = tokens[5]
+            if ',' in raw:
+                # 多个 entry，用逗号分隔
+                entries = [float(x) for x in raw.split(',') if x.strip()]
+                if not entries:
+                    raise ValueError('入场价列表中没有有效价格')
+                price = entries[0]
+            else:
+                price = float(raw)
+                entries = [price]
+
+        return side, [tp1, tp2, tp3], sl, price, entries
 
     @authorized_only
     async def _restore_manual(self, update: Update, context: CallbackContext):

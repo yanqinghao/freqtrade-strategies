@@ -1132,7 +1132,11 @@ class KamaFama_Dynamic(IStrategy):
                 if ('manual' in (getattr(t, 'enter_tag', '') or '').lower())
             }
 
-            to_delete = [p for p in list(self.manual_open.keys()) if p not in keep_pairs]
+            to_delete = [
+                p
+                for p in list(self.manual_open.keys())
+                if p not in keep_pairs and not self.manual_open[p].get('lock')
+            ]
             if to_delete:
                 for p in to_delete:
                     del self.manual_open[p]
@@ -2226,7 +2230,7 @@ class KamaFama_Dynamic(IStrategy):
         pair = trade.pair
 
         # 查找该交易对的监控配置
-        if pair in self.coin_monitoring:
+        if pair in self.coin_monitoring and pair not in self.manual_open:
             for config in self.coin_monitoring[pair]:
                 if config.get('direction') == direction:
                     # 保存原始入场点位
@@ -2518,7 +2522,8 @@ class KamaFama_Dynamic(IStrategy):
             # 当前已完成阶段（首段记为1），下一段索引 = entry_stage（entries 从0开始）
             es = int(trade.get_custom_data('entry_stage') or 1)
             next_idx = es
-            if 0 <= next_idx < len(entries):
+            pend = float(trade.get_custom_data('pending_dca_amount') or 0.0)
+            if pend == 0.0 and 0 <= next_idx < len(entries):
                 next_price = entries[next_idx]  # 可为 None 表示市价段
                 cur = float(current_rate)
                 gap_ratio = getattr(self, 'ENTRY_GAP_MAX_RATIO', 0.0005)  # 0.05%
@@ -2573,7 +2578,7 @@ class KamaFama_Dynamic(IStrategy):
                         # 补仓成功后由下方“检查并更新补仓后的initial_stake”区块把 entry_stage 提升
                         trade.set_custom_data('pending_entry_stage', es + 1)
 
-                        tag = f"{direction}_entries_stage_{next_idx}"
+                        tag = f"manual_{direction}_entries_stage_{next_idx}"
                         logger.info(
                             f"{pair} entries触发: stage={es}->{es+1}, idx={next_idx}, "
                             f"cur={cur}, next={next_price}, amount={dca_amount}, alloc={allocs[next_idx]}%, base={base_size}"
@@ -2819,30 +2824,12 @@ class KamaFama_Dynamic(IStrategy):
                 available_length = len(dataframe)
 
                 # 亏损20%以上，补仓50%
-                if loss_percentage >= 0.20:
-                    dca_amount_1 = trade.stake_amount * 0.5
-                    dca_tag_1 = f"{direction}_dca_loss_20pct"
-                # 亏损15%以上，补仓40%
-                elif loss_percentage >= 0.125 and (
-                    (direction == 'long' and current_rsi_84 > previous_rsi_84)
-                    or (  # 多头RSI开始上升
-                        direction == 'short' and current_rsi_84 < previous_rsi_84
-                    )  # 空头RSI开始下降
-                ):
-                    dca_amount_1 = trade.stake_amount * 0.4
-                    dca_tag_1 = f"{direction}_dca_loss_15pct"
-                # 亏损10%以上，补仓30%
-                elif loss_percentage >= 0.075 and (
-                    (
-                        direction == 'long'
-                        and current_rsi_84 > previous_rsi_84
-                        and current_rsi_84 > 30
-                    )
-                    or (
-                        direction == 'short'
-                        and current_rsi_84 < previous_rsi_84
-                        and current_rsi_84 < 70
-                    )
+                if (
+                    direction == 'long' and current_rsi_84 > previous_rsi_84 and current_rsi_84 > 40
+                ) or (
+                    direction == 'short'
+                    and current_rsi_84 < previous_rsi_84
+                    and current_rsi_84 < 60
                 ):
                     dca_amount_1 = trade.stake_amount * 0.3
                     dca_tag_1 = f"{direction}_dca_loss_10pct"
@@ -3364,7 +3351,7 @@ class KamaFama_Dynamic(IStrategy):
         direction = 'short' if trade.is_short else 'long'
 
         # ========= ① 手动单优先：只处理“最终全退”，其余交给 adjust_trade_position =========
-        if trade.enter_tag and 'manual' in trade.enter_tag:
+        if pair in self.manual_open:
             manual_cfg = self.manual_open.get(pair, {})
             exit_points = manual_cfg.get('exit_points', []) or []
 
@@ -3429,11 +3416,10 @@ class KamaFama_Dynamic(IStrategy):
                         # 内部状态更新仅用于记录；真正的清理在 _manual_cleanup_after_full_close 完成
                         trade.set_custom_data('exit_stage', 3)
                         return f"manual_{direction}_tp3_{sorted_exit_points[2]}"
+                    return None
 
-                # 手动单存在，但未满足“最终全退” → 明确不让 coin_monitoring 介入
                 return None
-
-            # 没有手动 exit_points，则继续走后续逻辑（可能是老单/被外部清空）
+                # 手动单存在，但未满足“最终全退” → 明确不让 coin_monitoring 介入
             # 不 return
 
         # ===== ② coin_monitoring：只处理“最终全退”；否则不下放 =====
