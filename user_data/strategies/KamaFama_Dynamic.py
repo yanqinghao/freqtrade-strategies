@@ -2581,7 +2581,7 @@ class KamaFama_Dynamic(IStrategy):
                         tag = f"manual_{direction}_entries_stage_{next_idx}"
                         logger.info(
                             f"{pair} entries触发: stage={es}->{es+1}, idx={next_idx}, "
-                            f"cur={cur}, next={next_price}, amount={dca_amount}, alloc={allocs[next_idx]}%, base={base_size}"
+                            f"cur={cur}, next={next_price}, current_amount={trade.stake_amount}, amount={dca_amount}, alloc={allocs[next_idx]}%, base={base_size}"
                         )
                         return dca_amount, tag
 
@@ -2598,12 +2598,18 @@ class KamaFama_Dynamic(IStrategy):
                     if current_rate <= sl_price:
                         return -trade.stake_amount, 'manual_sl_hit'
 
+        max_price_pullback_pct = 0.005
         # 先检查是否需要补仓
         if current_profit < 0:
 
             # 优先检查是否为止盈回撤情况（亏损小于0.5%且已经触发过减仓）
             exit_stage = trade.get_custom_data('exit_stage', default=0)
-            if exit_stage >= 1 and current_profit >= -0.005:  # 已减仓且亏损小于0.5%
+            # 获取杠杆，没取到就按 1 算
+            lev = getattr(trade, 'leverage', 1) or 1
+
+            # 允许的最大亏损比例（按 current_profit 维度）
+            max_loss_ratio = -max_price_pullback_pct * lev  # 例如 10x -> -0.05 (-5%)
+            if exit_stage >= 1 and current_profit >= max_loss_ratio:  # 已减仓且亏损小于0.5%
                 # ===== ① manual_open 优先：手动单的回撤清仓 =====
                 if trade.enter_tag and 'manual' in trade.enter_tag:
                     manual_cfg = self.manual_open.get(pair)
@@ -2755,7 +2761,7 @@ class KamaFama_Dynamic(IStrategy):
                 # )
 
             if last_dca_time is not None:
-                cooldown_minutes = 60 * 24 * 7  # 30分钟冷却期 (可根据交易对波动性调整)
+                cooldown_minutes = 60 * 24 * 180  # 30分钟冷却期 (可根据交易对波动性调整)
 
                 # 确保last_dca_time是时间戳格式
                 if isinstance(last_dca_time, datetime):
@@ -2809,8 +2815,14 @@ class KamaFama_Dynamic(IStrategy):
             loss_percentage = abs(current_profit)
 
             # 检查当前仓位金额是否已超过最大限制
-            if trade.stake_amount >= 400:
-                logger.info(f"{pair}: 当前仓位金额 {trade.stake_amount} 已超过最大限制 400，不再补仓")
+            if (
+                trade.stake_amount >= 400
+                or current_profit >= 0
+                or 'manual' in (trade.enter_tag or '')
+            ):
+                logger.info(
+                    f"{pair}: 当前仓位金额 {trade.stake_amount} 已超过最大限制 400, 当前利润为 {current_profit}，不再补仓"
+                )
                 return None
             else:
                 # 方法1: 基于亏损百分比的补仓策略 (原有逻辑)
@@ -2960,10 +2972,16 @@ class KamaFama_Dynamic(IStrategy):
             # 如果确认补仓已经执行（stake_amount已增加）
             if trade.stake_amount > last_stake_amount:
                 # 更新initial_stake为当前的总stake金额
+                logger.info(
+                    f"{pair}: [DCA-CLEAR] ENTER block, stake={trade.stake_amount}, last={last_stake_amount}, pending={pending_dca_amount}"
+                )
                 trade.set_custom_data('initial_stake', trade.stake_amount)
                 # 清除临时变量
-                trade.set_custom_data('last_stake_amount', 0)
-                trade.set_custom_data('pending_dca_amount', 0)
+                trade.set_custom_data('last_stake_amount', None)
+                trade.set_custom_data('pending_dca_amount', None)
+                logger.info(
+                    f"{pair}: [DCA-CLEAR] AFTER set get: initial={trade.get_custom_data('initial_stake')}, last={trade.get_custom_data('last_stake_amount')}, pending={trade.get_custom_data('pending_dca_amount')}"
+                )
                 logger.info(f"{pair}: 补仓后更新initial_stake为 {trade.stake_amount}")
 
                 # === 新增：若存在 pending_entry_stage，则将 entry_stage 前进并清空 pending ===

@@ -656,13 +656,13 @@ class Telegram(RPCHandler):
         返回: Trade 或 None
         """
         from freqtrade.persistence import Trade
-        q = Trade.query.filter(Trade.is_open.is_(True))
+        q = Trade.get_trades_query([Trade.is_open.is_(True)])
         if '/' in ident.upper():
-            return q.filter(Trade.pair == ident.upper()).first()
+            return Trade.session.scalars(q.filter(Trade.pair == ident.upper())).first()
         else:
             try:
                 tid = int(ident)
-                return q.filter(Trade.id == tid).first()
+                return Trade.session.scalars(q.filter(Trade.id == tid)).first()
             except ValueError:
                 return None
 
@@ -2074,23 +2074,25 @@ class Telegram(RPCHandler):
         size = item.get('size')
         lev = item.get('leverage')
         ep = item.get('entry_price')
+        entries = item.get('entries')
         tps = item.get('exit_points', [])
         sl = item.get('stop_loss')
         ts = datetime.fromtimestamp(item.get('timestamp', datetime.now().timestamp())).strftime('%Y-%m-%d %H:%M:%S')
 
-        tps_fmt = ', '.join([str(x) for x in tps]) if tps else '(未设)'
+        tps_fmt = ','.join([str(x) for x in tps]) if tps else '(未设)'
         ep_txt = f"{ep}" if isinstance(ep, (int, float)) else '市价'
 
         msg = (
             f"📌 *{pair}*  手动单详情\n"
             f"• 方向：`{side}`   • 杠杆：`{lev}`   • 仓位：`{size}`\n"
             f"• 进场价（enter price）：`{ep_txt}`\n"
+            f"• entries（多点位）：`{','.join([str(x) for x in entries]) if entries else '(未设)'}`\n"
             f"• TP1/2/3：`{tps_fmt}`\n"
             f"• SL：`{sl}`\n"
             f"• 设置时间：`{ts}`\n\n"
             f"✏️ *修改方法*：\n"
             f"1）五值：`entry tp1 tp2 tp3 sl`\n"
-            f"2）或键值对：`entry=... tp1=... tp2=... tp3=... sl=...`\n"
+            f"2）或键值对：`entry=... tp1=... tp2=... tp3=... sl=... size=... lev=...`\n"
             f"   （可只改其中一部分）\n"
         )
 
@@ -2133,63 +2135,124 @@ class Telegram(RPCHandler):
         )
         await query.message.reply_text(tip, parse_mode=ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
 
-    def _parse_edit_input(self, text: str, current: dict) -> tuple[float | None, list[float], float]:
+    def _parse_edit_input(self, text: str, current: dict) -> tuple[list[float], list[float], float, float | None, float | None]:
         """
-        解析用户输入。返回 (entry_price, tps[3], sl)
-        - 支持五个数：entry tp1 tp2 tp3 sl
-        - 支持四个数：tp1 tp2 tp3 sl（entry 不改）
-        - 支持键值对：entry= / price= / ep= ，tp1= tp2= tp3= sl=
-        """
-        text = text.strip().replace(',', ' ')
-        tokens = [t for t in text.split() if t]
+        解析用户输入，支持修改价格、仓位(size)和杠杆(lev)。
 
-        entry = current.get('entry_price')
+        返回: (entries, tps[3], sl, size, lev)
+
+        支持的键值对 (支持 entries 逗号分隔):
+        - entry=2600,2650,2700  (支持多条目)
+        - tp1=... tp2=... tp3=... sl=...
+        - size=... lev=...
+
+        支持的纯数字模式 (逗号视为分隔符):
+        - 7 个数: entry tp1 tp2 tp3 sl size lev
+        - 6 个数: tp1 tp2 tp3 sl size lev (entry 不改)
+        - 5 个数: entry tp1 tp2 tp3 sl
+        - 4 个数: tp1 tp2 tp3 sl
+        """
+
+        # 1. 原始分割：先按空格分，保留 token 内部的逗号 (用于处理 entry=1,2,3)
+        raw_tokens = text.strip().split()
+
+        # --- 获取当前默认值 ---
+        entries = current.get('entries')
+        if not entries:
+            ep = current.get('entry_price')
+            entries = [ep] if ep is not None else []
+
         tps = list(current.get('exit_points', [None, None, None]))
-        # 确保长度为 3
         if len(tps) < 3:
             tps += [None] * (3 - len(tps))
-        sl = current.get('stop_loss')
 
-        # 键值对优先
-        if any('=' in t for t in tokens):
-            for t in tokens:
+        sl = current.get('stop_loss')
+        size = current.get('size')
+        lev = current.get('leverage')
+
+        # --- 2. 模式 A：键值对优先 (包含 '=') ---
+        if any('=' in t for t in raw_tokens):
+            for t in raw_tokens:
                 if '=' not in t:
                     continue
                 k, v = t.split('=', 1)
                 k = k.lower()
-                try:
-                    val = float(v)
-                except ValueError:
-                    continue
-                if k in ('entry', 'price', 'ep'):
-                    entry = val
-                elif k == 'tp1':
-                    tps[0] = val
-                elif k == 'tp2':
-                    tps[1] = val
-                elif k == 'tp3':
-                    tps[2] = val
-                elif k in ('sl', 'stop', 'stop_loss'):
-                    sl = val
-            # 填回旧值（仍可能是 None 的就保持 None）
-            return entry, [tps[0], tps[1], tps[2]], sl
 
-        # 纯数字序列
+                # 尝试解析 Value
+                # 特殊处理：entries 可能包含逗号
+                if k in ('entry', 'price', 'ep', 'entries'):
+                    try:
+                        # 将 "2600,2650" 分割并转为 float 列表
+                        new_entries = [float(x) for x in v.split(',') if x.strip()]
+                        if new_entries:
+                            entries = new_entries
+                    except ValueError:
+                        continue
+                else:
+                    # 其他字段通常是单数值
+                    try:
+                        val = float(v)
+                    except ValueError:
+                        continue
+
+                    if k == 'tp1':
+                        tps[0] = val
+                    elif k == 'tp2':
+                        tps[1] = val
+                    elif k == 'tp3':
+                        tps[2] = val
+                    elif k in ('sl', 'stop', 'stop_loss'):
+                        sl = val
+                    elif k in ('size', 'amount', 'qty'):
+                        size = val
+                    elif k in ('lev', 'leverage'):
+                        lev = int(val)
+
+            return entries, [tps[0], tps[1], tps[2]], sl, size, lev
+
+        # --- 3. 模式 B：纯数字序列 ---
+        # 只有在没发现 '=' 时才进入这里
+        # 这里将逗号替换为空格，兼容 "entry, tp1, tp2" 这种输入习惯
+        normalized_text = text.replace(',', ' ')
         nums = []
-        for t in tokens:
+        for t in normalized_text.split():
             try:
                 nums.append(float(t))
             except ValueError:
                 pass
 
-        if len(nums) == 5:
-            entry, tp1, tp2, tp3, sl = nums
-            return entry, [tp1, tp2, tp3], sl
-        elif len(nums) == 4:
-            tp1, tp2, tp3, sl = nums
-            return entry, [tp1, tp2, tp3], sl
+        count = len(nums)
+
+        if count == 7:
+            # Entry, TP1, TP2, TP3, SL, Size, Lev
+            entries = [nums[0]]
+            tps = [nums[1], nums[2], nums[3]]
+            sl = nums[4]
+            size = nums[5]
+            lev = nums[6]
+
+        elif count == 6:
+            # TP1, TP2, TP3, SL, Size, Lev
+            tps = [nums[0], nums[1], nums[2]]
+            sl = nums[3]
+            size = nums[4]
+            lev = nums[5]
+
+        elif count == 5:
+            # Entry, TP1, TP2, TP3, SL
+            entries = [nums[0]]
+            tps = [nums[1], nums[2], nums[3]]
+            sl = nums[4]
+
+        elif count == 4:
+            # TP1, TP2, TP3, SL
+            tps = [nums[0], nums[1], nums[2]]
+            sl = nums[3]
+
         else:
-            raise ValueError('参数数量不正确。请输入 5 个数（含 entry）或 4 个数（不含 entry），或使用键值对。')
+            raise ValueError(f'参数数量({count})不匹配。请检查输入格式或使用键值对(key=value)。')
+
+        return entries, tps, sl, size, lev
 
     def _parse_num_list(self, s: str) -> list[float]:
         s = s.strip()
@@ -2388,11 +2451,9 @@ class Telegram(RPCHandler):
             return
 
         try:
-            entry_price, tps, sl = self._parse_edit_input(msg.text, current)
+            entries, tps, sl, size, lev = self._parse_edit_input(msg.text, current)
 
             # 用原来的 size/lev/方向
-            size = float(current.get('size', 0))
-            lev = float(current.get('leverage', 1))
             side = SignalDirection(current.get('direction', 'long'))
 
             # 根据方向做排序（long 升序，short 降序）
@@ -2413,7 +2474,7 @@ class Telegram(RPCHandler):
 
             # 调用统一的保存逻辑（会更新 JSON 和内存，并提示）
             await self._update_manual_trade_config(
-                pair, size, lev, tps_clean, float(sl), side, entry_price=entry_price, is_update=True
+                pair, size, lev, tps_clean, float(sl), side, entries=entries, is_update=True
             )
 
             await msg.reply_text('已更新 ✅')
@@ -3239,8 +3300,7 @@ class Telegram(RPCHandler):
         if not args:
             await self._send_msg(
                 '用法：\n'
-                '/setmanual <pair|trade_id> <long|short> <tp1> <tp2> <tp3> <sl> [entry_price]\n'
-                '或：/setmanual <pair|trade_id> side=<long|short> tp=71000,72000 sl=69500 [entry=70550] entries=70500,70600'
+                '/setmanual BTC/USDT side=long tp=71000,72000 sl=69500 entries=70500,70600\n'
             )
             return
 
@@ -3267,7 +3327,7 @@ class Telegram(RPCHandler):
 
                 # 1) 修改 enter_tag 并保存
                 trade.enter_tag = f"manual_{side}"
-                trade.update()
+                trade.commit()
 
                 # 2) 写入/更新配置（同时会更新内存 strategy.manual_open）
                 from freqtrade.enums import SignalDirection

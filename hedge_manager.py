@@ -163,7 +163,6 @@ class HedgeManager:
         qty = self._notional_to_qty(symbol, plan_notional * leverage, ref_price)
         side = 'buy' if direction == 'long' else 'sell'
         params = {
-            'reduceOnly': False,
             'positionSide': 'LONG' if direction == 'long' else 'SHORT',
             'newClientOrderId': f"hg_open_{int(time.time())}",
         }
