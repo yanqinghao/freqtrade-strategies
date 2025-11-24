@@ -1132,19 +1132,19 @@ class KamaFama_Dynamic(IStrategy):
                 if ('manual' in (getattr(t, 'enter_tag', '') or '').lower())
             }
 
-            to_delete = [
-                p
-                for p in list(self.manual_open.keys())
-                if p not in keep_pairs and not self.manual_open[p].get('lock')
-            ]
-            if to_delete:
-                for p in to_delete:
-                    del self.manual_open[p]
-                self.update_strategy_state_file()
-                msg = f"🧹 清理失效 manual 配置: {', '.join(to_delete)}"
-                logger.info(msg)
-                if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
-                    self.dp.send_msg(msg)
+            # to_delete = [
+            #     p
+            #     for p in list(self.manual_open.keys())
+            #     if p not in keep_pairs and not self.manual_open[p].get('lock')
+            # ]
+            # if to_delete:
+            #     for p in to_delete:
+            #         del self.manual_open[p]
+            #     self.update_strategy_state_file()
+            #     msg = f"🧹 清理失效 manual 配置: {', '.join(to_delete)}"
+            #     logger.info(msg)
+            #     if hasattr(self, 'dp') and hasattr(self.dp, 'send_msg'):
+            #         self.dp.send_msg(msg)
 
             # ---------- 2) 回填/补齐主配置（全部使用原始浮点，不做 round） ----------
             ratios = {
@@ -2104,13 +2104,14 @@ class KamaFama_Dynamic(IStrategy):
                 full_close = (
                     trade.amount is not None
                     and amount is not None
+                    and amount > 0
                     and abs(float(trade.amount) - float(amount))
-                    <= max(1e-12, float(trade.amount) * 1e-3)  # 0.1% 容差
+                    <= max(1e-12, float(trade.amount) * 1e-5)  # 0.001% 容差
                 )
             except Exception:
                 full_close = False
 
-            if full_close and pair in self.manual_open:
+            if full_close and pair in self.manual_open and exit_reason.upper().startswith('MANUAL'):
                 logger.info(
                     f"Manual trade for {pair} fully closing. Cleaning up manual monitoring."
                 )
@@ -2543,9 +2544,9 @@ class KamaFama_Dynamic(IStrategy):
                     # 分配权重
                     n = len(entries)
                     if n == 3:
-                        allocs = [50, 30, 20]
+                        allocs = [20, 30, 50]
                     elif n == 2:
-                        allocs = [60, 40]
+                        allocs = [30, 70]
                     elif n <= 1:
                         allocs = [100]
                     else:
@@ -2581,7 +2582,7 @@ class KamaFama_Dynamic(IStrategy):
                         tag = f"manual_{direction}_entries_stage_{next_idx}"
                         logger.info(
                             f"{pair} entries触发: stage={es}->{es+1}, idx={next_idx}, "
-                            f"cur={cur}, next={next_price}, current_amount={trade.stake_amount}, amount={dca_amount}, alloc={allocs[next_idx]}%, base={base_size}"
+                            f"cur={cur}, next={next_price}, current_amount={trade.stake_amount}, plan_amt={plan_amt}, min_stake={min_stake}, amount={dca_amount}, alloc={allocs[next_idx]}%, base={base_size}"
                         )
                         return dca_amount, tag
 
@@ -2977,8 +2978,8 @@ class KamaFama_Dynamic(IStrategy):
                 )
                 trade.set_custom_data('initial_stake', trade.stake_amount)
                 # 清除临时变量
-                trade.set_custom_data('last_stake_amount', None)
-                trade.set_custom_data('pending_dca_amount', None)
+                trade.set_custom_data('last_stake_amount', 0)
+                trade.set_custom_data('pending_dca_amount', 0)
                 logger.info(
                     f"{pair}: [DCA-CLEAR] AFTER set get: initial={trade.get_custom_data('initial_stake')}, last={trade.get_custom_data('last_stake_amount')}, pending={trade.get_custom_data('pending_dca_amount')}"
                 )

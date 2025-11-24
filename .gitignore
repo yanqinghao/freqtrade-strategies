@@ -92,3 +92,4 @@ plot
 pagination*
 *.json
 *.sqlite
+*.md

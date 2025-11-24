@@ -674,16 +674,16 @@ All outputs must be **actionable** and follow the **formatting rules** below.
   - **Ranging (ADX < 22)**: both sides may be provided (distinct triggers).
 
 ### Entry Constraints
-- **Long entries:** below current price or market only with breakout confirmation.
-- **Short entries:** above current price or market only with breakdown confirmation.
+- **Long entries:** strictly below current price (Limit orders). Breakout entries allowed ONLY if volume > 2x avg.
+- **Short entries:** strictly above current price (Limit orders). Breakdown entries allowed ONLY if volume > 2x avg.
 - Every entry must be tied to **current price context**.
 
-#### ⛔ First Entry Placement Filter
+#### ⛔ First Entry Placement Filter & Conservative Buffer
 - Applies **only to the first entry** (initial position).
-- **Do not generate Short entries below current price.**
-- **Do not generate Long entries above current price.**
-- Purpose: prevent meaningless initial entries against the live market context.
-- Subsequent scale-in entries (pyramiding) are exempt from this restriction.
+- **Longs:** Entry Price must be ≤ Current Price - (0.8 × ATR(1h)).
+- **Shorts:** Entry Price must be ≥ Current Price + (0.8 × ATR(1h)).
+- **Purpose:** Prevent chasing. Ensure Stage 1 is a "Pullback Entry" and not a "FOMO Entry".
+- Exception: If a confirmed breakout signal exists (Squeezed BB expansion + Volume), the buffer is waived.
 
 
 ---
@@ -710,8 +710,11 @@ For each selected side (Long or Short), produce **three staged entries**, each w
 Then produce a full **Opposite-Side Hedge** setup using the same structure but smaller exposure and defensive intent.
 
 ### Stage Definitions
-1. **🟢 Stage 1 — Initial Probe (Rating: Strong)**
-   Small trial position near major HTF support/resistance (4h/1d MA20/50, BB edge, prior swing). Safest entry, widest stop, lowest risk.
+1. **🟢 Stage 1 — Deep Value Probe (Rating: Strong)**
+   Small position at a **significant discount** from current price.
+   - Must align with **Strong Support/Resistance** (e.g., 4h/1d Bollinger Outer Band, MA99, or Weekly Level).
+   - Avoid entering "mid-air" or on weak 15m supports.
+   - If current price is too far from support, **wait**. Do not force a trade.
 
 2. **🟡 Stage 2 — Add-on Entry (Rating: Medium)**
    Add position on retest or mid-zone (1h/4h MA20, 0.382–0.5 retrace, or range midpoint). Balanced SL and reward.
@@ -829,7 +832,7 @@ Ensures hedges can offset multi-stage losses.
 
 <b>🎯 Risk &amp; Targets — ({{LONG|SHORT}} {{SYMBOL}})</b>\n\n
 
-<b>🟢 Stage 1 — Initial Probe (Rating: Strong)</b>\n
+<b>🟢 Stage 1 — Deep Value Probe (Rating: Strong)</b>\n
 <b>Entry</b>: <code>{{entry1}}</code> — Near strongest HTF support/resistance (4h/1d MA20/50, BB edge, major swing)\n
 <b>TP1/TP2/TP3</b>: <code>{{tp1}} / {{tp2}} / {{tp3}}</code>\n
 <b>SL</b>: <code>{{sl_stage1}}</code> — 1.0×ATR buffer; switches to Final Hard SL after Stage 3\n

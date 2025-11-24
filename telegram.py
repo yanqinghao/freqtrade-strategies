@@ -92,8 +92,8 @@ def _parse_price_list(token: str) -> list[float | None]:
     return out
 
 def _allocations_for(n: int) -> list[int]:
-    if n == 3: return [50, 30, 20]
-    if n == 2: return [60, 40]
+    if n == 3: return [20, 30, 50]
+    if n == 2: return [30, 70]
     if n <= 1: return [100]
     base = 100 // n
     arr = [base] * n
@@ -626,6 +626,7 @@ class Telegram(RPCHandler):
             CallbackQueryHandler(self._force_enter_inline, pattern=r'force_enter__\S+'),
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._text_router),
             CallbackQueryHandler(self._manual_open, pattern='update_manual_list'),
+            CallbackQueryHandler(self._manual_delete,      pattern=r'manual_delete__.+'),
             CallbackQueryHandler(self._manual_open_view, pattern=r'manual_select__.+'),
             CallbackQueryHandler(self._manual_edit_inline, pattern=r'manual_edit__.+'),
             CallbackQueryHandler(self._monitor_list, pattern='update_monitor_list'),
@@ -2054,6 +2055,38 @@ class Telegram(RPCHandler):
         )
 
     @authorized_only
+    async def _manual_delete(self, update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        _, pair = query.data.split('__', 1)
+
+        state_file = 'user_data/strategy_state_production.json'
+        try:
+            with open(state_file, 'r') as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            st = {}
+
+        manual_open = st.get('manual_open', {}) or {}
+        if pair not in manual_open:
+            await self._send_msg(f'{pair} 的对冲配置不存在或已删除。', query=query)
+            return
+
+        # 删除并落盘
+        manual_open.pop(pair, None)
+        st['manual_open'] = manual_open
+        with open(state_file, 'w') as f:
+            json.dump(st, f, indent=4)
+
+        # 同步内存
+        if hasattr(self._rpc._freqtrade, 'strategy'):
+            self._rpc._freqtrade.strategy.manual_open = manual_open
+
+        await self._send_msg(f'已删除 {pair} 的配置。', query=query)
+
+        # 返回列表
+        await self._manual_open(update=update, context=context)
+
+    @authorized_only
     async def _manual_open_view(self, update: Update, context: CallbackContext) -> None:
         query = update.callback_query
         pair = query.data.split('__', 1)[1]
@@ -2098,6 +2131,7 @@ class Telegram(RPCHandler):
 
         kb = [
             [InlineKeyboardButton('✏️ 修改参数', callback_data=f"manual_edit__{pair}")],
+            [InlineKeyboardButton('🗑 删除配置', callback_data=f"manual_delete__{pair}")],
             [InlineKeyboardButton('⬅️ 返回列表', callback_data='update_manual_list')],
             [InlineKeyboardButton('🔁 刷新本页', callback_data=f"manual_select__{pair}")],
         ]
