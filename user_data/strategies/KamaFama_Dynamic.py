@@ -65,7 +65,7 @@ class KamaFama_Dynamic(IStrategy):
             {'method': 'CooldownPeriod', 'stop_duration_candles': 5},
         ]
 
-    minimal_roi = {'0': 0.5, '372': 0.3, '861': 0.2}
+    minimal_roi = {'0': 10, '372': 100, '861': 1000}
     cc_long = {}
     cc_short = {}
 
@@ -2564,11 +2564,11 @@ class KamaFama_Dynamic(IStrategy):
                         dca_amount = max(0.0, 1000 - trade.stake_amount)
 
                     # 再套 min/max（和你下方保持一致）
-                    if min_stake and dca_amount < min_stake:
-                        if trade.stake_amount + min_stake > 1000:
-                            dca_amount = 0.0
-                        else:
-                            dca_amount = float(min_stake)
+                    # if min_stake and dca_amount < min_stake:
+                    #     if trade.stake_amount + min_stake > 1000:
+                    #         dca_amount = 0.0
+                    #     else:
+                    #         dca_amount = float(min_stake)
                     if dca_amount > max_stake:
                         dca_amount = float(max_stake)
 
@@ -2593,10 +2593,16 @@ class KamaFama_Dynamic(IStrategy):
                 if trade.is_short:
                     # 空头：若价格 >= SL 价，直接全部买回平仓
                     if current_rate >= sl_price:
+                        if pair in self.manual_open:
+                            del self.manual_open[pair]
+                            self.update_strategy_state_file()
                         return -trade.stake_amount, 'manual_sl_hit'
                 else:
                     # 多头：若价格 <= SL 价，直接全部卖出
                     if current_rate <= sl_price:
+                        if pair in self.manual_open:
+                            del self.manual_open[pair]
+                            self.update_strategy_state_file()
                         return -trade.stake_amount, 'manual_sl_hit'
 
         max_price_pullback_pct = 0.005
@@ -2750,6 +2756,44 @@ class KamaFama_Dynamic(IStrategy):
                                     return -trade.stake_amount, exit_tag
 
                                 break
+
+        # 检查并更新补仓后的initial_stake
+        last_stake_amount = trade.get_custom_data('last_stake_amount')
+        pending_dca_amount = trade.get_custom_data('pending_dca_amount')
+
+        if (
+            last_stake_amount != 0
+            and pending_dca_amount != 0
+            and last_stake_amount is not None
+            and pending_dca_amount is not None
+        ):
+            # 如果确认补仓已经执行（stake_amount已增加）
+            if trade.stake_amount > last_stake_amount:
+                # 更新initial_stake为当前的总stake金额
+                logger.info(
+                    f"{pair}: [DCA-CLEAR] ENTER block, stake={trade.stake_amount}, last={last_stake_amount}, pending={pending_dca_amount}"
+                )
+                trade.set_custom_data('initial_stake', trade.stake_amount)
+                # 清除临时变量
+                trade.set_custom_data('last_stake_amount', 0)
+                trade.set_custom_data('pending_dca_amount', 0)
+                logger.info(
+                    f"{pair}: [DCA-CLEAR] AFTER set get: initial={trade.get_custom_data('initial_stake')}, last={trade.get_custom_data('last_stake_amount')}, pending={trade.get_custom_data('pending_dca_amount')}"
+                )
+                logger.info(f"{pair}: 补仓后更新initial_stake为 {trade.stake_amount}")
+
+                # === 新增：若存在 pending_entry_stage，则将 entry_stage 前进并清空 pending ===
+                pes = trade.get_custom_data('pending_entry_stage')
+                if pes is not None:
+                    trade.set_custom_data('entry_stage', int(pes))
+                    trade.set_custom_data('pending_entry_stage', None)
+
+                # 新增: 补仓成功后，重新计算止盈点位
+                direction = 'short' if trade.is_short else 'long'
+                self.recalculate_exit_points_after_dca(trade, direction)
+
+                # 重置退出阶段，从第一阶段开始计算
+                trade.set_custom_data('exit_stage', 0)
 
             # 检查补仓冷却期
             last_dca_time = trade.get_custom_data('last_dca_time')
@@ -2936,8 +2980,8 @@ class KamaFama_Dynamic(IStrategy):
                         if trade.stake_amount + min_stake > 400:
                             # logger.info(f"{pair}: 最小补仓金额 {min_stake} 会导致总金额超过 400，不补仓")
                             dca_amount = 0
-                        else:
-                            dca_amount = min_stake
+                        # else:
+                        #     dca_amount = min_stake
 
                     if dca_amount > max_stake:
                         dca_amount = max_stake
@@ -2959,44 +3003,6 @@ class KamaFama_Dynamic(IStrategy):
                         trade.set_custom_data('pending_dca_amount', dca_amount)
 
                         return dca_amount, dca_tag
-
-        # 检查并更新补仓后的initial_stake
-        last_stake_amount = trade.get_custom_data('last_stake_amount')
-        pending_dca_amount = trade.get_custom_data('pending_dca_amount')
-
-        if (
-            last_stake_amount != 0
-            and pending_dca_amount != 0
-            and last_stake_amount is not None
-            and pending_dca_amount is not None
-        ):
-            # 如果确认补仓已经执行（stake_amount已增加）
-            if trade.stake_amount > last_stake_amount:
-                # 更新initial_stake为当前的总stake金额
-                logger.info(
-                    f"{pair}: [DCA-CLEAR] ENTER block, stake={trade.stake_amount}, last={last_stake_amount}, pending={pending_dca_amount}"
-                )
-                trade.set_custom_data('initial_stake', trade.stake_amount)
-                # 清除临时变量
-                trade.set_custom_data('last_stake_amount', 0)
-                trade.set_custom_data('pending_dca_amount', 0)
-                logger.info(
-                    f"{pair}: [DCA-CLEAR] AFTER set get: initial={trade.get_custom_data('initial_stake')}, last={trade.get_custom_data('last_stake_amount')}, pending={trade.get_custom_data('pending_dca_amount')}"
-                )
-                logger.info(f"{pair}: 补仓后更新initial_stake为 {trade.stake_amount}")
-
-                # === 新增：若存在 pending_entry_stage，则将 entry_stage 前进并清空 pending ===
-                pes = trade.get_custom_data('pending_entry_stage')
-                if pes is not None:
-                    trade.set_custom_data('entry_stage', int(pes))
-                    trade.set_custom_data('pending_entry_stage', None)
-
-                # 新增: 补仓成功后，重新计算止盈点位
-                direction = 'short' if trade.is_short else 'long'
-                self.recalculate_exit_points_after_dca(trade, direction)
-
-                # 重置退出阶段，从第一阶段开始计算
-                trade.set_custom_data('exit_stage', 0)
 
         # 检查是否是固定点位监控的交易对
         # Manual trade exit logic
