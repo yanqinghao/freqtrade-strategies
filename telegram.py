@@ -2222,6 +2222,14 @@ class Telegram(RPCHandler):
                             entries = new_entries
                     except ValueError:
                         continue
+                elif k in ('tp', 'tps'):
+                    try:
+                        # 将 "2600,2650" 分割并转为 float 列表
+                        new_tps = [float(x) for x in v.split(',') if x.strip()]
+                        if new_tps:
+                            tps = new_tps
+                    except ValueError:
+                        continue
                 else:
                     # 其他字段通常是单数值
                     try:
@@ -2242,7 +2250,7 @@ class Telegram(RPCHandler):
                     elif k in ('lev', 'leverage'):
                         lev = int(val)
 
-            return entries, [tps[0], tps[1], tps[2]], sl, size, lev
+            return entries, tps, sl, size, lev
 
         # --- 3. 模式 B：纯数字序列 ---
         # 只有在没发现 '=' 时才进入这里
@@ -2376,16 +2384,15 @@ class Telegram(RPCHandler):
 
             # 合并单独 tp1-3 与 tp= 批量
             if tp_bulk is not None:
-                while len(tp_bulk) < 3:
-                    tp_bulk.append(None)
-                tps = tp_bulk[:3]
-
+                tps = tp_bulk
             # 若 tps 三个都是 None，则表示不改
             if all(x is None for x in tps):
                 tps = None
             else:
-                cur = (current.get('exit_points') or [None, None, None]) + [None] * 3
-                tps = [tps[i] if tps[i] is not None else cur[i] for i in range(3)]
+                if tp_bulk is None:
+                    cur = (current.get('exit_points') or [None, None, None]) + [None] * 3
+                    tps = [tps[i] if tps[i] is not None else cur[i] for i in range(3)]
+
             return entries, tps, sl, auto
 
         # 否则尝试纯数字
@@ -2492,14 +2499,14 @@ class Telegram(RPCHandler):
 
             # 根据方向做排序（long 升序，short 降序）
             tps_clean = [x for x in tps if x is not None]
-            if len(tps_clean) != 3:
-                # 保证三档 TP
-                # 缺失的直接沿用旧值
-                old = current.get('exit_points', [])
-                while len(tps_clean) < 3 and old:
-                    tps_clean.append(old[len(tps_clean)])
-                if len(tps_clean) != 3:
-                    raise ValueError('TP 数量不足（需要 3 个）。')
+            # if len(tps_clean) != 3:
+            #     # 保证三档 TP
+            #     # 缺失的直接沿用旧值
+            #     old = current.get('exit_points', [])
+            #     while len(tps_clean) < 3 and old:
+            #         tps_clean.append(old[len(tps_clean)])
+            #     if len(tps_clean) != 3:
+            #         raise ValueError('TP 数量不足（需要 3 个）。')
 
             if side == SignalDirection.SHORT:
                 tps_clean = sorted(tps_clean, reverse=True)
@@ -2750,19 +2757,18 @@ class Telegram(RPCHandler):
             if tps is not None:
                 side = current.get('direction', 'long')
                 tps_clean = [x for x in tps if x is not None]
-                if len(tps_clean) != 3:
-                    old = current.get('exit_points', [])
-                    while len(tps_clean) < 3 and len(old) > len(tps_clean):
-                        tps_clean.append(old[len(tps_clean)])
-                    if len(tps_clean) != 3:
-                        raise ValueError('TP 数量不足（需要 3 个）。')
+                # if len(tps_clean) != 3:
+                #     old = current.get('exit_points', [])
+                #     while len(tps_clean) < 3 and len(old) > len(tps_clean):
+                #         tps_clean.append(old[len(tps_clean)])
+                #     if len(tps_clean) != 3:
+                #         raise ValueError('TP 数量不足（需要 3 个）。')
                 if side == 'short':
                     tps_clean = sorted(tps_clean, reverse=True)
                 else:
                     tps_clean = sorted(tps_clean)
             else:
                 tps_clean = None
-
             await self._update_coin_monitoring_config(
                 pair=pair,
                 idx=int(idx),
