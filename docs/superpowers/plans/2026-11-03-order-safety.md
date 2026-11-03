@@ -55,3 +55,5 @@ Interfaces: check_protection(strategy,trade,now,force=False) -> bool, updating c
 ## Progress
 
 Preflight: TTL order metadata is per order, protection state shares only the canonical assistant_execution document; callbacks must reload after native update_trade_state. Both helpers imported at strategy module load. No interface conflict.
+
+Result: 159 offline tests passed, independent review findings fixed, deployed native RUNNING with healthy watchdog, existing orders/plans preserved. Details: [rollout and implementation decisions](2026-11-03-order-safety-progress.md).
