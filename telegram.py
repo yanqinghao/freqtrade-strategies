@@ -355,7 +355,7 @@ class Telegram(UpstreamTelegram):
         except Exception as exc:
             Trade.rollback()
             state = store.get(ref)['state']
-            if state == 'reserved':
+            if state == 'reserved' or isinstance(exc, self._rpc._freqtrade.strategy.risk_error):
                 message = str(exc) if isinstance(exc, ValueError) else '提交前检查失败，未下单，请核对运行状态。'
                 return store.set_status(ref, 'rejected', {'message': message})
             logger.warning('Entry submission requires reconciliation (%s)', type(exc).__name__)
@@ -470,28 +470,30 @@ class Telegram(UpstreamTelegram):
             for p in plan['exit_points']
         ):
             raise ValueError('止盈必须位于入场价的盈利方向')
+        strategy.enforce_entry_risk(request, existing, plan, rate)
         if request_ref:
             # Account queries can take time while a Telegram pause arrives.
             self._rpc._force_entry_validations(pair, SignalDirection(request['direction']))
             strategy.entry_requests.set_status(request_ref, 'submitting', {})
         strategy.set_manual_plan(pair, plan)
         try:
-            trade = self._rpc._rpc_force_entry(
-                pair,
-                request.get('entry_price'),
-                order_side=SignalDirection(request['direction']),
-                order_type='limit' if request.get('entry_price') is not None else 'market',
-                stake_amount=request['size'],
-                leverage=request['leverage'],
-                enter_tag='manual_'
-                + request['direction']
-                + ('|ttl=' + str(request['ttl_seconds']) if 'entry_price' in request else '')
-                + ('|req=' + request_ref if request_ref else ''),
-            )
+            with strategy.risk_request(request_ref):
+                trade = self._rpc._rpc_force_entry(
+                    pair,
+                    request.get('entry_price'),
+                    order_side=SignalDirection(request['direction']),
+                    order_type='limit' if request.get('entry_price') is not None else 'market',
+                    stake_amount=request['size'],
+                    leverage=request['leverage'],
+                    enter_tag='manual_'
+                    + request['direction']
+                    + ('|ttl=' + str(request['ttl_seconds']) if 'entry_price' in request else '')
+                    + ('|req=' + request_ref if request_ref else ''),
+                )
             if trade is None:
                 raise RPCException('未创建订单')
-        except (ValueError, RPCException):
-            if request_ref:
+        except (ValueError, RPCException) as exc:
+            if request_ref and not isinstance(exc, strategy.risk_error):
                 raise
             if old is None:
                 strategy.delete_manual_plan(pair)

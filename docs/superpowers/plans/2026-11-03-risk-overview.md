@@ -35,8 +35,8 @@ Interfaces: load_limits(path), plan_for_entry(strategy,request,trade), estimate_
 
 Files: entry_risk.py installation; strategy native context; Telegram preflight and known-rejection handling; journal unresolved-all read; native integration tests.
 Interfaces: install_risk_guard(strategy,bot), EntryRiskError class exposed by strategy, strategy current request context; guard uses actual native base amount/rate/leverage and current limits.
-- [ ] RED requested/final cap breaches including native sizing changes, bypassed add confirmation, self/other pending request handling, restore plan, metadata/query failure and exit bypass.
-- [ ] Implement enforcement and context lifecycle; GREEN complete suite, hooks; commit.
+- [x] RED requested/final cap breaches including native sizing changes, bypassed add confirmation, self/other pending request handling, restore plan, metadata/query failure and exit bypass.
+- [x] Implement enforcement and context lifecycle; GREEN complete suite, hooks; commit.
 
 ## Task 3: Read-only overview and documentation
 

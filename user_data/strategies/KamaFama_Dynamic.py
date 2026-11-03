@@ -7,6 +7,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from copy import deepcopy
+from contextlib import contextmanager
 from math import isfinite, nextafter, inf
 from pathlib import Path
 from threading import RLock
@@ -20,7 +21,14 @@ from freqtrade.util import FtPrecise
 
 from assistant_state import read_state, update_state
 from entry_requests import EntryRequests
-from entry_risk import EntryRiskError, plan_for_entry, assess_entry
+from entry_risk import (
+    EntryRiskError,
+    plan_for_entry,
+    assess_entry,
+    load_limits,
+    enforce,
+    install_risk_guard,
+)
 from market_monitor import HourlyMarketMonitor
 from market_alerts import MarketAlerts
 from exit_policy import plan_exit
@@ -80,6 +88,7 @@ class KamaFama_Dynamic(IStrategy):
     def bot_start(self, **kwargs):
         if self.execution_bot is not None:
             install_entry_receipt_guard(self, self.execution_bot)
+            install_risk_guard(self, self.execution_bot)
         if str(getattr(self.config.get('runmode'), 'value', self.config.get('runmode'))) in (
             'live',
             'dry_run',
@@ -109,6 +118,24 @@ class KamaFama_Dynamic(IStrategy):
             result['reasons'].append('该币种有未完成订单，实际入场前须先核实或撤单')
             result['allowed'] = False
         return result
+
+    @contextmanager
+    def risk_request(self, ref):
+        previous = self._risk_request_ref
+        self._risk_request_ref = ref
+        try:
+            yield
+        finally:
+            self._risk_request_ref = previous
+
+    def enforce_entry_risk(self, request, trade, plan, rate):
+        if load_limits(self.risk_limits_file) is None:
+            return None
+        return enforce(
+            assess_entry(
+                self, request, trade, plan, rate=rate, ignore_request=self._risk_request_ref
+            )
+        )
 
     def ensure_entry_position(self, pair, trade):
         mode = self.config.get('runmode')

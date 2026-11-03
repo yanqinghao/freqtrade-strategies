@@ -115,6 +115,7 @@ with tempfile.TemporaryDirectory() as directory:
                                              last_process=datetime.now(timezone.utc),
                                              exchange=SimpleNamespace(
                                                  fetch_order=lambda *a, **kw: None,
+                                                 create_order=lambda **kw: None,
                                                  cancel_order_with_result=lambda *a, **kw: None))
     strategy.bot_start()
     assert strategy.execution_bot.exchange._assistant_entry_receipts

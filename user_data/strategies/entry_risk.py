@@ -299,3 +299,77 @@ def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, igno
     except Exception as error:
         logger.warning('Entry risk estimate unavailable (%s)', type(error).__name__)
         raise EntryRiskError('风险数据暂无法核实，本次未提交，请核对行情及记录') from None
+
+
+def enforce(result):
+    if not result['allowed']:
+        raise EntryRiskError('；'.join(result['reasons']) + '；本次未提交，不会自动缩量或更改杠杆')
+    return result
+
+
+def install_risk_guard(strategy, bot):
+    """Check final native entry parameters, leaving closing-only calls untouched."""
+    exchange = bot.exchange
+    exchange._assistant_risk_strategy = strategy
+    if getattr(exchange, '_assistant_risk_guard', False):
+        return
+    original = exchange.create_order
+
+    def guarded(**kwargs):
+        if kwargs.get('reduceOnly') is True:
+            return original(**kwargs)
+        current = exchange._assistant_risk_strategy
+        if load_limits(current.risk_limits_file) is None:
+            return original(**kwargs)
+        try:
+            if kwargs.get('reduceOnly', False) is not False or kwargs.get('side') not in (
+                'buy',
+                'sell',
+            ):
+                raise EntryRiskError('无法确认原生订单入场方向，本次未提交')
+            pair = kwargs['pair']
+            direction = 'short' if kwargs['side'] == 'sell' else 'long'
+            rate = number(kwargs['rate'], positive=True)
+            amount = number(kwargs['amount'], positive=True)
+            leverage = number(kwargs['leverage'], positive=True)
+            request = {
+                'pair': pair,
+                'direction': direction,
+                'size': float(amount * rate / leverage),
+                'leverage': float(leverage),
+                'entry_price': float(rate),
+            }
+            ref = current._risk_request_ref
+            if ref:
+                pending = current.entry_requests.get(ref)
+                if (
+                    not pending
+                    or pending['state'] != 'submitting'
+                    or pending['request']['pair'] != pair
+                    or pending['request']['direction'] != direction
+                ):
+                    raise EntryRiskError('原生提交与当前请求上下文不匹配，本次未提交')
+            trade = Trade.get_trades([Trade.is_open.is_(True), Trade.pair == pair]).first()
+            plan = (
+                saved_plan(current, trade)
+                if trade
+                else deepcopy(current.manual_open.get(pair) or {})
+            )
+            if plan.get('direction') != direction or not plan.get('stop_loss'):
+                raise EntryRiskError('原生入场缺少匹配的保护计划，本次未提交')
+            enforce(
+                assess_entry(
+                    current, request, trade, plan, rate=rate, amount=amount, ignore_request=ref
+                )
+            )
+        except EntryRiskError:
+            raise
+        except Exception as error:
+            logger.warning('Final entry risk guard unavailable (%s)', type(error).__name__)
+            raise EntryRiskError('最终风险核对不可用，本次未向交易所提交') from None
+        # Never classify an exception from the actual exchange call as a local rejection.
+        return original(**kwargs)
+
+    exchange.create_order = guarded
+    exchange._assistant_risk_guard = True
+    logger.info('Final native entry risk guard installed')
