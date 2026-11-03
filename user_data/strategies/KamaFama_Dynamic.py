@@ -6,7 +6,7 @@ There are deliberately no signal entries or unattended position increases.
 import logging
 import os
 from copy import deepcopy
-from math import isfinite
+from math import isfinite, nextafter, inf
 from pathlib import Path
 from threading import RLock
 from concurrent.futures import Future
@@ -15,9 +15,11 @@ from queue import Queue, Empty
 from pandas import DataFrame
 from freqtrade.strategy import IStrategy, stoploss_from_absolute
 from freqtrade.persistence import Trade
+from freqtrade.util import FtPrecise
 
 from assistant_state import read_state, update_state
 from market_monitor import HourlyMarketMonitor
+from exit_policy import plan_exit
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ class KamaFama_Dynamic(IStrategy):
         self._state_lock = RLock()
         self.market_monitor = None
         self._commands = Queue()
+        self.execution_bot = None
 
     def bot_start(self, **kwargs):
         if str(getattr(self.config.get('runmode'), 'value', self.config.get('runmode'))) in (
@@ -89,6 +92,9 @@ class KamaFama_Dynamic(IStrategy):
                     if hasattr(Trade, 'session'):
                         Trade.rollback()
                     future.set_exception(exc)
+        if self.execution_bot is not None:
+            for trade in Trade.get_open_trades():
+                self.check_full_exit(trade, current_time)
         if self.market_monitor:
             for message in self.market_monitor.tick(current_time):
                 self.dp.send_msg(message, always_send=True)
@@ -237,7 +243,131 @@ class KamaFama_Dynamic(IStrategy):
         if hit:
             stage = self._execution(trade).get('stage', 0)
             return 'manual_pullback_stop' if stage else 'manual_sl_hit'
+        full = self._execution(trade).get('full_exit')
+        if full and not full.get('blocked'):
+            if full.get('attempt_at') and not full.get('retry_ready'):
+                return None
+            quantity, reason = self.exit_decision(trade, current_rate, trade.amount)
+            if quantity is None:
+                self.request_full_exit(trade, reason, blocked=True)
+                return None
+            return 'manual_minimum_full_exit'
         return None
+
+    def exit_decision(self, trade, rate, quantity, *, manual=False):
+        exchange = self.dp._exchange
+        market = exchange.markets.get(trade.pair, {})
+        name = self.config.get('exchange', {}).get('name') or getattr(trade, 'exchange', None)
+        exempt = (
+            name in ('binance', 'binanceusdm')
+            and self.config.get('trading_mode', 'futures') == 'futures'
+            and market.get('contract')
+            and market.get('linear')
+        )
+        # Match native checks exactly: these methods return the value that the
+        # pinned bot/RPC compares directly with quote-value of the remainder.
+        if manual:
+            floor = exchange.get_min_pair_stake_amount(
+                trade.pair, rate, getattr(trade, 'stop_loss_pct', None) or 0.0
+            )
+        else:
+            floor = exchange.get_min_pair_stake_amount(
+                trade.pair, rate, self.stoploss, trade.leverage
+            )
+        return plan_exit(
+            exchange,
+            trade.pair,
+            trade.amount,
+            quantity,
+            rate,
+            min_notional_exempt=exempt,
+            min_remaining_value=floor or 0.0,
+        )
+
+    def _exit_notice(self, message):
+        logger.warning(message)
+        try:
+            self.dp.send_msg(message, always_send=True)
+        except Exception:
+            logger.exception('Unable to enqueue exit alert')
+
+    def request_full_exit(self, trade, reason, *, blocked=False):
+        state = self._execution(trade)
+        full = state.get('full_exit') or {}
+        changed = not full or full.get('blocked') != blocked or full.get('reason') != reason
+        full.update(reason=reason, blocked=blocked)
+        if blocked:
+            full['needs_protection_check'] = True
+        state['full_exit'] = full
+        self._save_execution(trade, state)
+        if changed:
+            self._exit_notice(
+                f'{trade.pair}：整仓暂不满足平仓规则（{reason}），未平记录已保留，需核实交易所仓位与止损。'
+                if blocked
+                else f'{trade.pair}：分批退出受限（{reason}），已切换为全平计划，实际成交前不会清理记录。'
+            )
+
+    def mark_full_exit_attempt(self, trade, current_time):
+        state = self._execution(trade)
+        full = state.get('full_exit')
+        if not full:
+            return
+        full.update(
+            attempt_at=current_time.timestamp(),
+            attempt_done=False,
+            blocked=False,
+            retry_ready=False,
+            orders_before=[str(o.order_id) for o in trade.orders],
+        )
+        self._save_execution(trade, state)
+
+    def check_full_exit(self, trade, current_time):
+        state = self._execution(trade)
+        full = state.get('full_exit')
+        if not full or not trade.is_open or not trade.amount:
+            return
+        attempt = full.get('attempt_at')
+        check_protection = full.get('needs_protection_check', False)
+        retry = False
+        if not check_protection:
+            if not attempt or full.get('attempt_done') or current_time.timestamp() <= attempt:
+                return
+            if trade.has_open_orders and current_time.timestamp() - attempt < 30:
+                return
+            previous = set(full.get('orders_before', []))
+            retry = not trade.has_open_orders and any(
+                str(o.order_id) not in previous
+                and o.ft_order_side == trade.exit_side
+                and float(o.filled or 0) > 0
+                and o.status in ('closed', 'canceled', 'cancelled', 'expired')
+                for o in trade.orders
+            )
+        full.update(
+            attempt_done=True, needs_protection_check=False, blocked=not retry, retry_ready=retry
+        )
+        self._save_execution(trade, state)
+        protection = '尚无法核验止损'
+        bot = self.execution_bot
+        if bot is not None and self.order_types.get('stoploss_on_exchange'):
+            try:
+                with bot._exit_lock:
+                    bot.handle_stoploss_on_exchange(trade)
+                protection = (
+                    '框架已核验/尝试恢复止损，当前有止损记录'
+                    if getattr(trade, 'open_sl_orders', [])
+                    else '框架已尝试恢复止损，但仍无有效止损记录，请立即检查交易所'
+                )
+            except Exception:
+                protection = '止损核验失败，请立即检查交易所'
+                logger.exception('Unable to verify stop protection for %s', trade.pair)
+        if not trade.is_open or not trade.amount:
+            return
+        self._exit_notice(
+            f'{trade.pair}：全平仅部分成交，仍有 {trade.amount:g}，将继续退出余量。{protection}。'
+            if retry
+            else f'{trade.pair}：全平失败或未确认完成，仍有 {trade.amount:g}。'
+            f'已暂停自动重复提交，请通过 /order、交易所核实后用 /forceexit 重试。{protection}。'
+        )
 
     def _tranche_target(self, trade, state, stage, target_count):
         key = str(stage)
@@ -253,9 +383,7 @@ class KamaFama_Dynamic(IStrategy):
             exchange = getattr(getattr(self, 'dp', None), '_exchange', None)
             if exchange:
                 quantity = float(exchange.amount_to_contract_precision(trade.pair, quantity))
-            # If a tranche is smaller than one exchange contract, take the whole
-            # tradable position rather than repeatedly proposing zero quantity.
-            targets[key] = quantity if quantity > 0 else trade.amount
+            targets[key] = quantity
         return targets[key]
 
     def adjust_trade_position(
@@ -273,7 +401,14 @@ class KamaFama_Dynamic(IStrategy):
         if not trade.is_open or not trade.amount or not trade.open_rate or trade.has_open_orders:
             return None
         rate = current_exit_rate if current_exit_rate is not None else current_rate
-        if self.custom_exit(trade.pair, trade, current_time, rate, current_profit):
+        exit_reason = self.custom_exit(trade.pair, trade, current_time, rate, current_profit)
+        full = self._execution(trade).get('full_exit')
+        if full:
+            if full.get('blocked') or (full.get('attempt_at') and not full.get('retry_ready')):
+                return None
+            self.mark_full_exit_attempt(trade, current_time)
+            return -trade.stake_amount, 'manual_minimum_full_exit'
+        if exit_reason:
             return -trade.stake_amount, 'manual_protective_exit'
         plan = self._plan(trade)
         targets = self._targets(plan, trade)
@@ -290,9 +425,36 @@ class KamaFama_Dynamic(IStrategy):
             already = state.get('tp_filled', {}).get(str(stage + 1), 0)
             amount = min(trade.amount, max(0, target - already))
             self._save_execution(trade, state)
-        if amount <= 0:
-            return None
-        stake = trade.stake_amount * amount / trade.amount
+        quantity, reason = self.exit_decision(trade, rate, amount)
+        if reason:
+            self.request_full_exit(trade, reason, blocked=quantity is None)
+            if quantity is None:
+                return None
+            self.mark_full_exit_attempt(trade, current_time)
+            return -trade.stake_amount, 'manual_minimum_full_exit'
+        amount = quantity
+        # Use the native core's string arithmetic for the inverse, then verify
+        # its actual roundtrip before returning a stake-based reduction.
+        stake = min(
+            trade.stake_amount,
+            nextafter(
+                float(FtPrecise(trade.stake_amount) * FtPrecise(amount) / FtPrecise(trade.amount)),
+                inf,
+            ),
+        )
+        roundtrip = self.dp._exchange.amount_to_contract_precision(
+            trade.pair,
+            abs(float(FtPrecise(-stake) * FtPrecise(trade.amount) / FtPrecise(trade.stake_amount))),
+        )
+        if roundtrip != amount:
+            quantity, full_reason = self.exit_decision(trade, rate, trade.amount)
+            self.request_full_exit(
+                trade, full_reason or 'quantity_roundtrip', blocked=quantity is None
+            )
+            if quantity is None:
+                return None
+            self.mark_full_exit_attempt(trade, current_time)
+            return -trade.stake_amount, 'manual_minimum_full_exit'
         return -stake, f"manual_{'short' if trade.is_short else 'long'}_tp{stage + 1}"
 
     def order_filled(self, pair, trade, order, current_time, **kwargs):
@@ -377,6 +539,7 @@ class KamaFama_Dynamic(IStrategy):
         current_time,
         **kwargs,
     ):
+        self.mark_full_exit_attempt(trade, current_time)
         return True  # Never remove a plan or reject a protective exit before a fill.
 
     def _cancel_for_stop(self, trade):

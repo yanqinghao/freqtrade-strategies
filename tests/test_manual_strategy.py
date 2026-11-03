@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from test_exit_policy import RuleExchange
 
 # The repo's patched telegram.py is not the python-telegram-bot package.
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +69,12 @@ class ManualStrategyTests(unittest.TestCase):
                 'trade_id': 1,
             }
         }
+        self.exchange = RuleExchange(minimum=0.001, step='.001', cost=0.0, pair=self.trade.pair)
+        self.messages = []
+        self.strategy.dp = SimpleNamespace(
+            _exchange=self.exchange,
+            send_msg=lambda message, **kwargs: self.messages.append(message),
+        )
 
     def adjust(self, rate):
         return self.strategy.adjust_trade_position(
@@ -249,15 +256,6 @@ class ManualStrategyTests(unittest.TestCase):
                 self.assertAlmostEqual(self.adjust(140)[0], -60.0)
 
     def test_take_profit_uses_exchange_quantity_precision(self):
-        from decimal import Decimal, ROUND_DOWN
-
-        self.strategy.dp = SimpleNamespace(
-            _exchange=SimpleNamespace(
-                amount_to_contract_precision=lambda pair, amount: float(
-                    Decimal(str(amount)).quantize(Decimal('.001'), rounding=ROUND_DOWN)
-                )
-            )
-        )
         self.trade.amount = 0.011
         self.trade.stake_amount = 11.0
         result = self.adjust(111)
@@ -276,13 +274,181 @@ class ManualStrategyTests(unittest.TestCase):
         self.assertEqual(self.trade.get_custom_data('assistant_execution', {}).get('stage', 0), 1)
 
     def test_too_small_tp_tranche_closes_position_instead_of_stalling(self):
-        self.strategy.dp = SimpleNamespace(
-            _exchange=SimpleNamespace(
-                amount_to_contract_precision=lambda pair, amount: float(int(amount))
-            )
+        from decimal import Decimal
+
+        self.exchange.step = Decimal(1)
+        self.exchange.markets[self.trade.pair]['limits']['amount']['min'] = 1.0
+        self.exchange.markets[self.trade.pair]['info']['filters'][0].update(
+            minQty='1', stepSize='1'
         )
         self.trade.amount = 1.0
         self.assertEqual(self.adjust(111)[0], -self.trade.stake_amount)
+
+    def test_remainder_floor_switches_tp_to_durable_full_exit(self):
+        self.exchange.remaining_floor = 800.0
+        result = self.adjust(111)
+        self.assertEqual(result[0], -100.0)
+        self.assertIn('full', result[1])
+        self.assertEqual(self.strategy._execution(self.trade).get('stage', 0), 0)
+        # The full-close intent remains active even if price drops below TP1.
+        self.assertTrue(self.strategy._execution(self.trade)['full_exit'])
+        self.assertIsNone(
+            self.strategy.custom_exit(self.trade.pair, self.trade, self.now, 105.0, 0.5)
+        )
+
+    def test_partial_fill_of_fallback_never_advances_tp_stage(self):
+        self.exchange.remaining_floor = 800.0
+        result = self.adjust(111)
+        self.trade.amount = 6.0
+        self.trade.stake_amount = 60.0
+        order = SimpleNamespace(
+            order_id='fallback',
+            ft_order_side='sell',
+            ft_order_tag=result[1],
+            filled=4.0,
+            amount=10.0,
+            status='canceled',
+        )
+        self.trade.orders.append(order)
+        self.strategy.order_filled(self.trade.pair, self.trade, order, self.now)
+        self.assertEqual(self.strategy._execution(self.trade).get('stage', 0), 0)
+        self.assertIn(self.trade.pair, self.strategy.manual_open)
+        self.assertTrue(self.strategy._execution(self.trade)['full_exit'])
+        self.assertIsNone(
+            self.strategy.custom_exit(self.trade.pair, self.trade, self.now, 105.0, 0.5)
+        )
+
+    def test_failed_fallback_alerts_and_requests_stop_protection(self):
+        self.assertTrue(
+            hasattr(self.strategy, 'check_full_exit'), 'fallback failure observer missing'
+        )
+        self.exchange.remaining_floor = 800.0
+        self.adjust(111)
+        restored = []
+
+        def restore(trade):
+            restored.append(trade.id)
+            trade.open_sl_orders = [SimpleNamespace(order_id='protected')]
+
+        from threading import Lock
+
+        self.strategy.execution_bot = SimpleNamespace(
+            _exit_lock=Lock(), handle_stoploss_on_exchange=restore
+        )
+        self.trade.open_sl_orders = []
+        from datetime import timedelta
+
+        self.strategy.check_full_exit(self.trade, self.now + timedelta(seconds=5))
+        self.assertEqual(restored, [1])
+        self.assertTrue(any('未确认' in m or '失败' in m for m in self.messages))
+        self.assertIn(self.trade.pair, self.strategy.manual_open)
+        self.assertIsNone(
+            self.strategy.custom_exit(self.trade.pair, self.trade, self.now, 105.0, 0.5)
+        )
+        count = len(self.messages)
+        self.strategy.check_full_exit(self.trade, self.now + timedelta(seconds=10))
+        self.assertEqual(len(self.messages), count)
+
+    def test_full_exit_invalid_keeps_position_and_warns(self):
+        self.exchange.markets[self.trade.pair]['limits']['amount']['min'] = 20.0
+        self.assertIsNone(self.adjust(111))
+        self.assertIn(self.trade.pair, self.strategy.manual_open)
+        self.assertTrue(self.messages)
+
+    def test_native_adjustment_submits_full_instead_of_skipping_tiny_remainder(self):
+        from freqtrade.freqtradebot import FreqtradeBot
+
+        bot = object.__new__(FreqtradeBot)
+        bot.strategy = self.strategy
+        bot.exchange = self.exchange
+        bot.exchange.remaining_floor = 800.0
+        bot.exchange.get_rates = lambda *a, **kw: (111.0, 111.0)
+        bot.exchange.get_max_pair_stake_amount = lambda *a, **kw: 10000.0
+        bot.wallets = SimpleNamespace(get_available_stake_amount=lambda: 10000.0)
+        self.trade.calc_profit_ratio = lambda rate: (rate - 100.0) / 100.0
+        submitted = []
+        bot.execute_trade_exit = lambda *a, **kw: submitted.append(kw) or True
+        bot.check_and_call_adjust_trade_position(self.trade)
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0]['sub_trade_amt'], self.trade.amount)
+        self.assertEqual(submitted[0]['exit_tag'], 'manual_minimum_full_exit')
+
+    def test_native_stake_roundtrip_preserves_validated_minimum_quantity(self):
+        from freqtrade.freqtradebot import FreqtradeBot
+
+        bot = object.__new__(FreqtradeBot)
+        bot.strategy = self.strategy
+        bot.exchange = self.exchange
+        self.trade.calc_profit_ratio = lambda rate: 0.1
+        self.exchange.get_rates = lambda *a, **kw: (111.0, 111.0)
+        self.exchange.get_max_pair_stake_amount = lambda *a, **kw: 10000.0
+        bot.wallets = SimpleNamespace(get_available_stake_amount=lambda: 10000.0)
+        submitted = []
+        bot.execute_trade_exit = lambda *a, **kw: submitted.append(kw) or True
+        for total, stake, quantity in (
+            (0.017, 1.0, 0.003),
+            (0.275, 3.0, 0.082),
+            (0.017, 0.3, 0.001),
+        ):
+            with self.subTest(total=total, stake=stake, quantity=quantity):
+                self.trade.amount = total
+                self.trade.stake_amount = stake
+                self.trade.set_custom_data('assistant_execution', {'tp_targets': {'1': quantity}})
+                self.exchange.markets[self.trade.pair]['limits']['amount']['min'] = quantity
+                submitted.clear()
+                bot.check_and_call_adjust_trade_position(self.trade)
+                self.assertEqual(len(submitted), 1)
+                self.assertEqual(submitted[0]['sub_trade_amt'], quantity)
+
+    def test_protection_that_closes_position_does_not_emit_false_failure(self):
+        self.exchange.remaining_floor = 800.0
+        self.adjust(111)
+        before = len(self.messages)
+        from threading import Lock
+
+        def close_on_stop(trade):
+            trade.is_open = False
+
+        self.strategy.execution_bot = SimpleNamespace(
+            _exit_lock=Lock(), handle_stoploss_on_exchange=close_on_stop
+        )
+        from datetime import timedelta
+
+        self.strategy.check_full_exit(self.trade, self.now + timedelta(seconds=5))
+        self.assertEqual(len(self.messages), before)
+
+    def test_partial_fallback_is_retried_for_remaining_position(self):
+        self.exchange.remaining_floor = 800.0
+        result = self.adjust(111)
+        self.trade.amount = 6.0
+        self.trade.stake_amount = 60.0
+        order = SimpleNamespace(
+            order_id='partially-filled',
+            ft_order_side='sell',
+            ft_order_tag=result[1],
+            filled=4.0,
+            amount=10.0,
+            status='canceled',
+        )
+        self.trade.orders.append(order)
+        self.strategy.order_filled(self.trade.pair, self.trade, order, self.now)
+        from datetime import timedelta
+
+        self.strategy.check_full_exit(self.trade, self.now + timedelta(seconds=5))
+        self.assertEqual(self.adjust(105)[0], -60.0)
+
+    def test_zero_fill_cancel_after_observer_does_not_blindly_retry(self):
+        self.exchange.remaining_floor = 800.0
+        self.adjust(111)
+        self.trade.has_open_orders = True
+        from datetime import timedelta
+
+        self.strategy.check_full_exit(self.trade, self.now + timedelta(seconds=5))
+        # Native manage_open_orders may reconcile this after our observer ran.
+        self.trade.has_open_orders = False
+        self.assertIsNone(
+            self.strategy.custom_exit(self.trade.pair, self.trade, self.now, 105.0, 0.5)
+        )
 
     def test_fill_replay_after_interrupted_commit_is_idempotent(self):
         result = self.adjust(111)

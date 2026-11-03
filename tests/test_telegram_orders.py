@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from threading import Lock
 
 from test_telegram_assistant import load_telegram
+from test_exit_policy import RuleExchange
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'user_data' / 'strategies'))
@@ -25,6 +26,9 @@ class TelegramOrderTests(unittest.TestCase):
         engine = Trade.session.get_bind()
 
         def cleanup_database():
+            from freqtrade.persistence.custom_data import _CustomData
+
+            _CustomData.session.remove()
             Trade.session.remove()
             engine.dispose()
 
@@ -46,6 +50,9 @@ class TelegramOrderTests(unittest.TestCase):
             )
         )
         self.bot._rpc = self.rpc
+        self.exchange = RuleExchange(minimum=0.001, step='.001', cost=0.0, pair='BTC/USDT:USDT')
+        self.rpc._freqtrade.exchange = self.exchange
+        self.strategy.dp = SimpleNamespace(_exchange=self.exchange, send_msg=lambda *a, **kw: None)
         self.request = self.module.parse_entry(
             ['BTC', '100', '3', 'sl=90', 'tp=110,120,130'], 'long'
         )
@@ -114,6 +121,59 @@ class TelegramOrderTests(unittest.TestCase):
         self.rpc._rpc_force_exit = lambda ident, **kw: calls.append((ident, kw)) or {'result': 'ok'}
         self.bot._close_position(str(trade.id), 40)
         self.assertEqual(calls[0][1]['amount'], 4.0)
+
+    def test_close_percentage_with_tiny_remainder_requests_native_full_close(self):
+        trade = self.position()
+        self.exchange.remaining_floor = 700.0
+        calls = []
+        self.rpc._rpc_force_exit = lambda ident, **kw: calls.append((ident, kw)) or {'result': 'ok'}
+        self.bot._close_position(str(trade.id), 40)
+        self.assertIsNone(calls[0][1].get('amount'))
+        self.assertTrue(trade.get_custom_data('assistant_execution')['full_exit'])
+
+    def test_native_rpc_accepts_fallback_without_remaining_amount_rejection(self):
+        from freqtrade.rpc import RPC
+        from freqtrade.enums import State
+
+        trade = self.position()
+        self.exchange.remaining_floor = 700.0
+        runtime = self.rpc._freqtrade
+        runtime.state = State.RUNNING
+        runtime.wallets = SimpleNamespace(update=lambda: None)
+        submitted = []
+        runtime.execute_trade_exit = lambda *a, **kw: submitted.append(kw) or True
+        native_rpc = object.__new__(RPC)
+        native_rpc._freqtrade = runtime
+        self.bot._rpc = native_rpc
+        self.bot._close_position(str(trade.id), 40)
+        self.assertEqual(len(submitted), 1)
+        self.assertIsNone(submitted[0]['sub_trade_amt'])
+
+    def test_full_fallback_survives_reload_and_rejects_add(self):
+        trade = self.position()
+        self.strategy.set_manual_plan(
+            trade.pair,
+            {
+                'trade_id': trade.id,
+                'direction': 'long',
+                'stop_loss': 90,
+                'exit_points': [110, 120, 130],
+            },
+        )
+        self.strategy._plan(trade)
+        self.exchange.remaining_floor = 700.0
+        self.rpc._rpc_force_exit = lambda *a, **kw: {'result': 'ok'}
+        self.bot._close_position(str(trade.id), 40)
+        self.Trade.session.remove()
+        reopened = self.Trade.get_open_trades()[0]
+        restored = type(self.strategy)(self.strategy.config)
+        restored.dp = self.strategy.dp
+        self.assertTrue(restored._execution(reopened)['full_exit'])
+        self.assertIsNone(
+            restored.custom_exit(reopened.pair, reopened, datetime.now(timezone.utc), 105.0, 0.5)
+        )
+        with self.assertRaisesRegex(ValueError, '全平'):
+            self.bot._submit_entry(self.request)
 
     def test_plan_edit_does_not_change_position_direction(self):
         trade = self.position()

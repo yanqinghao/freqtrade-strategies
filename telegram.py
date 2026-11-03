@@ -80,6 +80,7 @@ def parse_entry(args, direction):
 class Telegram(UpstreamTelegram):
     def __init__(self, rpc, config):
         self._manual_order_lock = asyncio.Lock()
+        rpc._freqtrade.strategy.execution_bot = rpc._freqtrade
         super().__init__(rpc, config)
 
     def _init_keyboard(self):
@@ -236,6 +237,8 @@ class Telegram(UpstreamTelegram):
         strategy = bot.strategy
         existing = Trade.get_trades([Trade.is_open.is_(True), Trade.pair == pair]).first()
         if existing:
+            if strategy._execution(existing).get('full_exit'):
+                raise ValueError('该持仓正在全平兜底处理中，请确认退出完成后再开仓')
             if existing.is_short != (request['direction'] == 'short'):
                 raise ValueError('同一币种只允许单方向持仓，请先平掉原方向')
             if existing.has_open_orders:
@@ -349,9 +352,24 @@ class Telegram(UpstreamTelegram):
         trade = Trade.get_trades([Trade.is_open.is_(True), Trade.id == int(ident)]).first()
         if not trade:
             raise ValueError('未找到该持仓')
-        return self._rpc._rpc_force_exit(
-            ident, ordertype='market', amount=trade.amount * percentage / 100
+        bot = self._rpc._freqtrade
+        rate = bot.exchange.get_rate(trade.pair, side='exit', is_short=trade.is_short, refresh=True)
+        requested = (
+            trade.amount
+            if bot.strategy._execution(trade).get('full_exit')
+            else trade.amount * percentage / 100
         )
+        amount, reason = bot.strategy.exit_decision(trade, rate, requested, manual=True)
+        if reason:
+            bot.strategy.request_full_exit(trade, reason, blocked=amount is None)
+            if amount is None:
+                raise ValueError('整仓也暂不满足平仓规则，已保留记录并请求核验止损，请检查交易所')
+        if amount >= trade.amount:
+            from datetime import datetime, timezone
+
+            bot.strategy.mark_full_exit_attempt(trade, datetime.now(timezone.utc))
+            return self._rpc._rpc_force_exit(ident, ordertype='market')
+        return self._rpc._rpc_force_exit(ident, ordertype='market', amount=amount)
 
     @authorized_only
     async def _close(self, update, context):
