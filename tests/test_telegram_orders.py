@@ -17,7 +17,7 @@ class TelegramOrderTests(unittest.TestCase):
     def setUp(self):
         self.module = load_telegram()
         from freqtrade.persistence import init_db, Trade
-        from freqtrade.enums import RunMode
+        from freqtrade.enums import RunMode, State
         from KamaFama_Dynamic import KamaFama_Dynamic
 
         self.temp = tempfile.TemporaryDirectory()
@@ -47,8 +47,10 @@ class TelegramOrderTests(unittest.TestCase):
                 strategy=self.strategy,
                 exchange=SimpleNamespace(get_rate=lambda *a, **k: 100.0),
                 _exit_lock=Lock(),
+                state=State.RUNNING,
             )
         )
+        self.rpc._force_entry_validations = lambda *a, **kw: None
         self.bot._rpc = self.rpc
         self.exchange = RuleExchange(minimum=0.001, step='.001', cost=0.0, pair='BTC/USDT:USDT')
         self.exchange._api = SimpleNamespace(fetch_open_orders=lambda *a, **kw: [])

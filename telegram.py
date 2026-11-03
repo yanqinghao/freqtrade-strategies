@@ -292,6 +292,10 @@ class Telegram(UpstreamTelegram):
             for other in store.unresolved(request['pair']):
                 if self._entry_request_status(other['ref'])['state'] == 'unknown':
                     raise ValueError(f"该币种请求 {other['ref']} 尚待核实，本次未提交；请先 /request 查询")
+            # Native eligibility (especially PAUSED) must fail before plan changes.
+            self._rpc._force_entry_validations(
+                request['pair'], SignalDirection(request['direction'])
+            )
             result = self._submit_entry(request, request_ref=ref)
             return store.set_status(ref, 'submitted', result)
         except Exception as exc:
@@ -413,6 +417,8 @@ class Telegram(UpstreamTelegram):
         ):
             raise ValueError('止盈必须位于入场价的盈利方向')
         if request_ref:
+            # Account queries can take time while a Telegram pause arrives.
+            self._rpc._force_entry_validations(pair, SignalDirection(request['direction']))
             strategy.entry_requests.set_status(request_ref, 'submitting', {})
         strategy.set_manual_plan(pair, plan)
         try:

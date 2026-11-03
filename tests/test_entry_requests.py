@@ -191,6 +191,81 @@ class EntryRequestFlowTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(store.get(self.ref)['result']['order_ids'], ['order-1'])
 
+    def test_paused_native_rejection_preserves_existing_plan_and_tp_state(self):
+        self.prepare()
+        from freqtrade.enums import SignalDirection, State
+        from freqtrade.rpc import RPC
+
+        trade = self.position()
+        prior = {
+            'trade_id': trade.id,
+            'direction': 'long',
+            'stop_loss': 80.0,
+            'exit_points': [150.0],
+        }
+        self.strategy.set_manual_plan(trade.pair, prior)
+        self.strategy._save_execution(trade, {'stage': 1, 'protected_stop': 100.0})
+        before = self.strategy._execution(trade)
+        self.rpc._freqtrade.state = State.PAUSED
+        self.rpc._freqtrade.config = {'force_entry_enable': True}
+        self.rpc._force_entry_validations = lambda pair, side: RPC._force_entry_validations(
+            self.rpc, pair, side
+        )
+
+        def native_reject(*args, **kwargs):
+            self.calls.append(kwargs)
+            self.rpc._force_entry_validations(trade.pair, SignalDirection.LONG)
+
+        self.rpc._rpc_force_entry = native_reject
+        request = {**self.request, 'stop_loss': 95.0, 'exit_points': [110.0]}
+        row = self.bot._execute_entry_request(request, self.ref)
+        self.assertEqual(row['state'], 'rejected')
+        self.assertEqual(self.strategy.manual_open[trade.pair], prior)
+        self.assertEqual(self.strategy._execution(trade), before)
+        self.assertEqual(self.calls, [])
+        self.bot._execute_entry_request(request, self.ref)
+        self.assertEqual(self.calls, [])
+
+    def test_pause_during_account_checks_cannot_install_new_plan(self):
+        self.prepare()
+        from freqtrade.enums import SignalDirection, State
+        from freqtrade.rpc import RPC
+
+        trade = self.position()
+        prior = {
+            'trade_id': trade.id,
+            'direction': 'long',
+            'stop_loss': 80.0,
+            'exit_points': [150.0],
+        }
+        self.strategy.set_manual_plan(trade.pair, prior)
+        self.rpc._freqtrade.config = {'force_entry_enable': True}
+
+        def eligibility(pair, side):
+            if self.rpc._freqtrade.state != State.RUNNING:
+                RPC._force_entry_validations(self.rpc, pair, side)
+
+        self.rpc._force_entry_validations = eligibility
+        original = self.strategy.ensure_entry_protection
+
+        def pause(trade):
+            original(trade)
+            self.rpc._freqtrade.state = State.PAUSED
+
+        self.strategy.ensure_entry_protection = pause
+
+        def native_reject(*args, **kwargs):
+            self.calls.append(kwargs)
+            eligibility(trade.pair, SignalDirection.LONG)
+
+        self.rpc._rpc_force_entry = native_reject
+        row = self.bot._execute_entry_request(
+            {**self.request, 'stop_loss': 95.0, 'exit_points': [110.0]}, self.ref
+        )
+        self.assertEqual(row['state'], 'rejected')
+        self.assertEqual(self.strategy.manual_open[trade.pair], prior)
+        self.assertEqual(self.calls, [])
+
     def test_rejected_preflight_is_cached_and_does_not_change_plan(self):
         store = self.prepare()
         bad = {**self.request, 'stop_loss': 101.0}
