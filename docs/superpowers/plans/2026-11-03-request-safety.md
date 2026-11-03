@@ -42,6 +42,8 @@ Interfaces: EntryRequests.reserve/get/recent/set_status/unresolved; Telegram exe
 ## Task 3: Review and rollout
 
 - [x] Fresh read-only whole-branch review; important findings reproduced RED and fixed GREEN.
-- [ ] Merge/push, build and verify merged image tests; consistent DB/plan/request-journal backups, read-only preflight.
-- [ ] Update service; verify image artifacts, native RUNNING, Telegram, watchdog and existing records/plans; no live test entries.
-- [ ] Record rollout, archive own workspace and preserve host-managed checkout.
+- [x] Merge/push, build and verify merged image tests; consistent DB/plan/request-journal backups, read-only preflight.
+- [x] Update service; verify image artifacts, native RUNNING, Telegram, watchdog and existing records/plans; no live test entries.
+- [x] Record rollout, archive own workspace and preserve host-managed checkout.
+
+Result:187 offline tests passed, independent review finding fixed, main pushed and service RUNNING with healthy watchdog and preserved records. See [verification and implementation decisions](2026-11-03-request-safety-progress.md).
