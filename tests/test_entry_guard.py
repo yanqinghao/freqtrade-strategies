@@ -140,3 +140,106 @@ class EntryGuardTests(unittest.TestCase):
 
     def test_simulation_does_not_contact_real_account(self):
         self.guard(SimpleNamespace(), self.pair, self.trade, dry_run=True)
+
+
+class ExternalEntryOrderTests(unittest.TestCase):
+    def setUp(self):
+        import entry_guard
+
+        self.assertTrue(hasattr(entry_guard, 'ensure_no_entry_orders'))
+        self.guard = entry_guard.ensure_no_entry_orders
+        self.pair = 'BTC/USDT:USDT'
+        self.regular, self.conditional, self.calls = [], [], []
+
+        def fetch(pair, **kwargs):
+            self.calls.append((pair, kwargs))
+            return self.conditional if kwargs.get('params', {}).get('trigger') else self.regular
+
+        self.exchange = SimpleNamespace(_api=SimpleNamespace(fetch_open_orders=fetch))
+        self.row = {
+            'id': 'outside-1',
+            'symbol': self.pair,
+            'status': 'open',
+            'side': 'buy',
+            'type': 'limit',
+            'reduceOnly': False,
+            'info': {'positionSide': 'BOTH', 'reduceOnly': False},
+        }
+
+    def test_empty_queries_both_regular_and_conditional_fresh(self):
+        self.guard(self.exchange, self.pair)
+        self.guard(self.exchange, self.pair)
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(self.calls[1], (self.pair, {'params': {'trigger': True}}))
+
+    def test_regular_and_conditional_entry_orders_block_both_sides(self):
+        for conditional in (False, True):
+            for side in ('buy', 'sell'):
+                with self.subTest(conditional=conditional, side=side):
+                    self.regular, self.conditional = [], []
+                    row = {
+                        **self.row,
+                        'side': side,
+                        'type': 'stop_market' if conditional else 'limit',
+                    }
+                    (self.conditional if conditional else self.regular).append(row)
+                    with self.assertRaisesRegex(ValueError, '挂单'):
+                        self.guard(self.exchange, self.pair)
+
+    def test_explicit_reduce_only_or_close_position_orders_do_not_block(self):
+        self.regular = [{**self.row, 'reduceOnly': True, 'info': {'reduceOnly': True}}]
+        self.conditional = [
+            {
+                **self.row,
+                'side': 'sell',
+                'closePosition': True,
+                'info': {'reduceOnly': False, 'closePosition': True},
+            }
+        ]
+        self.guard(self.exchange, self.pair)
+
+    def test_unknown_or_contradictory_flags_and_mode_fail_closed(self):
+        for change in (
+            {'reduceOnly': True},
+            {'reduceOnly': 'invalid'},
+            {'info': []},
+            {'side': None},
+            {'status': None},
+            {'id': None},
+            {'info': {'positionSide': 'LONG'}},
+            {'symbol': None},
+        ):
+            with self.subTest(change=change):
+                self.regular = [{**self.row, **change}]
+                with self.assertRaises(ValueError):
+                    self.guard(self.exchange, self.pair)
+
+    def test_other_symbols_and_confirmed_terminal_orders_do_not_block(self):
+        self.regular = [{**self.row, 'symbol': 'ETH/USDT:USDT'}, {**self.row, 'status': 'canceled'}]
+        self.guard(self.exchange, self.pair)
+
+    def test_query_failures_and_malformed_responses_are_not_empty(self):
+        def fail(*args, **kwargs):
+            raise ValueError('SECRET_SIGNED_URL')
+
+        self.exchange._api.fetch_open_orders = fail
+        with self.assertRaises(ValueError) as caught:
+            self.guard(self.exchange, self.pair)
+        self.assertNotIn('SECRET_SIGNED_URL', str(caught.exception))
+        for response in (None, {}, [None]):
+            self.exchange._api.fetch_open_orders = lambda *a, **kw: response
+            with self.assertRaises(ValueError):
+                self.guard(self.exchange, self.pair)
+
+    def test_conditional_query_failure_cannot_be_hidden_by_empty_regular(self):
+        def fetch(*args, **kwargs):
+            if kwargs:
+                raise TimeoutError('private')
+            return []
+
+        self.exchange._api.fetch_open_orders = fetch
+        with self.assertRaises(ValueError):
+            self.guard(self.exchange, self.pair)
+
+    def test_simulation_never_queries_private_orders(self):
+        self.guard(SimpleNamespace(), self.pair, dry_run=True)

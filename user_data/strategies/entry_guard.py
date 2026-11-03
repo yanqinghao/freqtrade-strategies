@@ -79,3 +79,59 @@ def ensure_position_matches(exchange, pair, trade, *, dry_run=False):
     tolerance = min(rounding_noise, min(steps, default=Decimal(1)) * size * Decimal('.001'))
     if abs(actual - expected) > tolerance:
         raise ValueError('交易所与本地持仓数量不一致，未提交订单；请核对 /status、/order 与交易所')
+
+
+def _closing_flag(order, name):
+    values = []
+    for source in (order, order.get('info', {})):
+        if not isinstance(source, dict):
+            raise ValueError('交易所挂单字段无效，未提交订单')
+        value = source.get(name)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            values.append(value)
+        elif isinstance(value, str) and value.lower() in ('true', 'false'):
+            values.append(value.lower() == 'true')
+        else:
+            raise ValueError('交易所挂单平仓标志无效，未提交订单')
+    if len(set(values)) > 1:
+        raise ValueError('交易所挂单平仓标志矛盾，未提交订单')
+    return any(values)
+
+
+def ensure_no_entry_orders(exchange, pair, *, dry_run=False):
+    """Read ordinary and conditional orders; never cancel external orders."""
+    if dry_run:
+        return
+    for params in (None, {'trigger': True}):
+        try:
+            rows = (
+                exchange._api.fetch_open_orders(pair, params=params)
+                if params
+                else exchange._api.fetch_open_orders(pair)
+            )
+        except Exception:
+            raise ValueError('无法核对普通/条件挂单，未提交订单；请检查连接后重试') from None
+        if not isinstance(rows, list):
+            raise ValueError('交易所挂单响应无效，未提交订单')
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get('symbol'), str):
+                raise ValueError('交易所挂单数据不完整，未提交订单')
+            if row['symbol'] != pair:
+                continue
+            if row.get('status') in ('closed', 'canceled', 'cancelled', 'expired', 'rejected'):
+                continue
+            info = row.get('info', {})
+            if (
+                row.get('status') != 'open'
+                or not row.get('id')
+                or row.get('side') not in ('buy', 'sell')
+                or not isinstance(info, dict)
+                or info.get('positionSide') not in (None, 'BOTH')
+            ):
+                raise ValueError('交易所挂单状态/持仓模式无法确认，未提交订单')
+            reduce_only = _closing_flag(row, 'reduceOnly')
+            close_all = _closing_flag(row, 'closePosition')
+            if not reduce_only and not close_all:
+                raise ValueError(f'{pair} 存在潜在入场挂单，请先核对交易所；未提交新订单，不会自动撤单')

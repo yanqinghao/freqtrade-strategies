@@ -22,7 +22,7 @@ from assistant_state import read_state, update_state
 from market_monitor import HourlyMarketMonitor
 from market_alerts import MarketAlerts
 from exit_policy import plan_exit
-from entry_guard import ensure_position_matches
+from entry_guard import ensure_position_matches, ensure_no_entry_orders
 from execution_health import HeartbeatPublisher
 from entry_lifecycle import process_entry_orders, install_entry_receipt_guard
 from stop_protection import check_protection
@@ -98,6 +98,7 @@ class KamaFama_Dynamic(IStrategy):
         mode = self.config.get('runmode')
         simulated = self.config.get('dry_run', getattr(mode, 'value', mode) == 'dry_run')
         ensure_position_matches(self.dp._exchange, pair, trade, dry_run=simulated)
+        ensure_no_entry_orders(self.dp._exchange, pair, dry_run=simulated)
 
     def ensure_entry_protection(self, trade):
         if trade is not None and not check_protection(

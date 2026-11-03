@@ -51,6 +51,7 @@ class TelegramOrderTests(unittest.TestCase):
         )
         self.bot._rpc = self.rpc
         self.exchange = RuleExchange(minimum=0.001, step='.001', cost=0.0, pair='BTC/USDT:USDT')
+        self.exchange._api = SimpleNamespace(fetch_open_orders=lambda *a, **kw: [])
         self.rpc._freqtrade.exchange = self.exchange
         self.strategy.dp = SimpleNamespace(_exchange=self.exchange, send_msg=lambda *a, **kw: None)
         self.request = self.module.parse_entry(
@@ -110,6 +111,27 @@ class TelegramOrderTests(unittest.TestCase):
             self.bot._submit_entry(self.request)
         self.assertEqual(calls, [])
         self.assertEqual(self.strategy.manual_open[self.request['pair']], prior)
+
+    def test_external_entry_order_blocks_before_plan_and_submission(self):
+        self.strategy.config['dry_run'] = False
+        self.exchange.fetch_positions = lambda pair: []
+        self.exchange._api.fetch_open_orders = lambda pair, **kw: [
+            {
+                'id': 'outside',
+                'symbol': pair,
+                'status': 'open',
+                'side': 'buy',
+                'type': 'limit',
+                'reduceOnly': False,
+                'info': {'reduceOnly': False},
+            }
+        ]
+        calls = []
+        self.rpc._rpc_force_entry = lambda *a, **kw: calls.append(a) or self.position()
+        with self.assertRaisesRegex(ValueError, '挂单'):
+            self.bot._submit_entry(self.request)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.strategy.manual_open, {})
 
     def test_live_position_query_failure_does_not_submit_order(self):
         self.strategy.config['dry_run'] = False
