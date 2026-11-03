@@ -19,6 +19,7 @@ from freqtrade.persistence import Trade
 from freqtrade.util import FtPrecise
 
 from assistant_state import read_state, update_state
+from entry_requests import EntryRequests
 from market_monitor import HourlyMarketMonitor
 from market_alerts import MarketAlerts
 from exit_policy import plan_exit
@@ -63,6 +64,9 @@ class KamaFama_Dynamic(IStrategy):
             or Path(config.get('user_data_dir', 'user_data')) / 'strategy_state_production.json'
         )
         self.manual_open = read_state(self.state_file).get('manual_open', {})
+        self.entry_requests = EntryRequests(
+            Path(config.get('user_data_dir', 'user_data')) / 'entry_requests.sqlite'
+        )
         self._state_lock = RLock()
         self.market_monitor = None
         self._commands = Queue()

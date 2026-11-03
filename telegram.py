@@ -8,7 +8,7 @@ from math import isfinite
 
 from telegram.ext import CallbackQueryHandler, CommandHandler
 from freqtrade.enums import SignalDirection
-from freqtrade.persistence import Trade
+from freqtrade.persistence import Trade, Order
 from freqtrade.rpc import RPCException
 from freqtrade.rpc._telegram_base import Telegram as UpstreamTelegram, authorized_only
 
@@ -123,6 +123,7 @@ class Telegram(UpstreamTelegram):
             'fx': self._force_exit,
             'close': self._close,
             'manual': self._manual,
+            'request': self._request,
             'setmanual': self._set_manual,
             'monitor': self._monitor,
             'coo': self._cancel_open_order,
@@ -148,6 +149,7 @@ class Telegram(UpstreamTelegram):
                 block=name
                 not in {
                     'monitor',
+                    'request',
                     'forcelong',
                     'forceshort',
                     'setmanual',
@@ -228,32 +230,149 @@ class Telegram(UpstreamTelegram):
 
     @authorized_only
     async def _force_enter(self, update, context, order_side):
+        request_ref = None
         try:
             request = parse_entry(context.args or [], order_side.value)
-            async with self._manual_order_lock:
-                result = await self._await_command(self._submit_entry, request)
-            lifetime = (
-                f"限价单有效期 {request['ttl_seconds'] // 60} 分钟，从订单创建时计算。\n"
-                if 'ttl_seconds' in request
-                else ''
+            request_ref = self._rpc._freqtrade.strategy.entry_requests.reference(
+                update.effective_chat.id, update.effective_message.message_id
             )
+            async with self._manual_order_lock:
+                row = await self._await_command(self._execute_entry_request, request, request_ref)
+            await self._send_msg(self._format_entry_request(row), parse_mode=None)
+        except (ValueError, RPCException) as exc:
+            suffix = f'\n请求 {request_ref}，可用 /request {request_ref} 查询。' if request_ref else ''
+            await self._send_msg(str(exc) + suffix, parse_mode=None)
+        except Exception as exc:
+            logger.warning('Entry request unavailable (%s)', type(exc).__name__)
+            ref_label = request_ref or '未建立'
             await self._send_msg(
-                f"已提交交易 #{result['id']}：{request['pair']} {request['direction']}\n"
-                f"本次保证金 {request['size']:g} USDT，杠杆 {result['leverage']:g}x。\n"
-                + lifetime
-                + '成交情况以订单通知和 /status 为准；没有后续自动补仓。',
+                f'请求 {ref_label} 状态暂无法确认，请先用 /request、/status 和 /order 核实，勿直接重复下单。',
                 parse_mode=None,
             )
+
+    def _entry_request_status(self, ref):
+        store = self._rpc._freqtrade.strategy.entry_requests
+        row = store.get(ref)
+        if row is None:
+            raise ValueError('未找到请求；可能尚未进入交易循环或未成功建立记录')
+        if row['state'] in ('submitting', 'unknown'):
+            orders = (
+                Trade.session.query(Order).filter(Order.ft_order_tag.endswith('|req=' + ref)).all()
+            )
+            orders = [
+                o
+                for o in orders
+                if o.ft_pair == row['request']['pair']
+                and o.ft_order_side == ('sell' if row['request']['direction'] == 'short' else 'buy')
+            ]
+            if orders:
+                trade = orders[0].trade
+                return store.set_status(
+                    ref,
+                    'submitted',
+                    {
+                        'id': orders[0].ft_trade_id,
+                        'leverage': trade.leverage if trade else None,
+                        'order_ids': [o.order_id for o in orders],
+                    },
+                )
+            return store.set_status(
+                ref, 'unknown', {'message': '提交结果尚未确认，该币种暂停新增入场；核实交易所后可显式 resolve，旧请求不会重发。'}
+            )
+        if row['state'] == 'reserved':
+            return store.set_status(ref, 'rejected', {'message': '请求在提交前中断，未自动重放；请核实后发送新指令。'})
+        return row
+
+    def _execute_entry_request(self, request, ref):
+        store = self._rpc._freqtrade.strategy.entry_requests
+        row, fresh = store.reserve(ref, request)
+        if not fresh:
+            return self._entry_request_status(ref)
+        try:
+            for other in store.unresolved(request['pair']):
+                if self._entry_request_status(other['ref'])['state'] == 'unknown':
+                    raise ValueError(f"该币种请求 {other['ref']} 尚待核实，本次未提交；请先 /request 查询")
+            result = self._submit_entry(request, request_ref=ref)
+            return store.set_status(ref, 'submitted', result)
+        except Exception as exc:
+            Trade.rollback()
+            state = store.get(ref)['state']
+            if state == 'reserved':
+                message = str(exc) if isinstance(exc, ValueError) else '提交前检查失败，未下单，请核对运行状态。'
+                return store.set_status(ref, 'rejected', {'message': message})
+            logger.warning('Entry submission requires reconciliation (%s)', type(exc).__name__)
+            store.set_status(ref, 'unknown', {'message': '交易所提交结果待核实，不会自动重下。'})
+            return self._entry_request_status(ref)
+
+    def _resolve_entry_request(self, ref):
+        row = self._entry_request_status(ref)
+        if row['state'] != 'unknown':
+            return row
+        pair = row['request']['pair']
+        trade = Trade.get_trades([Trade.is_open.is_(True), Trade.pair == pair]).first()
+        self._rpc._freqtrade.strategy.ensure_entry_position(pair, trade)
+        return self._rpc._freqtrade.strategy.entry_requests.set_status(
+            ref, 'resolved', {'message': '已按你的指令核对当前仓位和挂单并解除阻塞；旧请求不会重新提交，新入场请发新指令。'}
+        )
+
+    @staticmethod
+    def _format_entry_request(row):
+        states = {
+            'reserved': '待执行',
+            'submitting': '提交待核实',
+            'submitted': '已提交',
+            'rejected': '未提交/已拒绝',
+            'unknown': '结果待核实',
+            'resolved': '已核实解除',
+        }
+        request, result = row['request'], row['result']
+        text = f"请求 {row['ref']}：{states[row['state']]}\n{request['pair']} {request['direction']}\n"
+        if row['state'] == 'submitted':
+            text += f"交易 #{result['id']}，关联订单 {', '.join(result['order_ids'])}。\n"
+            leverage = result.get('leverage')
+            leverage_text = f'{leverage:g}x' if leverage is not None else '未核实'
+            text += f"请求保证金 {request['size']:g} USDT，实际杠杆 {leverage_text}。\n"
+            if 'ttl_seconds' in request:
+                text += f"限价有效期 {request['ttl_seconds'] // 60} 分钟，从订单创建时计算。\n"
+            text += '本请求不会重复下单；实际成交/退出以 /order、/status 和 /trades 为准。'
+        else:
+            text += result.get('message', '请稍后查询。')
+        return text
+
+    @authorized_only
+    async def _request(self, update, context):
+        args = context.args or []
+        if len(args) > 2 or (len(args) == 2 and args[1] != 'resolve'):
+            await self._send_msg(
+                '用法：/request [请求编号]；核实后解除未知阻塞：/request <编号> resolve', parse_mode=None
+            )
+            return
+        try:
+            if args:
+                function = (
+                    self._resolve_entry_request if len(args) == 2 else self._entry_request_status
+                )
+                rows = [await self._await_command(function, args[0])]
+            else:
+
+                def recent():
+                    return [
+                        self._entry_request_status(r['ref'])
+                        for r in self._rpc._freqtrade.strategy.entry_requests.recent()
+                    ]
+
+                rows = await self._await_command(recent)
+            if not rows:
+                await self._send_msg('暂无本版本开单请求记录。', parse_mode=None)
+            for row in rows:
+                await self._send_msg(self._format_entry_request(row), parse_mode=None)
         except (ValueError, RPCException) as exc:
             await self._send_msg(str(exc), parse_mode=None)
+        except Exception as exc:
+            logger.warning('Entry request lookup unavailable (%s)', type(exc).__name__)
+            await self._send_msg('请求记录暂不可用，请核对 /order、/status 与交易所；本命令未提交新订单。', parse_mode=None)
 
-        except Exception:
-            logger.exception('Manual entry submission could not be confirmed')
-            await self._send_msg(
-                '提交状态暂无法确认，保护计划已保留。请先用 /status 和 /order 核实，勿直接重复下单。', parse_mode=None
-            )
-
-    def _submit_entry(self, request):
+    def _submit_entry(self, request, request_ref=None):
         pair = request['pair']
         bot = self._rpc._freqtrade
         strategy = bot.strategy
@@ -279,9 +398,12 @@ class Telegram(UpstreamTelegram):
         plan.setdefault('exit_points', [])
         if not plan.get('stop_loss'):
             raise ValueError('开仓必须提供 sl=<止损价>；本助手不自动生成止损')
-        rate = request.get('entry_price') or bot.exchange.get_rate(
-            pair, side='entry', is_short=request['direction'] == 'short', refresh=True
-        )
+        try:
+            rate = request.get('entry_price') or bot.exchange.get_rate(
+                pair, side='entry', is_short=request['direction'] == 'short', refresh=True
+            )
+        except Exception:
+            raise ValueError('无法取得入场参考价格，本次未提交') from None
         sl = float(plan['stop_loss'])
         if sl <= rate if request['direction'] == 'short' else sl >= rate:
             raise ValueError('止损必须位于当前入场价的亏损方向')
@@ -290,6 +412,8 @@ class Telegram(UpstreamTelegram):
             for p in plan['exit_points']
         ):
             raise ValueError('止盈必须位于入场价的盈利方向')
+        if request_ref:
+            strategy.entry_requests.set_status(request_ref, 'submitting', {})
         strategy.set_manual_plan(pair, plan)
         try:
             trade = self._rpc._rpc_force_entry(
@@ -301,11 +425,14 @@ class Telegram(UpstreamTelegram):
                 leverage=request['leverage'],
                 enter_tag='manual_'
                 + request['direction']
-                + ('|ttl=' + str(request['ttl_seconds']) if 'entry_price' in request else ''),
+                + ('|ttl=' + str(request['ttl_seconds']) if 'entry_price' in request else '')
+                + ('|req=' + request_ref if request_ref else ''),
             )
             if trade is None:
                 raise RPCException('未创建订单')
         except (ValueError, RPCException):
+            if request_ref:
+                raise
             if old is None:
                 strategy.delete_manual_plan(pair)
             else:
@@ -314,7 +441,14 @@ class Telegram(UpstreamTelegram):
         bound = deepcopy(strategy.manual_open.get(pair) or plan)
         bound['trade_id'] = trade.id
         strategy.set_manual_plan(pair, bound)
-        return {'id': trade.id, 'leverage': trade.leverage}
+        order_ids = [
+            o.order_id
+            for o in trade.orders
+            if request_ref and (o.ft_order_tag or '').endswith('|req=' + request_ref)
+        ]
+        if request_ref and not order_ids:
+            raise RPCException('订单关联尚未确认')
+        return {'id': trade.id, 'leverage': trade.leverage, 'order_ids': order_ids}
 
     @authorized_only
     async def _manual(self, update, context):
@@ -429,6 +563,10 @@ class Telegram(UpstreamTelegram):
             '限价单默认24h有效，可填 ttl=4h 或 ttl=2d（1m至5d）；市价单不填ttl。\n'
             '到期撤单依赖机器人在线和网络；检测到部分成交后撤余量，优先保护已成交仓位。\n'
             '加仓前须实时确认交易所止损；未确认时拒绝加仓，平仓照常。\n'
+            '新入场前核对同币种普通/条件挂单；只减仓或整仓退出单可保留，不自动撤外部单。\n'
+            '同一开单消息重放只返回原请求；主动发送新消息视为新开仓/加仓请求。\n'
+            '/request [请求编号] 查询一条或最近5条开单请求\n'
+            '/request <编号> resolve 核实后解除未知请求阻塞（不重发旧请求）\n'
             '/forceshort BTC 100 3 sl=105000 tp=98000,95000,90000\n'
             '金额为保证金USDT，后接杠杆；不填price则市价，只接受单个入场价。以上数字仅示范格式。\n'
             '同方向已有持仓时，同一命令用于明确加仓，杠杆须与原仓一致。\n\n'

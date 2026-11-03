@@ -11,7 +11,7 @@ TERMINAL = {'closed', 'canceled', 'expired', 'rejected'}
 
 def entry_ttl(order):
     tag = order.ft_order_tag or ''
-    match = re.fullmatch(r'manual_(?:long|short)\|ttl=(\d+)', tag)
+    match = re.fullmatch(r'manual_(?:long|short)\|ttl=(\d+)(?:\|req=[0-9a-f]{24})?', tag)
     if not match:
         if '|ttl=' in tag:
             raise ValueError('订单有效期元数据无效')

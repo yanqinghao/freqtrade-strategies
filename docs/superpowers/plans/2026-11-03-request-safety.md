@@ -35,9 +35,9 @@ Interfaces: ensure_no_entry_orders(exchange,pair,*,dry_run=False), consumed by e
 
 Files: new entry_requests.py, telegram.py, strategy eager import/init, entry_lifecycle tag parser, tests/test_entry_requests.py and Telegram/lifecycle tests; README/help.
 Interfaces: EntryRequests.reserve/get/recent/set_status/unresolved; Telegram execution/status/resolve wrappers, native tag |req=<24hex>.
-- [ ] Add RED duplicate/new-message/fingerprint/restart/unknown/resolve/storage failure/native tag and TTL tests.
-- [ ] Implement journal, guarded dispatch/status recovery, explicit resolution and query command; update help/README.
-- [ ] Run complete GREEN suite and hooks; commit.
+- [x] Add RED duplicate/new-message/fingerprint/restart/unknown/resolve/storage failure/native tag and TTL tests.
+- [x] Implement journal, guarded dispatch/status recovery, explicit resolution and query command; update help/README.
+- [x] Run complete GREEN suite and hooks; commit.
 
 ## Task 3: Review and rollout
 
