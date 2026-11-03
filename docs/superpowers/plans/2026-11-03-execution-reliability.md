@@ -51,11 +51,17 @@ Interfaces: HeartbeatPublisher(bot,path).publish(now), start(), close() writes o
 
 Consumes the two components above; deployment uses the unchanged live database/manual plan and a separate health directory.
 
-- [ ] Request one fresh whole-change read-only review. Fix important findings using RED→GREEN regressions, then green full suite.
-- [ ] Fast-forward main, test merged source, push; create TG-only config locally without printing credentials. Backup/recheck live trades/orders/plans and verify Binance connectivity.
-- [ ] Gracefully update main service and start watchdog; verify native RUNNING heartbeat, fresh health snapshot, watchdog healthy status, monitoring and preservation of existing orders/plans. No injected live faults or test orders.
-- [ ] Record evidence, push completion docs and retain host-managed worktree per platform ownership.
+- [x] Request one fresh whole-change read-only review. Fix important findings using RED→GREEN regressions, then green full suite.
+- [x] Fast-forward main, test merged source, push; create TG-only config locally without printing credentials. Backup/recheck live trades/orders/plans and verify Binance connectivity.
+- [x] Gracefully update main service and start watchdog; verify native RUNNING heartbeat, fresh health snapshot, watchdog healthy status, monitoring and preservation of existing orders/plans. No injected live faults or test orders.
+- [x] Record evidence, push completion docs and retain host-managed worktree per platform ownership.
 
 ## Progress
 
 Baseline: 83 tests green in /tmp/execution-reliability-baseline.log. No dependency install required; use pinned deployment image with network disabled for tests.
+
+Final evidence: 124/124 tests on exact merged source (`/tmp/reliability-merged-tests.log`), commit hooks/Compose validation/image build passed. Review corrections cover storage degradation notifications, actual spot metadata validation, malformed records and bounded bot-restart tolerance. Read-only Binance guard smoke, public probes and restricted offline container start/stop passed. No test orders or injected live faults.
+
+Live verification 2026-11-03 07:45 UTC: main RUNNING with fresh native last_process, watchdog running with readonly root/minimal mounts and no faults or pending notification, fresh completed-loop observation. Its config contains only token/chat_id. Running Telegram artifact contains the entry guard. Both prior unfilled order IDs/statuses and full manual plan remained intact. One startup Telegram ConnectError was followed by no recurrence for over two minutes and successful read-only TG authentication; native retry was retained.
+
+Notification storage failures intentionally degrade to in-memory notification/deduplication, with explicit warning and later flush; duplicate notices across a degraded restart remain possible. Same-host outages cannot be notified until the host/network can operate. Independent review did not operate production; all rollout evidence above was checked by the implementer. Profitability is outside this operational change.
