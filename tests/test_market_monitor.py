@@ -124,11 +124,10 @@ class MarketMonitorTests(unittest.TestCase):
 
     def test_alert_checks_are_minutely_without_repeating_hourly_reports_or_fetches(self):
         from concurrent.futures import Future
+        from market_alerts import MarketAlerts
         import inspect
 
-        self.assertIn(
-            'alert_state_file', inspect.signature(self.module.HourlyMarketMonitor).parameters
-        )
+        self.assertIn('alerts', inspect.signature(self.module.HourlyMarketMonitor).parameters)
 
         class Executor:
             def __init__(self):
@@ -153,7 +152,7 @@ class MarketMonitorTests(unittest.TestCase):
             path = Path(directory) / 'alerts.json'
             executor = Executor()
             monitor = self.module.HourlyMarketMonitor(
-                fetch, executor=executor, alert_state_file=path
+                fetch, executor=executor, alerts=MarketAlerts(path)
             )
             self.assertEqual(monitor.tick(self.now), [])
             self.assertEqual(
@@ -178,13 +177,12 @@ class MarketMonitorTests(unittest.TestCase):
 
     def test_alert_storage_failure_does_not_discard_hourly_reports(self):
         import inspect
+        from market_alerts import MarketAlerts
 
-        self.assertIn(
-            'alert_state_file', inspect.signature(self.module.HourlyMarketMonitor).parameters
-        )
+        self.assertIn('alerts', inspect.signature(self.module.HourlyMarketMonitor).parameters)
         with tempfile.TemporaryDirectory() as directory:
             monitor = self.module.HourlyMarketMonitor(
-                lambda p, t: self.candles(t), alert_state_file=directory
+                lambda p, t: self.candles(t), alerts=MarketAlerts(directory)
             )
             self.addCleanup(monitor.close)
             with self.assertLogs('market_monitor', level='ERROR'):

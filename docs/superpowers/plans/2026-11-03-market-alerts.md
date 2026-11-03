@@ -43,12 +43,12 @@
 
 **Files:** modify `market_monitor.py`, `KamaFama_Dynamic.py`, `tests/test_market_monitor.py`, `tests/test_manual_strategy.py`, `README.md`.
 
-**Interfaces:** `HourlyMarketMonitor(..., alert_state_file=None)` keeps hourly-only behavior for existing callers; production strategy supplies a dedicated sibling `market_alert_state.json`. One worker cycle runs due hourly reports and minute alert checks, sharing per-cycle fetched rows. Manual reports do not mutate alert state.
+**Interfaces:** `HourlyMarketMonitor(..., alerts=None)` keeps hourly-only behavior for existing callers; production strategy imports `MarketAlerts` while the native temporary strategy path exists and supplies an instance using a dedicated sibling `market_alert_state.json`. One worker cycle runs due hourly reports and minute alert checks, sharing per-cycle fetched rows. Manual reports do not mutate alert state.
 
 - [x] Add failing tests proving minute scheduling, same-hour hourly reports do not repeat, pending jobs do not block ticks, and strategy enables a separate alert-state file.
 - [x] Implement scheduling and wiring; document thresholds, startup baseline, cooldown and best-effort notifications.
 - [x] Run all unittest tests with `--network none`; expect green suite. Run Black/Flake8 and `git diff --check`.
-- [ ] Request one fresh read-only whole-change review; address important findings with failing regressions before fixes.
+- [x] Request one fresh read-only whole-change review; address important findings with failing regressions before fixes.
 - [ ] Commit reviewed code, fast-forward original checkout and push under prior authorization. Check current assistant positions/plans, build/restart service, inspect redacted logs and baseline state. Do not submit orders.
 
 ## Progress

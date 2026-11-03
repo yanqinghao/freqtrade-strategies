@@ -1,6 +1,7 @@
 import importlib
 import sys
 import tempfile
+import subprocess
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,6 +98,28 @@ class ManualStrategyTests(unittest.TestCase):
         self.assertIsNotNone(alerts, 'production monitoring must enable closed-candle alerts')
         self.assertEqual(alerts.state_file.name, 'market_alert_state.json')
         self.assertNotEqual(str(alerts.state_file), self.strategy.state_file)
+
+    def test_monitor_starts_after_native_strategy_import_path_is_removed(self):
+        script = '''
+import sys, tempfile
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from KamaFama_Dynamic import KamaFama_Dynamic
+sys.path.remove(sys.argv[1])
+with tempfile.TemporaryDirectory() as directory:
+    strategy = KamaFama_Dynamic({'runmode': 'dry_run', 'user_data_dir': Path(directory),
+                                'stake_currency': 'USDT', 'exchange': {'name': 'binance'}})
+    strategy.bot_start()
+    assert strategy.market_monitor._alerts is not None
+    strategy.market_monitor.close()
+'''
+        result = subprocess.run(
+            [sys.executable, '-c', script, str(ROOT / 'user_data' / 'strategies')],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
     def test_all_entry_signals_are_disabled_even_with_legacy_configs(self):
         import pandas as pd

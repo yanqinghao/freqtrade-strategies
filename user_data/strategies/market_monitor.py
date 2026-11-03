@@ -133,7 +133,7 @@ class HourlyMarketMonitor:
         exchange_name='binance',
         futures=True,
         executor=None,
-        alert_state_file=None,
+        alerts=None,
     ):
         self._client = None
         self._exchange_name = exchange_name
@@ -146,11 +146,7 @@ class HourlyMarketMonitor:
         self._hour = None
         self._minute = None
         self._lock = Lock()
-        self._alerts = None
-        if alert_state_file is not None:
-            from market_alerts import MarketAlerts
-
-            self._alerts = MarketAlerts(alert_state_file)
+        self._alerts = alerts
 
     def _fetch_public(self, pair, timeframe):
         if self._client is None:

@@ -19,6 +19,7 @@ from freqtrade.util import FtPrecise
 
 from assistant_state import read_state, update_state
 from market_monitor import HourlyMarketMonitor
+from market_alerts import MarketAlerts
 from exit_policy import plan_exit
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ class KamaFama_Dynamic(IStrategy):
             self.market_monitor = HourlyMarketMonitor(
                 exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
-                alert_state_file=Path(self.state_file).with_name('market_alert_state.json'),
+                alerts=MarketAlerts(Path(self.state_file).with_name('market_alert_state.json')),
             )
 
     def submit_command(self, function, *args):
