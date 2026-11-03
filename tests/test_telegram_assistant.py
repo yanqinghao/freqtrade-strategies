@@ -73,6 +73,21 @@ class TelegramAssistantTests(unittest.TestCase):
         monitor = next(h for h in handlers if 'monitor' in getattr(h, 'commands', ()))
         self.assertFalse(monitor.block, 'slow reports must not block urgent Telegram commands')
 
+    def test_limit_ttl_defaults_and_market_rejection(self):
+        default = self.module.parse_entry(['BTC', '100', '3', 'price=100', 'sl=90'], 'long')
+        self.assertEqual(default.get('ttl_seconds'), 14400)
+        explicit = self.module.parse_entry(
+            ['BTC', '100', '3', 'price=100', 'sl=90', 'ttl=1d'], 'long'
+        )
+        self.assertEqual(explicit['ttl_seconds'], 86400)
+        for tail in (
+            ['sl=90', 'ttl=4h'],
+            ['price=100', 'sl=90', 'ttl=0h'],
+            ['price=100', 'sl=90', 'ttl=6d'],
+        ):
+            with self.assertRaises(ValueError):
+                self.module.parse_entry(['BTC', '100', '3', *tail], 'long')
+
     def test_monitor_sends_three_plain_text_reports_without_creating_orders(self):
         self.assertTrue(
             hasattr(self.module.Telegram, '_monitor'), 'advisory report command missing'

@@ -1,6 +1,7 @@
 """Small Telegram extension on top of the pinned, unmodified Freqtrade runtime."""
 import asyncio
 import logging
+import re
 from copy import deepcopy
 from functools import partial
 from math import isfinite
@@ -31,10 +32,21 @@ def positive(value, name):
     return number
 
 
+def ttl_seconds(value):
+    match = re.fullmatch(r'([1-9]\d*)(m|h|d)', value.lower())
+    if not match:
+        raise ValueError('ttl 请使用整数分钟/小时/天，例如 30m、4h、1d')
+    seconds = int(match[1]) * {'m': 60, 'h': 3600, 'd': 86400}[match[2]]
+    if not 60 <= seconds <= 5 * 86400:
+        raise ValueError('ttl 范围为1分钟至5天')
+    return seconds
+
+
 def parse_entry(args, direction):
     if len(args) < 3:
         raise ValueError(
-            '用法：/forcelong 或 /forceshort BTC <保证金USDT> <杠杆> sl=<止损> [price=<限价>] [tp=<TP1,TP2,TP3>]'
+            '用法：/forcelong 或 /forceshort BTC <保证金USDT> <杠杆> '
+            'sl=<止损> [price=<限价>] [ttl=4h] [tp=<TP1,TP2,TP3>]'
         )
     result = {
         'pair': normalize_pair(args[0]),
@@ -55,7 +67,7 @@ def parse_entry(args, direction):
             if '=' not in token:
                 raise ValueError('请使用 key=value 参数')
             key, value = token.split('=', 1)
-            if key not in ('sl', 'price', 'tp', 'tp1', 'tp2', 'tp3') or key in values:
+            if key not in ('sl', 'price', 'tp', 'tp1', 'tp2', 'tp3', 'ttl') or key in values:
                 raise ValueError(f'不支持或重复的参数：{key}；不支持自动分段入场')
             values[key] = value
     if 'tp' in values and any(k in values for k in ('tp1', 'tp2', 'tp3')):
@@ -74,6 +86,10 @@ def parse_entry(args, direction):
         result['exit_points'] = sorted(
             set(positive(p, 'TP') for p in tps), reverse=direction == 'short'
         )
+    if 'ttl' in values and 'entry_price' not in result:
+        raise ValueError('ttl 仅适用于带 price 的限价单')
+    if 'entry_price' in result:
+        result['ttl_seconds'] = ttl_seconds(values.get('ttl', '4h'))
     return result
 
 
@@ -216,10 +232,16 @@ class Telegram(UpstreamTelegram):
             request = parse_entry(context.args or [], order_side.value)
             async with self._manual_order_lock:
                 result = await self._await_command(self._submit_entry, request)
+            lifetime = (
+                f"限价单有效期 {request['ttl_seconds'] // 60} 分钟，从订单创建时计算。\n"
+                if 'ttl_seconds' in request
+                else ''
+            )
             await self._send_msg(
                 f"已提交交易 #{result['id']}：{request['pair']} {request['direction']}\n"
                 f"本次保证金 {request['size']:g} USDT，杠杆 {result['leverage']:g}x。\n"
-                '成交情况以订单通知和 /status 为准；没有后续自动补仓。',
+                + lifetime
+                + '成交情况以订单通知和 /status 为准；没有后续自动补仓。',
                 parse_mode=None,
             )
         except (ValueError, RPCException) as exc:
@@ -246,11 +268,14 @@ class Telegram(UpstreamTelegram):
             if request['leverage'] != existing.leverage:
                 raise ValueError('加仓必须沿用现有持仓杠杆')
         strategy.ensure_entry_position(pair, existing)
+        strategy.ensure_entry_protection(existing)
         old = deepcopy(strategy.manual_open.get(pair))
         plan = deepcopy(strategy._plan(existing) if existing else {})
         if not existing:
             plan.pop('trade_id', None)
-        plan.update({k: v for k, v in request.items() if k not in ('pair', 'entry_price')})
+        plan.update(
+            {k: v for k, v in request.items() if k not in ('pair', 'entry_price', 'ttl_seconds')}
+        )
         plan.setdefault('exit_points', [])
         if not plan.get('stop_loss'):
             raise ValueError('开仓必须提供 sl=<止损价>；本助手不自动生成止损')
@@ -274,7 +299,9 @@ class Telegram(UpstreamTelegram):
                 order_type='limit' if request.get('entry_price') is not None else 'market',
                 stake_amount=request['size'],
                 leverage=request['leverage'],
-                enter_tag='manual_' + request['direction'],
+                enter_tag='manual_'
+                + request['direction']
+                + ('|ttl=' + str(request['ttl_seconds']) if 'entry_price' in request else ''),
             )
             if trade is None:
                 raise RPCException('未创建订单')
@@ -399,6 +426,9 @@ class Telegram(UpstreamTelegram):
         await self._send_msg(
             '手动交易助手\n\n'
             '/forcelong BTC 100 3 sl=90000 price=95000 tp=98000,100000,105000\n'
+            '限价单默认4h有效，可填 ttl=1h 或 ttl=1d（1m至5d）；市价单不填ttl。\n'
+            '到期撤单依赖机器人在线和网络；检测到部分成交后撤余量，优先保护已成交仓位。\n'
+            '加仓前须实时确认交易所止损；未确认时拒绝加仓，平仓照常。\n'
             '/forceshort BTC 100 3 sl=105000 tp=98000,95000,90000\n'
             '金额为保证金USDT，后接杠杆；不填price则市价，只接受单个入场价。以上数字仅示范格式。\n'
             '同方向已有持仓时，同一命令用于明确加仓，杠杆须与原仓一致。\n\n'

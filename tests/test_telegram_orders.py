@@ -138,6 +138,33 @@ class TelegramOrderTests(unittest.TestCase):
         self.bot._close_position(str(trade.id), 100)
         self.assertEqual(len(calls), 1)
 
+    def test_live_add_without_confirmed_stop_is_rejected_before_plan_change(self):
+        self.strategy.config['dry_run'] = False
+        trade = self.position()
+        prior = {
+            'trade_id': trade.id,
+            'direction': 'long',
+            'stop_loss': 90.0,
+            'exit_points': [110.0, 120.0, 130.0],
+        }
+        self.strategy.set_manual_plan(trade.pair, prior)
+        self.exchange.fetch_positions = lambda pair: [
+            {
+                'symbol': pair,
+                'contracts': 10.0,
+                'side': 'long',
+                'contractSize': 1.0,
+                'hedged': False,
+                'info': {'positionSide': 'BOTH'},
+            }
+        ]
+        calls = []
+        self.rpc._rpc_force_entry = lambda *a, **kw: calls.append(a) or trade
+        with self.assertRaisesRegex(ValueError, '止损'):
+            self.bot._submit_entry(self.request)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.strategy.manual_open[trade.pair], prior)
+
     def test_uncertain_submission_preserves_protection_plan(self):
         def unknown(*args, **kwargs):
             raise TimeoutError('exchange acknowledgement unknown')
@@ -240,6 +267,16 @@ class TelegramOrderTests(unittest.TestCase):
 
         self.rpc._rpc_force_entry = create
         self.bot._submit_entry(self.request)
+
+    def test_limit_ttl_is_sent_as_order_tag_not_position_plan(self):
+        request = self.module.parse_entry(
+            ['BTC', '100', '3', 'sl=90', 'price=100', 'ttl=1h'], 'long'
+        )
+        calls = []
+        self.rpc._rpc_force_entry = lambda *args, **kwargs: calls.append(kwargs) or self.position()
+        self.bot._submit_entry(request)
+        self.assertEqual(calls[0]['enter_tag'], 'manual_long|ttl=3600')
+        self.assertNotIn('ttl_seconds', self.strategy.manual_open[request['pair']])
 
     def test_take_profit_edit_rejected_while_order_is_open(self):
         from freqtrade.persistence import Order

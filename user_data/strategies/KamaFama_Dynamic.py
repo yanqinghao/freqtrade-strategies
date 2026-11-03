@@ -5,6 +5,7 @@ There are deliberately no signal entries or unattended position increases.
 """
 import logging
 import os
+from datetime import datetime, timezone
 from copy import deepcopy
 from math import isfinite, nextafter, inf
 from pathlib import Path
@@ -23,6 +24,8 @@ from market_alerts import MarketAlerts
 from exit_policy import plan_exit
 from entry_guard import ensure_position_matches
 from execution_health import HeartbeatPublisher
+from entry_lifecycle import process_entry_orders
+from stop_protection import check_protection
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +97,12 @@ class KamaFama_Dynamic(IStrategy):
         simulated = self.config.get('dry_run', getattr(mode, 'value', mode) == 'dry_run')
         ensure_position_matches(self.dp._exchange, pair, trade, dry_run=simulated)
 
+    def ensure_entry_protection(self, trade):
+        if trade is not None and not check_protection(
+            self, trade, datetime.now(timezone.utc), force=True
+        ):
+            raise ValueError('止损尚未确认，本次加仓未提交；请先核对 /order 与交易所')
+
     def bot_loop_start(self, current_time, **kwargs):
         # All Telegram mutations run on the trading thread, before native exit
         # processing. Native RPC can acquire its own lock without reentrancy.
@@ -111,7 +120,11 @@ class KamaFama_Dynamic(IStrategy):
                     future.set_exception(exc)
         if self.execution_bot is not None:
             for trade in Trade.get_open_trades():
+                process_entry_orders(self, self.execution_bot, trade, current_time)
+            for trade in Trade.get_open_trades():
                 self.check_full_exit(trade, current_time)
+            for trade in Trade.get_open_trades():
+                check_protection(self, trade, current_time)
         if self.market_monitor:
             for message in self.market_monitor.tick(current_time):
                 self.dp.send_msg(message, always_send=True)
@@ -501,6 +514,11 @@ class KamaFama_Dynamic(IStrategy):
                 tp_targets={},
                 stage=0,
             )
+            state['protection'] = {
+                'status': 'pending',
+                'pending_since': current_time.timestamp(),
+                'checked_at': 0,
+            }
         elif order.ft_order_side == trade.exit_side:
             tag = order.ft_order_tag or ''
             if not tag.startswith(('manual_long_tp', 'manual_short_tp')):
