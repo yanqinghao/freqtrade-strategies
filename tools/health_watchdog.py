@@ -17,21 +17,55 @@ from assistant_state import read_state, update_state
 
 logger = logging.getLogger(__name__)
 PROBES = {
-    'spot': 'https://api.binance.com/api/v3/ping',
+    'spot': 'https://api.binance.com/api/v3/exchangeInfo?symbol=BTCUSDT',
     'futures': 'https://fapi.binance.com/fapi/v1/ping',
 }
 
 
 def _timestamp(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and isfinite(value)
-        and value >= 0
-    )
+    try:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isfinite(value)
+            and value >= 0
+        )
+    except OverflowError:
+        return False
 
 
-def _heartbeat_fault(snapshot, now, started_at):
+def _initial_state(started_at):
+    return {
+        'started_at': started_at,
+        'faults': {},
+        'probe_failures': {},
+        'pending': False,
+        'incident': {},
+        'incident_since': None,
+        'last_completed': None,
+    }
+
+
+def _transition(state, faults, now):
+    result = deepcopy(state)
+    if faults != result['faults']:
+        if faults and result['incident_since'] is None:
+            result['incident_since'] = now
+        result['incident'].update(faults)
+        result['faults'] = dict(faults)
+        result['pending'] = True
+    result['last_check'] = now
+    return result
+
+
+def _storage_fault(state, now, error):
+    logger.warning('Watchdog storage degraded (%s)', type(error).__name__)
+    faults = dict(state['faults'])
+    faults['storage'] = '守护状态无法持久化，已使用内存继续监测；重启后可能重复通知'
+    return _transition(state, faults, now)
+
+
+def _heartbeat_fault(snapshot, now, started_at, last_completed=None):
     if now - started_at < 180:
         return None
     if not isinstance(snapshot, dict):
@@ -40,12 +74,19 @@ def _heartbeat_fault(snapshot, now, started_at):
     if not _timestamp(observed) or observed > now + 5 or now - observed > 180:
         return '交易健康快照缺失、过期或时钟异常'
     state = snapshot.get('state')
+    last = snapshot.get('last_process')
+    recent_progress = _timestamp(last_completed) and 0 <= now - last_completed <= 180
+    valid_last = _timestamp(last) and last <= now + 5 and last <= observed + 5
+    if recent_progress and (
+        (last is None and state in ('RUNNING', 'PAUSED', 'STOPPED'))
+        or (state in ('RELOAD_CONFIG', 'STARTUP') and (last is None or valid_last))
+    ):
+        return None  # Brief startup may use previous real progress, never a new grace clock.
     if state == 'STOPPED':
         return '交易处理已停止'
     if state not in ('RUNNING', 'PAUSED'):
         return '机器人尚未进入交易处理状态'
-    last = snapshot.get('last_process')
-    if not _timestamp(last) or last > now + 5 or last > observed + 5:
+    if not valid_last:
         return '交易循环尚未完成或时间数据无效'
     if now - last > 180:
         return '交易循环超过3分钟未完成'
@@ -66,23 +107,57 @@ class Watchdog:
         self._state = state
 
     def check(self, snapshot, probes, now, send):
-        stored = self._state if self._state is not None else read_state(self.state_file)
-        state = (
-            deepcopy(stored)
-            if stored
-            else {
-                'started_at': now,
-                'faults': {},
-                'probe_failures': {},
-                'pending': False,
-                'incident': {},
-                'incident_since': None,
-            }
-        )
-        if not _timestamp(state.get('started_at')) or state['started_at'] > now + 5:
-            raise ValueError('Watchdog state time is invalid')
+        load_error = None
+        try:
+            stored = self._state if self._state is not None else read_state(self.state_file)
+            state = deepcopy(stored) if stored else _initial_state(now)
+            if (
+                not _timestamp(state.get('started_at'))
+                or state['started_at'] > now + 5
+                or not {'faults', 'probe_failures', 'incident', 'pending', 'incident_since'}
+                <= state.keys()
+                or not all(
+                    isinstance(state.get(k), dict) for k in ('faults', 'probe_failures', 'incident')
+                )
+                or not all(
+                    isinstance(k, str) and isinstance(v, str)
+                    for field in ('faults', 'incident')
+                    for k, v in state.get(field, {}).items()
+                )
+                or not isinstance(state.get('pending'), bool)
+                or any(
+                    not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 2
+                    for v in state['probe_failures'].values()
+                )
+                or (
+                    state.get('incident_since') is not None
+                    and not _timestamp(state['incident_since'])
+                )
+                or (
+                    state.get('last_completed') is not None
+                    and not _timestamp(state['last_completed'])
+                )
+            ):
+                raise ValueError('Invalid watchdog state')
+        except Exception as error:
+            load_error = error
+            # Lost history must not grant another grace period or silence current faults.
+            state = _initial_state(max(0, now - 180))
         faults = {}
-        heartbeat = _heartbeat_fault(snapshot, now, state['started_at'])
+        if isinstance(snapshot, dict):
+            observed, last = snapshot.get('observed_at'), snapshot.get('last_process')
+            if (
+                _timestamp(observed)
+                and 0 <= now - observed <= 180
+                and _timestamp(last)
+                and last <= now + 5
+                and last <= observed + 5
+                and snapshot.get('state') in ('RUNNING', 'PAUSED', 'STOPPED', 'RELOAD_CONFIG')
+            ):
+                state['last_completed'] = max(last, state.get('last_completed') or 0)
+        heartbeat = _heartbeat_fault(
+            snapshot, now, state['started_at'], state.get('last_completed')
+        )
         if heartbeat:
             faults['heartbeat'] = heartbeat
         for name in PROBES:
@@ -93,17 +168,23 @@ class Watchdog:
             if count >= 2:
                 label = '现货元数据' if name == 'spot' else 'USDT合约'
                 faults[name] = f'Binance {label}公共接口不可达'
-        if faults != state['faults']:
-            if faults and state['incident_since'] is None:
-                state['incident_since'] = now
-            state['incident'].update(faults)
-            state['faults'] = faults
-            state['pending'] = True
-        state['last_check'] = now
-        self._save(state)  # Never consume an unrecorded transition or claim delivery prematurely.
+        candidate = _transition(state, faults, now)
+        if load_error is not None:
+            candidate = _storage_fault(candidate, now, load_error)
+        try:
+            self._save(candidate)
+        except Exception as error:
+            # Notification-only degradation: keep deduplication in memory if disk is broken.
+            candidate = _storage_fault(_transition(state, faults, now), now, error)
+            # Compare against original faults, not a speculative storage-recovery transition.
+            final_faults = candidate['faults']
+            candidate = _transition(state, final_faults, now)
+            self._state = candidate
+        state = self._state
         if state['pending']:
-            conditions = faults or state['incident']
-            message = '开单助手异常提醒' if faults else '开单助手监控恢复；此前异常已解除'
+            current_faults = state['faults']
+            conditions = current_faults or state['incident']
+            message = '开单助手异常提醒' if current_faults else '开单助手监控恢复；此前异常已解除'
             message += '\n' + '\n'.join(conditions.values())
             since = state['incident_since']
             if since is not None:
@@ -112,23 +193,38 @@ class Watchdog:
             message += '\n独立守护仅通知，不会重启、撤单或修改仓位。'
             try:
                 delivered = send(message) is True
-            except Exception as exc:
-                logger.warning('Watchdog notification pending (%s)', type(exc).__name__)
+            except Exception as error:
+                logger.warning('Watchdog notification pending (%s)', type(error).__name__)
                 delivered = False
             if delivered:
                 acknowledged = deepcopy(state)
                 acknowledged['pending'] = False
-                if not faults:
+                if not current_faults:
                     acknowledged['incident'] = {}
                     acknowledged['incident_since'] = None
-                self._save(acknowledged)
+                try:
+                    self._save(acknowledged)
+                except Exception as error:
+                    self._state = _storage_fault(acknowledged, now, error)
         return deepcopy(self._state)
 
 
 def probe_public(url):
     try:
         with urlopen(url, timeout=5) as response:
-            return response.status == 200 and json.loads(response.read(8192)) == {}
+            if response.status != 200:
+                return False
+            data = json.loads(response.read(65536))
+            if url == PROBES['spot']:
+                return any(
+                    item.get('symbol') == 'BTCUSDT'
+                    and item.get('baseAsset') == 'BTC'
+                    and item.get('quoteAsset') == 'USDT'
+                    and isinstance(item.get('filters'), list)
+                    and bool(item['filters'])
+                    for item in data.get('symbols', [])
+                )
+            return data == {}
     except Exception:
         return False
 

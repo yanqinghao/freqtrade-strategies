@@ -107,6 +107,7 @@ class EntryGuardTests(unittest.TestCase):
             {'symbol': None},
             {'contractSize': 0.1},
             {'info': {'positionSide': 'LONG'}},
+            {'info': 'invalid'},
         ):
             with self.subTest(values=values):
                 self.positions = [self.position(**values)]

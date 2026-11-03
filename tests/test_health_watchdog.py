@@ -128,6 +128,114 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
         self.assertEqual(json.loads(self.path.read_text())['last_check'], 2000.0)
 
+    def test_corrupt_state_still_alerts_without_resetting_grace_and_recovers(self):
+        self.path.write_text('{broken json')
+        self.watch = self.module.Watchdog(self.path)
+        self.call(1300.0, None)
+        self.assertEqual(len(self.messages), 1)
+        self.assertIn('持久化', self.messages[0])
+        self.call(1330.0, None)
+        self.assertEqual(len(self.messages), 1, 'memory fallback must deduplicate')
+        self.assertIn('heartbeat', self.watch._state['faults'])
+        self.path.write_text('{}')
+        self.call(1360.0)
+        self.assertEqual(len(self.messages), 2)
+        self.assertIn('恢复', self.messages[-1])
+        self.assertFalse(json.loads(self.path.read_text())['faults'])
+
+    def test_invalid_persisted_schema_still_reports_storage_degradation(self):
+        state = json.loads(self.path.read_text())
+        del state['incident_since']
+        self.path.write_text(json.dumps(state))
+        self.watch = self.module.Watchdog(self.path)
+        self.call(1300.0, None)
+        self.assertTrue(self.messages)
+        self.assertIn('持久化', self.messages[-1])
+
+    def test_bot_restart_uses_last_completed_loop_deadline_not_a_new_grace(self):
+        self.call(1300.0)
+        for now, mode in ((1330.0, 'STOPPED'), (1360.0, 'RELOAD_CONFIG'), (1450.0, 'RUNNING')):
+            self.watch = self.module.Watchdog(self.path)
+            self.call(now, {'observed_at': now, 'last_process': None, 'state': mode})
+            self.assertEqual(self.messages, [], 'short bot startup must not raise a false alarm')
+        self.call(1481.0, {'observed_at': 1481.0, 'last_process': None, 'state': 'RUNNING'})
+        self.assertEqual(
+            len(self.messages), 1, 'restart cannot extend the last completed loop deadline'
+        )
+
+    def test_unwritable_state_uses_memory_alerts_then_flushes_on_recovery(self):
+        with patch.object(self.module, 'update_state', side_effect=PermissionError('SECRET')):
+            self.call(1300.0, self.healthy(1300.0, last=1000.0))
+            self.assertEqual(len(self.messages), 1)
+            self.assertIn('持久化', self.messages[0])
+            self.call(1330.0, self.healthy(1330.0, last=1000.0))
+            self.assertEqual(len(self.messages), 1)
+        self.call(1360.0)
+        self.assertEqual(len(self.messages), 2)
+        state = json.loads(self.path.read_text())
+        self.assertFalse(state['pending'])
+        self.assertEqual(state['faults'], {})
+
+    def test_storage_and_telegram_failure_keeps_pending_in_memory(self):
+        with patch.object(self.module, 'update_state', side_effect=OSError('disk full')):
+            state = self.call(1300.0, None, send=lambda text: False)
+            self.assertTrue(state['pending'])
+            self.call(1330.0, None)
+            self.assertEqual(len(self.messages), 1)
+            self.assertFalse(self.watch._state['pending'])
+
+    def test_metadata_failure_is_detected_when_ping_is_healthy(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self, *args):
+                return b'{}'
+
+        def opened(url, **kwargs):
+            if 'exchangeInfo' in url:
+                raise OSError('metadata blocked')
+            return Response()
+
+        with patch.object(self.module, 'urlopen', side_effect=opened):
+            probes = {
+                name: self.module.probe_public(url) for name, url in self.module.PROBES.items()
+            }
+        self.assertFalse(probes['spot'])
+        self.assertTrue(probes['futures'])
+
+    def test_spot_probe_validates_minimal_symbol_metadata(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self, *args):
+                return json.dumps(
+                    {
+                        'symbols': [
+                            {
+                                'symbol': 'BTCUSDT',
+                                'baseAsset': 'BTC',
+                                'quoteAsset': 'USDT',
+                                'filters': [{'filterType': 'LOT_SIZE'}],
+                            }
+                        ]
+                    }
+                ).encode()
+
+        with patch.object(self.module, 'urlopen', return_value=Response()):
+            self.assertTrue(self.module.probe_public(self.module.PROBES['spot']))
+
     def test_secret_bearing_transport_error_is_sanitized(self):
         config = {'token': '123:FAKE_SECRET_TOKEN', 'chat_id': '10', 'topic_id': 5}
 

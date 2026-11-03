@@ -33,10 +33,13 @@ def ensure_position_matches(exchange, pair, trade, *, dry_run=False):
         contracts = _number(position.get('contracts'))
         if contracts == 0:
             continue
+        info = position.get('info')
+        if info is not None and not isinstance(info, dict):
+            raise ValueError('交易所仓位数据不完整，未提交订单')
         if (
             position.get('side') not in ('long', 'short')
             or position.get('hedged') is not False
-            or (position.get('info') or {}).get('positionSide') in ('LONG', 'SHORT')
+            or (info or {}).get('positionSide') in ('LONG', 'SHORT')
         ):
             raise ValueError('交易所仓位方向/持仓模式异常，未提交订单')
         active.append((position, contracts))
