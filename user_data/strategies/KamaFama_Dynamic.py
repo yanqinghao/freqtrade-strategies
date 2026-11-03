@@ -22,6 +22,7 @@ from market_monitor import HourlyMarketMonitor
 from market_alerts import MarketAlerts
 from exit_policy import plan_exit
 from entry_guard import ensure_position_matches
+from execution_health import HeartbeatPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class KamaFama_Dynamic(IStrategy):
         self.market_monitor = None
         self._commands = Queue()
         self.execution_bot = None
+        self._health_publisher = None
 
     def bot_start(self, **kwargs):
         if str(getattr(self.config.get('runmode'), 'value', self.config.get('runmode'))) in (
@@ -74,6 +76,13 @@ class KamaFama_Dynamic(IStrategy):
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
                 alerts=MarketAlerts(Path(self.state_file).with_name('market_alert_state.json')),
             )
+            if self.execution_bot is not None:
+                self._health_publisher = HeartbeatPublisher(
+                    self.execution_bot,
+                    Path(self.config.get('user_data_dir', 'user_data'))
+                    / 'health'
+                    / 'assistant.json',
+                ).start()
 
     def submit_command(self, function, *args):
         future = Future()
@@ -113,6 +122,8 @@ class KamaFama_Dynamic(IStrategy):
         return self.market_monitor.reports()
 
     def ft_bot_cleanup(self):
+        if self._health_publisher:
+            self._health_publisher.close()
         while not self._commands.empty():
             future, _, _ = self._commands.get_nowait()
             future.cancel()

@@ -100,3 +100,5 @@ pagination*
 .assistant-archive/
 user_data/*sqlite*
 user_data/strategy_state_production.json
+user_data/health/
+user_data/watchdog/

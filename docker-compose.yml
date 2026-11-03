@@ -17,3 +17,50 @@ services:
       --db-url sqlite:////freqtrade/user_data/assistant_trades.sqlite
       --config /freqtrade/deploy/config.json
       --strategy KamaFama_Dynamic
+  watchdog:
+    image: freqtradeorg/freqtrade:2026.10
+    restart: unless-stopped
+    entrypoint: ["python", "/app/health_watchdog.py"]
+    command:
+      - --telegram-config
+      - /secrets/watchdog.json
+      - --health-file
+      - /health/assistant.json
+      - --state-file
+      - /state/watchdog.json
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - type: bind
+        source: ./tools/health_watchdog.py
+        target: /app/health_watchdog.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./user_data/strategies/assistant_state.py
+        target: /app/assistant_state.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./deploy/watchdog.json
+        target: /secrets/watchdog.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./user_data/health
+        target: /health
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./user_data/watchdog
+        target: /state
+        bind:
+          create_host_path: false

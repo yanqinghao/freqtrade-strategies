@@ -125,6 +125,19 @@ class TelegramOrderTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(self.strategy.manual_open, {})
 
+    def test_live_exit_is_not_blocked_by_unavailable_position_query(self):
+        self.strategy.config['dry_run'] = False
+        trade = self.position()
+
+        def fail(pair):
+            raise TimeoutError('position endpoint unavailable')
+
+        self.exchange.fetch_positions = fail
+        calls = []
+        self.rpc._rpc_force_exit = lambda ident, **kw: calls.append((ident, kw)) or {'result': 'ok'}
+        self.bot._close_position(str(trade.id), 100)
+        self.assertEqual(len(calls), 1)
+
     def test_uncertain_submission_preserves_protection_plan(self):
         def unknown(*args, **kwargs):
             raise TimeoutError('exchange acknowledgement unknown')

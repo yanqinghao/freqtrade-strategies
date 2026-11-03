@@ -103,14 +103,20 @@ class ManualStrategyTests(unittest.TestCase):
         script = '''
 import sys, tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from datetime import datetime, timezone
 sys.path.insert(0, sys.argv[1])
 from KamaFama_Dynamic import KamaFama_Dynamic
 sys.path.remove(sys.argv[1])
 with tempfile.TemporaryDirectory() as directory:
     strategy = KamaFama_Dynamic({'runmode': 'dry_run', 'user_data_dir': Path(directory),
                                 'stake_currency': 'USDT', 'exchange': {'name': 'binance'}})
+    strategy.execution_bot = SimpleNamespace(state=SimpleNamespace(name='RUNNING'),
+                                             last_process=datetime.now(timezone.utc))
     strategy.bot_start()
     assert strategy.market_monitor._alerts is not None
+    assert strategy._health_publisher is not None
+    strategy._health_publisher.close()
     strategy.market_monitor.close()
 '''
         result = subprocess.run(
