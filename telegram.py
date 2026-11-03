@@ -3,6 +3,7 @@ import asyncio
 import logging
 import re
 from copy import deepcopy
+from datetime import datetime, timezone
 from functools import partial
 from math import isfinite
 
@@ -125,6 +126,7 @@ class Telegram(UpstreamTelegram):
             'manual': self._manual,
             'request': self._request,
             'preview': self._preview,
+            'overview': self._overview,
             'setmanual': self._set_manual,
             'monitor': self._monitor,
             'coo': self._cancel_open_order,
@@ -152,6 +154,7 @@ class Telegram(UpstreamTelegram):
                     'monitor',
                     'request',
                     'preview',
+                    'overview',
                     'forcelong',
                     'forceshort',
                     'setmanual',
@@ -251,6 +254,26 @@ class Telegram(UpstreamTelegram):
                 f'请求 {ref_label} 状态暂无法确认，请先用 /request、/status 和 /order 核实，勿直接重复下单。',
                 parse_mode=None,
             )
+
+    def _overview_snapshot(self):
+        bot = self._rpc._freqtrade
+        state = getattr(bot.state, 'name', str(bot.state))
+        return bot.strategy.overview(state, datetime.now(timezone.utc))
+
+    @authorized_only
+    async def _overview(self, update, context):
+        if context.args:
+            await self._send_msg('用法：/overview，查看助手持仓、挂单、TP和止损核验快照。', parse_mode=None)
+            return
+        try:
+            messages = await self._await_command(self._overview_snapshot)
+            for message in messages:
+                await self._send_msg(message, parse_mode=None)
+        except (ValueError, RPCException) as error:
+            await self._send_msg(str(error), parse_mode=None)
+        except Exception as error:
+            logger.warning('Trade overview unavailable (%s)', type(error).__name__)
+            await self._send_msg('总览暂不可用，本命令未改变持仓或订单，请用 /status、/order 核对。', parse_mode=None)
 
     def _preview_entry(self, request):
         trade = Trade.get_trades([Trade.is_open.is_(True), Trade.pair == request['pair']]).first()
@@ -627,6 +650,9 @@ class Telegram(UpstreamTelegram):
             '加仓前须实时确认交易所止损；未确认时拒绝加仓，平仓照常。\n'
             '新入场前核对同币种普通/条件挂单；只减仓或整仓退出单可保留，不自动撤外部单。\n'
             '同一开单消息重放只返回原请求；主动发送新消息视为新开仓/加仓请求。\n'
+            '/preview long|short BTC <保证金> <杠杆> sl=... [price=...] 只读风险预览\n'
+            '/overview 汇总助手持仓、挂单TTL、TP及止损核验快照\n'
+            '风险上限覆盖保证金、杠杆、助手总敞口和该币种加仓后估算止损亏损；超限拒绝，不自动缩量。\n'
             '/request [请求编号] 查询一条或最近5条开单请求\n'
             '/request <编号> resolve 核实后解除未知请求阻塞（不重发旧请求）\n'
             '/forceshort BTC 100 3 sl=105000 tp=98000,95000,90000\n'

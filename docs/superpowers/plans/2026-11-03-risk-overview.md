@@ -42,8 +42,8 @@ Interfaces: install_risk_guard(strategy,bot), EntryRiskError class exposed by st
 
 Files: new trade_overview.py, Telegram /overview, tests/test_trade_overview.py; README/help/config example.
 Interfaces: overview_messages(strategy,trades,bot_state,now), pure snapshot rendering.
-- [ ] RED no trades/pending/TTL/TP/SL age/unknown request/invalid field/multimessage read-only tests.
-- [ ] Implement overview and help/docs with exact units/limits and estimation caveats; complete GREEN, commit.
+- [x] RED no trades/pending/TTL/TP/SL age/unknown request/invalid field/multimessage read-only tests.
+- [x] Implement overview and help/docs with exact units/limits and estimation caveats; complete GREEN, commit.
 
 ## Task 4: Review and rollout
 

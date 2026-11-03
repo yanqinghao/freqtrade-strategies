@@ -1,9 +1,11 @@
+import asyncio
 import importlib.util
 import json
 import unittest
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import test_telegram_orders as order_tests
 
@@ -213,3 +215,25 @@ class EntryRiskTests(unittest.TestCase):
         self.assertEqual(self.strategy._execution(trade), before)
         self.assertFalse(self.strategy.entry_requests.path.exists())
         self.assertEqual(self.Trade.get_open_trade_count(), 1)
+
+    def test_telegram_preview_uses_same_parameters_without_native_submission(self):
+        self.prepare()
+        sent = []
+
+        async def send(text, **kwargs):
+            sent.append(text)
+
+        async def execute(function, *args):
+            return function(*args)
+
+        self.bot._send_msg, self.bot._await_command = send, execute
+        self.rpc._rpc_force_entry = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError('preview traded')
+        )
+        context = SimpleNamespace(args=['long', 'BTC', '10', '20', 'sl=97'])
+        asyncio.run(self.bot._preview.__wrapped__(self.bot, None, context))
+        self.assertEqual(len(sent), 1)
+        self.assertIn('未下单', sent[0])
+        self.assertIn('6.197', sent[0])
+        self.assertFalse(self.strategy.entry_requests.path.exists())
+        self.assertFalse(Path(self.strategy.state_file).exists())

@@ -51,7 +51,17 @@ class TelegramAssistantTests(unittest.TestCase):
         handlers = bot._assistant_handlers()
         commands = set().union(*(h.commands for h in handlers if hasattr(h, 'commands')))
         self.assertTrue(
-            {'forcelong', 'forceshort', 'forceexit', 'setmanual', 'manual', 'monitor', 'close'}
+            {
+                'forcelong',
+                'forceshort',
+                'forceexit',
+                'setmanual',
+                'manual',
+                'monitor',
+                'preview',
+                'overview',
+                'close',
+            }
             <= commands
         )
         self.assertFalse(

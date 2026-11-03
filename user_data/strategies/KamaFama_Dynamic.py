@@ -36,6 +36,7 @@ from entry_guard import ensure_position_matches, ensure_no_entry_orders
 from execution_health import HeartbeatPublisher
 from entry_lifecycle import process_entry_orders, install_entry_receipt_guard
 from stop_protection import check_protection
+from trade_overview import overview_messages
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,9 @@ class KamaFama_Dynamic(IStrategy):
         future = Future()
         self._commands.put((future, function, args))
         return future
+
+    def overview(self, bot_state, current_time):
+        return overview_messages(self, Trade.get_open_trades(), bot_state, current_time)
 
     def preview_entry(self, request, trade):
         plan = plan_for_entry(self, request, trade)
