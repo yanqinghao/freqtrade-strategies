@@ -128,7 +128,8 @@ class EntryRequestFlowTests(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertEqual(len(self.calls), 2)
-        self.assertEqual(len(sent), 5)
+        self.assertEqual(len(sent), 6)
+        self.assertIn('/request <请求编号>', sent[3])
         self.assertIn(self.strategy.entry_requests.reference(-12, 77), sent[0])
         self.assertIn(self.strategy.entry_requests.reference(-12, 77), sent[1])
 

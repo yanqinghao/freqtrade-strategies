@@ -4,6 +4,8 @@
 
 ## 交易指令
 
+Telegram 底部键盘包含 `/overview`（交易总览）、`/preview`（风险预览）和 `/request`（开单请求查询）。点击 `/preview` 会显示参数说明与可复制示例，不会下单；点击 `/request` 会显示用法并查询最近5条请求。输入 `/help` 可查看全部助手用法。
+
 ```text
 /forcelong BTC 100 3 sl=90000 price=95000 tp=98000,100000,105000
 /forcelong BTC 100 3 sl=90000 price=95000 ttl=1h

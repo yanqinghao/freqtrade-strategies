@@ -102,6 +102,7 @@ class Telegram(UpstreamTelegram):
 
     def _init_keyboard(self):
         self._keyboard = [
+            ['/overview', '/preview', '/request'],
             ['/status table', '/balance', '/manual'],
             ['/forcelong', '/forceshort', '/forceexit'],
             ['/setmanual', '/close', '/coo'],
@@ -320,9 +321,17 @@ class Telegram(UpstreamTelegram):
     async def _preview(self, update, context):
         args = context.args or []
         try:
-            if not args or args[0] not in ('long', 'short'):
+            if len(args) < 4 or args[0] not in ('long', 'short'):
                 raise ValueError(
-                    '用法：/preview long|short BTC <保证金> <杠杆> sl=<止损> [price=<限价>] [tp=...] [ttl=24h]'
+                    '风险预览（只读，不下单）\n'
+                    '用法：/preview long|short <币种> <保证金USDT> <杠杆> '
+                    'sl=<止损> [price=<限价>] [tp=<TP1,TP2,TP3>] [ttl=24h]\n'
+                    'long 做多，short 做空；不填price按市价估算。'
+                    '限价单默认24h有效，ttl仅用于限价单。\n'
+                    '示例（价格仅演示格式，请替换）：\n'
+                    '/preview long BTC 10 20 sl=90000 price=95000\n'
+                    '/preview short ETH 10 20 sl=3200 price=3100\n'
+                    '预览不会开仓；实际开仓请使用 /forcelong 或 /forceshort。'
                 )
             request = parse_entry(args[1:], args[0])
             row = await self._await_command(self._preview_entry, request)
@@ -441,6 +450,14 @@ class Telegram(UpstreamTelegram):
                 )
                 rows = [await self._await_command(function, args[0])]
             else:
+                await self._send_msg(
+                    '开单请求查询\n'
+                    '/request 不带参数：最近5条请求\n'
+                    '/request <请求编号>：查询指定请求\n'
+                    '/request <请求编号> resolve：核实仓位和挂单后解除未知请求阻塞，'
+                    '不会重发旧订单。',
+                    parse_mode=None,
+                )
 
                 def recent():
                     return [
@@ -650,13 +667,14 @@ class Telegram(UpstreamTelegram):
     async def _help(self, update, context):
         await self._send_msg(
             '手动交易助手\n\n'
+            '底部键盘可直接选择命令；点击 /preview 查看参数说明和示例。\n'
             '/forcelong BTC 100 3 sl=90000 price=95000 tp=98000,100000,105000\n'
             '限价单默认24h有效，可填 ttl=4h 或 ttl=2d（1m至5d）；市价单不填ttl。\n'
             '到期撤单依赖机器人在线和网络；检测到部分成交后撤余量，优先保护已成交仓位。\n'
             '加仓前须实时确认交易所止损；未确认时拒绝加仓，平仓照常。\n'
             '新入场前核对同币种普通/条件挂单；只减仓或整仓退出单可保留，不自动撤外部单。\n'
             '同一开单消息重放只返回原请求；主动发送新消息视为新开仓/加仓请求。\n'
-            '/preview long|short BTC <保证金> <杠杆> sl=... [price=...] 只读风险预览\n'
+            '/preview long|short BTC <保证金> <杠杆> sl=... [price=...] [tp=...] [ttl=24h] 只读预览\n'
             '/overview 汇总助手持仓、挂单TTL、TP及止损核验快照\n'
             '风险上限覆盖保证金、杠杆、助手总敞口和该币种加仓后估算止损亏损；超限拒绝，不自动缩量。\n'
             '/request [请求编号] 查询一条或最近5条开单请求\n'
