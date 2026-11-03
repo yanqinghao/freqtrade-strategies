@@ -49,8 +49,12 @@
 - [x] Implement scheduling and wiring; document thresholds, startup baseline, cooldown and best-effort notifications.
 - [x] Run all unittest tests with `--network none`; expect green suite. Run Black/Flake8 and `git diff --check`.
 - [x] Request one fresh read-only whole-change review; address important findings with failing regressions before fixes.
-- [ ] Commit reviewed code, fast-forward original checkout and push under prior authorization. Check current assistant positions/plans, build/restart service, inspect redacted logs and baseline state. Do not submit orders.
+- [x] Commit reviewed code, fast-forward original checkout and push under prior authorization. Check current assistant positions/plans, build/restart service, inspect redacted logs and baseline state. Do not submit orders.
 
 ## Progress
 
 Plan and spec reviewed against each other. Existing session authorizes inline work, commits, push and startup. Development worktree uses the existing pinned Docker image for tests; no dependency installation needed.
+
+Final verification: 83/83 offline tests passed on the merged source (`/tmp/market-alerts-final-tests.log`); all commit hooks and Compose validation passed. Independent review issues were reproduced and fixed with regression tests. A native temporary-import-path startup issue was also reproduced in a fresh subprocess and fixed. Public Binance data smoke passed for all three coins.
+
+Deployment verified 2026-11-03 05:05 UTC after the user restored proxy connectivity: fresh RUNNING heartbeat, Telegram initialized, three hourly reports submitted, and BTC/ETH/SOL baselines persisted in the separate alert file. No current-startup errors. The existing unfilled BTC entry order id and complete manual plan were preserved; no validation orders were submitted. Rollout backups remain in the ignored `.assistant-archive/market-alerts-rollout-*` directory.
