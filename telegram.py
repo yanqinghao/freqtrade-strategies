@@ -286,14 +286,20 @@ class Telegram(UpstreamTelegram):
     @staticmethod
     def _format_risk_preview(row):
         status = '本地风险预检通过' if row['allowed'] else '当前会被拦截'
+        scope = '该币种加仓后' if row.get('risk_complete', True) else '已能计算部分'
+        loss_text = (
+            f"估算止损亏损 {row['estimated_loss']:.4f}U"
+            if row['estimated_loss'] is not None
+            else '整体估算不可用（另有待记账成交或入场余量）'
+        )
         text = (
             f"风险预览（未下单）：{row['pair']} {row['direction']}\n"
             f"请求保证金 {row['margin']:g}U，杠杆 {row['leverage']:g}倍\n"
             f"参考入场 {row['reference_price']:g}，预计数量 {row['amount']:g}\n"
             f"名义仓位 {row['notional']:g}U，保护止损 {row['stop_price']:g}，"
             f"距离 {row['stop_distance_pct']:.3f}%\n"
-            f"该币种加仓后价格损失 {row['price_loss']:.4f}U＋费用参考 {row['fees']:.4f}U\n"
-            f"估算止损亏损 {row['estimated_loss']:.4f}U\n"
+            f"{scope}价格损失 {row['price_loss']:.4f}U＋费用参考 {row['fees']:.4f}U\n"
+            f'{loss_text}\n'
             f"助手敞口：持仓 {row['exposure']['position_notional']:g}U＋"
             f"挂单 {row['exposure']['pending_notional']:g}U；"
             f"新增后约 {row['projected_total_notional']:g}U\n"

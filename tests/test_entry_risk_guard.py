@@ -172,3 +172,45 @@ class EntryRiskGuardTests(unittest.TestCase):
         with self.assertRaises(self.risk.EntryRiskError):
             self.exchange.create_order(**self.kw)
         self.assertEqual(len(self.calls), 1)
+
+    def test_upward_native_price_rounding_can_breach_margin_and_loss_limits(self):
+        self.prepare()
+        from freqtrade.exchange import price_to_precision
+        from ccxt import TICK_SIZE
+
+        self.exchange.price_to_precision = lambda pair, rate: price_to_precision(
+            rate, 0.01, TICK_SIZE
+        )
+        self.exchange._order_needs_price = lambda side, kind: kind != 'market'
+        self.strategy.set_manual_plan(
+            self.request['pair'], {'direction': 'long', 'stop_loss': 14.2, 'exit_points': []}
+        )
+        params = {**self.kw, 'ordertype': 'limit', 'rate': 14.2857, 'amount': 7.0, 'leverage': 1.0}
+        with self.assertRaisesRegex(self.risk.EntryRiskError, '保证金'):
+            self.exchange.create_order(**params)
+        import json
+
+        self.path.write_text(
+            json.dumps({**self.limits, 'max_margin_usdt': 1000, 'max_stop_loss_usdt': 0.71})
+        )
+        with self.assertRaisesRegex(self.risk.EntryRiskError, '亏损'):
+            self.exchange.create_order(**params)
+        self.assertEqual(self.calls, [])
+
+    def test_downward_native_price_rounding_uses_actual_permitted_margin(self):
+        self.prepare()
+        from freqtrade.exchange import price_to_precision
+        from ccxt import TICK_SIZE
+        import json
+
+        self.exchange.price_to_precision = lambda pair, rate: price_to_precision(
+            rate, 0.01, TICK_SIZE
+        )
+        self.exchange._order_needs_price = lambda side, kind: kind != 'market'
+        self.strategy.set_manual_plan(
+            self.request['pair'], {'direction': 'long', 'stop_loss': 14.2, 'exit_points': []}
+        )
+        self.path.write_text(json.dumps({**self.limits, 'max_margin_usdt': 99.98}))
+        params = {**self.kw, 'ordertype': 'limit', 'rate': 14.2849, 'amount': 7.0, 'leverage': 1.0}
+        self.exchange.create_order(**params)
+        self.assertEqual(self.calls, [params])

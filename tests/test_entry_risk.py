@@ -237,3 +237,32 @@ class EntryRiskTests(unittest.TestCase):
         self.assertIn('6.197', sent[0])
         self.assertFalse(self.strategy.entry_requests.path.exists())
         self.assertFalse(Path(self.strategy.state_file).exists())
+
+    def test_terminal_unaccounted_fill_cannot_be_reported_as_complete_low_risk(self):
+        self.prepare()
+        trade = self.position()
+        trade.amount = 0
+        self.order(trade, amount=2, filled=2, opened=False)
+        result = self.assess(trade=trade)
+        self.assertFalse(result['allowed'])
+        self.assertIsNone(result['estimated_loss'])
+        self.assertIn('整体估算不可用', self.bot._format_risk_preview(result))
+
+    def test_durable_observed_fill_is_not_omitted_from_whole_position_risk(self):
+        self.prepare()
+        trade = self.position()
+        trade.amount = 0
+        self.order(trade, amount=4, filled=0)
+        self.strategy._save_execution(trade, {'entry_observed': {'order-0': 2}})
+        result = self.assess(trade=trade)
+        self.assertFalse(result['allowed'])
+        self.assertIsNone(result['estimated_loss'])
+
+    def test_existing_pending_entry_prevents_claiming_complete_post_add_risk(self):
+        self.prepare()
+        trade = self.position()
+        trade.amount = 0
+        self.order(trade, amount=2, filled=0)
+        result = self.assess(trade=trade)
+        self.assertFalse(result['allowed'])
+        self.assertIsNone(result['estimated_loss'])

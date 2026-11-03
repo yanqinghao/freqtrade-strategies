@@ -3,7 +3,7 @@ import json
 import logging
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
-from math import isfinite
+from math import isfinite, ulp
 from pathlib import Path
 
 from freqtrade.persistence import Order, Trade
@@ -170,6 +170,25 @@ def estimate_exposure(exchange, trades, *, fresh=True):
     }
 
 
+def incomplete_position(exchange, trade):
+    observed, pending = observed_quantities(trade)
+    managed = number(trade.amount)
+    noise = Decimal(str(4 * max(ulp(float(observed)), ulp(float(managed)))))
+    market = exchange.markets[trade.pair]
+    steps = [
+        number(rule.get('stepSize', 0))
+        for rule in market.get('info', {}).get('filters', [])
+        if rule.get('filterType') in ('LOT_SIZE', 'MARKET_LOT_SIZE')
+    ]
+    steps = [step for step in steps if step > 0]
+    tolerance = (
+        min(noise, min(steps) * number(market['contractSize'], positive=True) / 1000)
+        if steps
+        else Decimal(0)
+    )
+    return pending > 0 or observed - managed > tolerance
+
+
 def unknown_requests(strategy, ignore_request=None):
     store = strategy.entry_requests
     if not store.path.exists():
@@ -215,6 +234,7 @@ def _fee(strategy, pair, side):
 
 
 def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, ignore_request=None):
+    # A supplied amount is already normalized at the native submission boundary.
     try:
         exchange = strategy.dp._exchange
         pair = request['pair']
@@ -236,11 +256,11 @@ def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, igno
                 pair, side='entry', is_short=request['direction'] == 'short', refresh=True
             )
         rate = number(rate, positive=True)
-        raw_amount = (
-            number(amount, positive=True) if amount is not None else margin * leverage / rate
-        )
         quantity = number(
-            exchange.amount_to_contract_precision(pair, float(raw_amount)), positive=True
+            amount
+            if amount is not None
+            else exchange.amount_to_contract_precision(pair, float(margin * leverage / rate)),
+            positive=True,
         )
         notional = max(margin * leverage, quantity * rate)
         open_fee = _fee(strategy, pair, 'sell' if request['direction'] == 'short' else 'buy')
@@ -262,6 +282,9 @@ def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, igno
         total = number(exposure['total_notional']) + notional
         limits = load_limits(strategy.risk_limits_file)
         reasons = []
+        complete = not trade or not incomplete_position(exchange, trade)
+        if not complete:
+            reasons.append('该币种存在待记账成交或现存入场挂单，整体止损风险不可用，请先核实或等待处理完成')
         if limits:
             if margin > number(limits['max_margin_usdt']):
                 reasons.append(f"单笔保证金 {margin:g}U 超过上限 {limits['max_margin_usdt']:g}U")
@@ -269,7 +292,7 @@ def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, igno
                 reasons.append(f"杠杆 {leverage:g}倍超过上限 {limits['max_leverage']:g}倍")
             if total > number(limits['max_total_notional_usdt']):
                 reasons.append(f"助手总名义敞口预计 {total:g}U 超过上限 {limits['max_total_notional_usdt']:g}U")
-            if loss + fees > number(limits['max_stop_loss_usdt']):
+            if complete and loss + fees > number(limits['max_stop_loss_usdt']):
                 reasons.append(
                     f"该币种加仓后估算止损亏损 {loss + fees:g}U 超过上限 {limits['max_stop_loss_usdt']:g}U"
                 )
@@ -287,7 +310,8 @@ def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, igno
             'stop_distance_pct': float(distance / rate * 100),
             'price_loss': float(loss),
             'fees': float(fees),
-            'estimated_loss': float(loss + fees),
+            'risk_complete': complete,
+            'estimated_loss': float(loss + fees) if complete else None,
             'exposure': exposure,
             'projected_total_notional': float(total),
             'limits': limits,
@@ -330,7 +354,14 @@ def install_risk_guard(strategy, bot):
             pair = kwargs['pair']
             direction = 'short' if kwargs['side'] == 'sell' else 'long'
             rate = number(kwargs['rate'], positive=True)
-            amount = number(kwargs['amount'], positive=True)
+            amount = number(
+                exchange.amount_to_contract_precision(
+                    pair, float(number(kwargs['amount'], positive=True))
+                ),
+                positive=True,
+            )
+            if exchange._order_needs_price(kwargs['side'], kwargs['ordertype']):
+                rate = number(exchange.price_to_precision(pair, float(rate)), positive=True)
             leverage = number(kwargs['leverage'], positive=True)
             request = {
                 'pair': pair,

@@ -41,6 +41,15 @@ class RuleExchange:
         rounded = (contracts / self.step).to_integral_value(rounding=ROUND_DOWN) * self.step
         return float(rounded * Decimal(str(self.contract_size)))
 
+    def _order_needs_price(self, side, ordertype):
+        return ordertype != 'market'
+
+    def price_to_precision(self, pair, price):
+        from freqtrade.exchange import price_to_precision
+        from ccxt import TICK_SIZE
+
+        return price_to_precision(price, 0.01, TICK_SIZE)
+
     def get_min_pair_stake_amount(self, *args):
         return self.remaining_floor
 

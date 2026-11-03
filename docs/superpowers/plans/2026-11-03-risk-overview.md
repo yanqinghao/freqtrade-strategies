@@ -47,7 +47,7 @@ Interfaces: overview_messages(strategy,trades,bot_state,now), pure snapshot rend
 
 ## Task 4: Review and rollout
 
-- [ ] Fresh whole-change read-only review, fix important findings via RED→GREEN and full suite.
+- [x] Fresh whole-change read-only review, fix important findings via RED→GREEN and full suite.
 - [ ] Merge/build/verify merged image/push; back up native/request DBs, plans and old risk file; write approved100/20/1000/10 limits atomically.
 - [ ] Update service and verify source artifacts, policy read, preview/overview read-only, RUNNING/TG/watchdog and unchanged tracked records; no test orders.
 - [ ] Record results, push docs, archive own execution artifacts and retain host-managed checkout.
