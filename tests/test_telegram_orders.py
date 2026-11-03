@@ -90,6 +90,41 @@ class TelegramOrderTests(unittest.TestCase):
             self.bot._submit_entry(self.request)
         self.assertEqual(self.strategy.manual_open[self.request['pair']], prior)
 
+    def test_live_external_position_rejects_before_plan_or_order_mutation(self):
+        self.strategy.config['dry_run'] = False
+        prior = {'direction': 'long', 'stop_loss': 80, 'exit_points': [150]}
+        self.strategy.set_manual_plan(self.request['pair'], prior)
+        self.exchange.fetch_positions = lambda pair: [
+            {
+                'symbol': pair,
+                'contracts': 1.0,
+                'side': 'long',
+                'contractSize': 1.0,
+                'hedged': False,
+                'info': {'positionSide': 'BOTH'},
+            }
+        ]
+        calls = []
+        self.rpc._rpc_force_entry = lambda *a, **k: calls.append(a) or self.position()
+        with self.assertRaisesRegex(ValueError, '未接管'):
+            self.bot._submit_entry(self.request)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.strategy.manual_open[self.request['pair']], prior)
+
+    def test_live_position_query_failure_does_not_submit_order(self):
+        self.strategy.config['dry_run'] = False
+
+        def fail(pair):
+            raise TimeoutError('private network failure')
+
+        self.exchange.fetch_positions = fail
+        calls = []
+        self.rpc._rpc_force_entry = lambda *a, **k: calls.append(a) or self.position()
+        with self.assertRaisesRegex(ValueError, '无法核对'):
+            self.bot._submit_entry(self.request)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.strategy.manual_open, {})
+
     def test_uncertain_submission_preserves_protection_plan(self):
         def unknown(*args, **kwargs):
             raise TimeoutError('exchange acknowledgement unknown')

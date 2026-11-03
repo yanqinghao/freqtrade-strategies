@@ -245,6 +245,7 @@ class Telegram(UpstreamTelegram):
                 raise ValueError('该持仓尚有未完成订单，请先等待成交或撤单')
             if request['leverage'] != existing.leverage:
                 raise ValueError('加仓必须沿用现有持仓杠杆')
+        strategy.ensure_entry_position(pair, existing)
         old = deepcopy(strategy.manual_open.get(pair))
         plan = deepcopy(strategy._plan(existing) if existing else {})
         if not existing:

@@ -21,6 +21,7 @@ from assistant_state import read_state, update_state
 from market_monitor import HourlyMarketMonitor
 from market_alerts import MarketAlerts
 from exit_policy import plan_exit
+from entry_guard import ensure_position_matches
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,11 @@ class KamaFama_Dynamic(IStrategy):
         future = Future()
         self._commands.put((future, function, args))
         return future
+
+    def ensure_entry_position(self, pair, trade):
+        mode = self.config.get('runmode')
+        simulated = self.config.get('dry_run', getattr(mode, 'value', mode) == 'dry_run')
+        ensure_position_matches(self.dp._exchange, pair, trade, dry_run=simulated)
 
     def bot_loop_start(self, current_time, **kwargs):
         # All Telegram mutations run on the trading thread, before native exit
