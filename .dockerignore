@@ -1,0 +1,11 @@
+.git
+.venv
+.env
+.assistant-archive
+deploy
+user_data
+logs
+tests
+docs
+__pycache__
+*.sqlite*

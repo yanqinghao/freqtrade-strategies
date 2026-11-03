@@ -1,112 +1,69 @@
-# Freqtrade strategies
+# Telegram 开单助手
 
-This Git repo contains free buy/sell strategies for [Freqtrade](https://github.com/freqtrade/freqtrade).
+基于官方 Freqtrade **2026.10**，只保留手动开仓、加仓、分批止盈、保护止损和平仓。交易核心与 RPC 使用官方实现，`telegram.py` 是一层精简扩展，不再维护整个框架的副本。
 
-All strategies should work with a freqtrade version of 2022.4 or newer.
+## 交易指令
 
-## Disclaimer
-
-These strategies are for educational purposes only. Do not risk money 
-which you are afraid to lose. USE THE SOFTWARE AT YOUR OWN RISK. THE 
-AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING 
-RESULTS. 
-
-Always start by testing strategies with a backtesting then run the 
-trading bot in Dry-run. Do not engage money before you understand how 
-it works and what profit/loss you should expect.
-
-We strongly recommend you to have coding and Python knowledge. Do not 
-hesitate to read the source code and understand the mechanism of this 
-bot.
-
-## Table of Content
-
-- [Free trading strategies](#free-trading-strategies)
-- [Contribute](#share-your-own-strategies-and-contribute-to-this-repo)
-- [FAQ](#faq)
-    - [What is Freqtrade?](#what-is-freqtrade)
-    - [What includes these strategies?](#what-includes-these-strategies)
-    - [How to install a strategy?](#how-to-install-a-strategy)
-    - [How to test a strategy?](#how-to-test-a-strategy)
-    - [How to create/optimize a strategy?](https://www.freqtrade.io/en/latest/strategy-customization/)
-
-## Free trading strategies
-
-Value below are result from backtesting from 2018-01-10 to 2018-01-30 and  
-`exit_profit_only` enabled. More detail on each strategy page.
-
-|  Strategy | Buy count | AVG profit % | Total profit | AVG duration | Backtest period |
-|-----------|-----------|--------------|--------------|--------------|-----------------|
-| [Strategy 001](https://github.com/freqtrade/freqtrade-strategies/blob/main/user_data/strategies/Strategy001.py) | 55 | 0.05 | 0.00012102 |  476.1 | 2018-01-10 to 2018-01-30 |
-| [Strategy 002](https://github.com/freqtrade/freqtrade-strategies/blob/main/user_data/strategies/Strategy002.py) | 9 | 3.21 | 0.00114807 |  189.4 | 2018-01-10 to 2018-01-30 |
-| [Strategy 003](https://github.com/freqtrade/freqtrade-strategies/blob/main/user_data/strategies/Strategy003.py) | 14 | 1.47 | 0.00081740 |  227.5 | 2018-01-10 to 2018-01-30 | 
-| [Strategy 004](https://github.com/freqtrade/freqtrade-strategies/blob/main/user_data/strategies/Strategy004.py) | 37 | 0.69 | 0.00102128 |  367.3 | 2018-01-10 to 2018-01-30 | 
-| [Strategy 005](https://github.com/freqtrade/freqtrade-strategies/blob/main/user_data/strategies/Strategy005.py) | 180 | 1.16 | 0.00827589 |  156.2 | 2018-01-10 to 2018-01-30 |
-
-Strategies from this repo are free to use. Feel free to update them to your likings.
-Most of them  were designed from Hyperopt calculations.
-
-Some only work in specific market conditions, while others are more "general purpose" strategies.
-It's noteworthy that depending on the exchange and Pairs used, further optimization can bring better results.
-
-Please keep in mind, results will heavily depend on the pairs, timeframe and timerange used to backtest - so please run your own backtests that mirror your usecase, to evaluate each strategy for yourself.
-
-The results above should serve as a general outline to demonstrate the number of trades to expect. Actual performance will be different based on various factors.
-
-## Share your own strategies and contribute to this repo
-
-Feel free to send your strategies, comments, optimizations and pull requests via an 
-[Issue ticket](https://github.com/freqtrade/freqtrade-strategies/issues/new) or as a [Pull request](https://github.com/freqtrade/freqtrade-strategies/pulls) enhancing this repository.
-
-## FAQ
-
-### What is Freqtrade?
-
-[Freqtrade](https://github.com/freqtrade/freqtrade) Freqtrade is a free and open source crypto trading bot written in Python.
-It is designed to support all major exchanges and be controlled via Telegram. It contains backtesting, plotting and money management tools as well as strategy optimization by machine learning.
-
-### What includes these strategies?
-
-Each Strategies includes:  
-
-- [x] **Minimal ROI**: Minimal ROI optimized for the strategy.
-- [x] **Stoploss**: Optimimal stoploss.
-- [x] **Buy signals**: Result from Hyperopt or based on exisiting trading strategies.
-- [x] **Sell signals**: Result from Hyperopt or based on exisiting trading strategies.
-- [x] **Indicators**: Includes the indicators required to run the strategy.
-
-Best backtest multiple strategies with the exchange and pairs you're interrested in, and finetune the strategy to the markets you're trading.
-
-### How to install a strategy?
-
-First you need a [working Freqtrade](https://freqtrade.io).
-
-Once you have the bot on the right version, follow this steps:
-
-1. Select the strategy you want. All strategies of the repo are into 
-[user_data/strategies](https://github.com/freqtrade/freqtrade-strategies/tree/main/user_data/strategies)
-2. Copy the strategy file
-3. Paste it into your `user_data/strategies` folder
-4. Run the bot with the parameter `--strategy <STRATEGY CLASS NAME>` (ex: `freqtrade trade --strategy Strategy001`)
-
-More information [about backtesting](https://www.freqtrade.io/en/latest/backtesting/) and [strategy customization](https://www.freqtrade.io/en/latest/strategy-customization/).
-
-### How to test a strategy?
-
-Let assume you have selected the strategy `strategy001.py`:
-
-#### Simple backtesting
-
-```bash
-freqtrade backtesting --strategy Strategy001
+```text
+/forcelong BTC 100 3 sl=90000 price=95000 tp=98000,100000,105000
+/forceshort BTC 100 3 sl=105000 tp=98000,95000,90000
+/setmanual 1 sl=96000 tp=98000,100000,105000
+/close 1 50
+/forceexit 1
+/coo 1
+/manual
+/status table
 ```
 
-#### Refresh your test data
+以上价格仅演示格式。币种后两项分别为**本次保证金 USDT**与杠杆；`price` 省略时使用市价。新开仓必须提供 `sl`，止盈可选，最多三档。完整交易对如 `BTC/USDT:USDT` 也可使用。开仓币种不限于监控的三币种，以交易所支持为准。
+
+已有同方向仓位时，重复开仓命令表示明确加仓；沿用原杠杆，存在挂单时先等待或撤单。同币种反方向请求会拒绝。加仓命令中明确提供的 SL/TP 会更新当前计划；未提供的继续沿用。没有多档入场、到价补仓或指标驱动加仓。
+
+三个 TP：第一档退出初始数量的 30%，第二档退出当时剩余数量的 50%，第三档全部退出。两个 TP：第一档退出 50%，第二档全退。一个 TP：全部退出。**成交确认后**才推进阶段；部分成交、取消与重试不会提前跳档。分批数量按交易所合约精度取整；不足一个可交易单位时直接退出剩余仓位。最终止盈在仓位完全退出前一直有效。
+
+TP1 成交后，保护位移至包含开平交易手续费的成本参考价；TP2 成交后移至 TP1。空头方向相反。手续费参考不包含未来滑点和资金费，因此不保证最终零损益。保护止损只收紧，修改计划或加仓不会自动放宽它。配置使用交易所止损；机器人本地同时判断保护价。`/setmanual` 是修改现有仓位计划，不会改变真实仓位方向。有未完成订单时不能改 TP，可以单独收紧 SL。所有 TG 交易变更都排入交易循环串行执行，避免与成交处理交错；超时且尚未执行的请求会取消，执行中的请求则提示先核实状态。
+
+`/close <ID> [百分比]` 支持部分平仓，省略比例则全平；`/forceexit <ID|all>` 使用官方强制平仓流程。`/stopentry` 暂停新开仓，已有仓位继续管理；`/stop` 是停止交易处理。
+
+## 每小时市场监控
+
+每次分别发送 **BTC、ETH、SOL 三份消息**，每份合并：
+
+- **1d、4h：** EMA20/EMA50 走势，以及最近 60 根已收盘 K 线的支撑/阻力参考。
+- **1h、15m：** 当前走势与节奏，只参与走势判断，不产生入场、SL 或 TP 点位。
+- **走势分区：** 顺势、回调、反弹、整理或大周期分歧。
+
+所有分析排除未收盘 K 线。点位来自已确认局部高低点，缺少局部拐点时参考历史区间边界；不是预测目标，也不会写入交易计划或触发订单。每小时 UTC 整点后由后台任务取公共行情，机器人启动时也发送首轮报告。`/monitor` 可手动请求同样三份报告。网络错误逐币种、逐周期隔离，异常周期标记不可用。
+
+## 运行
+
+生产配置为 `deploy/config.json`，手动计划为 `deploy/strategy_state.json`。该目录不纳入 git。原配置中的交易所和 Telegram 凭据保留；不再加载 `.env` 中的 AI、数据库或旧回测参数。
 
 ```bash
-freqtrade download-data --days 100
+docker compose build
+docker compose up -d
+docker compose logs -f
 ```
 
-*Note:* Generally, it's recommended to use static backtest data (from a defined period of time) for comparable results.
+**本次代码整理没有启动或重启交易服务。** 上述 `up` 会按 `deploy/config.json` 的 `dry_run` 值运行；需要模拟时先设为 `true`。数据使用新的 `user_data/assistant_trades.sqlite`。HTTP API 已关闭，不映射端口；开仓和加仓只走 TG。`deploy` 使用目录挂载，使计划文件可以原子更新。
 
-Please check out the [official backtesting documentation](https://www.freqtrade.io/en/latest/backtesting/) for more information.
+旧 `.venv` 不会自动升级或应用 TG 扩展；以 Docker 镜像为运行入口。需要本地依赖时，Python 3.12+，按 `requirements.txt` 安装。
+
+## 验证
+
+测试不调用 Telegram 或交易所、不加载生产凭据：
+
+```bash
+docker run --rm --network none \
+  --mount type=bind,src="$PWD",target=/workspace,readonly \
+  --entrypoint python freqtrade-manual-assistant:2026.10 \
+  -m unittest discover -s /workspace/tests -v
+```
+
+先用 `docker build -t freqtrade-manual-assistant:2026.10 .` 创建测试镜像。测试覆盖无信号开仓、禁止到价补仓、止盈成交阶段、部分成交重试、多空止损、报告周期、币种隔离和 TG 参数校验。
+
+## 已归档内容
+
+旧 AI、回测/筛币/选方向脚本、对冲、复杂开仓逻辑、魔改交易核心与 RPC、未使用的策略样例及旧本地交易记录已移出运行目录。每天 02:00 的旧回测 cron 已删除。
+
+本地备份在 `.assistant-archive/2026-11-03-before-assistant/`，包含原始修改文件、配置、crontab 和包含 WAL 数据的 SQLite 一致性备份。该目录被 git 和 Docker 构建上下文排除，可能含凭据，不要上传。旧数据库的 123 条交易（其中 2 条标记为未平仓）仅作本地归档；整理过程没有向交易所下单或平仓。若交易所仍有真实仓位，应在启用干净数据库前单独核实与接管。

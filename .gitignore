@@ -93,3 +93,10 @@ pagination*
 *.json
 *.sqlite
 *.md
+!docs/superpowers/specs/*.md
+!docs/superpowers/plans/*.md
+
+# Local archives may contain API credentials and retired trading databases.
+.assistant-archive/
+user_data/*sqlite*
+user_data/strategy_state_production.json

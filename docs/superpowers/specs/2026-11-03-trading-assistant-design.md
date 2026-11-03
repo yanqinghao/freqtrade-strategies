@@ -1,0 +1,13 @@
+# Trading assistant scope
+
+The user chose to modify this existing repository in place. Keep Telegram initiated, single-direction entries and position management (manual stop loss, partial take profit, tightening protection, manual exits). No hedge positions, indicator entries, unattended scale-ins, backtesting jobs, automatic direction selection, or AI calls.
+
+Every hour send three separate Telegram reports, one each for BTC, ETH and SOL. Each report combines daily/four-hour reference support/resistance with 15m/1h/4h/1d trend and regime classification, using only closed candles. Short timeframes never generate reference levels. Reports are advisory and must never update an executable trade plan. Manual `/monitor` uses the same report generation. Reporting must not block the trading loop or interfere with the trade whitelist.
+
+Reuse the existing Freqtrade runtime and Telegram commands; keep the strategy class name for configuration compatibility. Store manual plan data atomically, and advance exit stages only on confirmed fills. Keep exchange/account maintenance schedules. Remove repository-owned obsolete research/AI scheduling entrypoints. Do not restart the running bot, submit trades, or modify exchange positions during development.
+
+Considered: a new repository with Freqtrade, a new exchange executor, and simplifying this repository. The user explicitly chose the last option. Work against the current dirty workspace, preserving unrelated changes; no automatic git commits.
+
+Ruling: until the user requests otherwise, only explicit Telegram requests may increase exposure. Existing JSON plans do not automatically trigger an initial or additional entry. Monitoring uses deterministic EMA and recent closed-candle ranges, with no LLM dependency. The user additionally authorized removing obsolete custom core/RPC copies, sample strategies, old scripts and local trade records. Archive originals and consistent SQLite backups first, verify no process is using them, then remove legacy records from the active directory. No exchange order is authorized by this cleanup. Upgrade to official stable 2026.10 (verified against the official release on 2026-11-03).
+
+Execution invariant: Telegram mutations are queued as standard-library Futures and run in bot_loop_start on the bot thread, before native exit locks are acquired. API is disabled. Pending requests are canceled after 30 seconds if not yet executing; running requests are reported as uncertain until checked. Monitoring handlers run without blocking other Telegram updates. Fill state (quantities, targets, stages, replay markers) is one durable custom-data document. Plan deletion requires matching trade ownership.

@@ -1,2 +1,1 @@
-freqtrade
-python-dotenv
+freqtrade==2026.10
