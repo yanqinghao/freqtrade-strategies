@@ -124,6 +124,7 @@ class Telegram(UpstreamTelegram):
             'close': self._close,
             'manual': self._manual,
             'request': self._request,
+            'preview': self._preview,
             'setmanual': self._set_manual,
             'monitor': self._monitor,
             'coo': self._cancel_open_order,
@@ -150,6 +151,7 @@ class Telegram(UpstreamTelegram):
                 not in {
                     'monitor',
                     'request',
+                    'preview',
                     'forcelong',
                     'forceshort',
                     'setmanual',
@@ -249,6 +251,58 @@ class Telegram(UpstreamTelegram):
                 f'请求 {ref_label} 状态暂无法确认，请先用 /request、/status 和 /order 核实，勿直接重复下单。',
                 parse_mode=None,
             )
+
+    def _preview_entry(self, request):
+        trade = Trade.get_trades([Trade.is_open.is_(True), Trade.pair == request['pair']]).first()
+        result = self._rpc._freqtrade.strategy.preview_entry(request, trade)
+        if getattr(self._rpc._freqtrade.state, 'name', '') != 'RUNNING':
+            result['reasons'].append('机器人当前未允许新入场')
+            result['allowed'] = False
+        return result
+
+    @staticmethod
+    def _format_risk_preview(row):
+        status = '本地风险预检通过' if row['allowed'] else '当前会被拦截'
+        text = (
+            f"风险预览（未下单）：{row['pair']} {row['direction']}\n"
+            f"请求保证金 {row['margin']:g}U，杠杆 {row['leverage']:g}倍\n"
+            f"参考入场 {row['reference_price']:g}，预计数量 {row['amount']:g}\n"
+            f"名义仓位 {row['notional']:g}U，保护止损 {row['stop_price']:g}，"
+            f"距离 {row['stop_distance_pct']:.3f}%\n"
+            f"该币种加仓后价格损失 {row['price_loss']:.4f}U＋费用参考 {row['fees']:.4f}U\n"
+            f"估算止损亏损 {row['estimated_loss']:.4f}U\n"
+            f"助手敞口：持仓 {row['exposure']['position_notional']:g}U＋"
+            f"挂单 {row['exposure']['pending_notional']:g}U；"
+            f"新增后约 {row['projected_total_notional']:g}U\n"
+        )
+        limits = row['limits']
+        if limits:
+            text += (
+                f"上限：保证金 {limits['max_margin_usdt']:g}U／杠杆 {limits['max_leverage']:g}倍／"
+                f"总敞口 {limits['max_total_notional_usdt']:g}U／"
+                f"估算亏损 {limits['max_stop_loss_usdt']:g}U\n"
+            )
+        else:
+            text += '额度限制未启用，不能把本预览当作额度保护。\n'
+        text += status + ('：' + '；'.join(row['reasons']) if row['reasons'] else '')
+        return text + '\n实际提交会重新核对；余额和交易所规则仍适用。估算不含未来滑点、跳价与资金费，不保证最终亏损上限。'
+
+    @authorized_only
+    async def _preview(self, update, context):
+        args = context.args or []
+        try:
+            if not args or args[0] not in ('long', 'short'):
+                raise ValueError(
+                    '用法：/preview long|short BTC <保证金> <杠杆> sl=<止损> [price=<限价>] [tp=...] [ttl=24h]'
+                )
+            request = parse_entry(args[1:], args[0])
+            row = await self._await_command(self._preview_entry, request)
+            await self._send_msg(self._format_risk_preview(row), parse_mode=None)
+        except (ValueError, RPCException) as error:
+            await self._send_msg(str(error), parse_mode=None)
+        except Exception as error:
+            logger.warning('Entry preview unavailable (%s)', type(error).__name__)
+            await self._send_msg('风险预览暂不可用，本命令未下单。', parse_mode=None)
 
     def _entry_request_status(self, ref):
         store = self._rpc._freqtrade.strategy.entry_requests

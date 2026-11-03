@@ -20,6 +20,7 @@ from freqtrade.util import FtPrecise
 
 from assistant_state import read_state, update_state
 from entry_requests import EntryRequests
+from entry_risk import EntryRiskError, plan_for_entry, assess_entry
 from market_monitor import HourlyMarketMonitor
 from market_alerts import MarketAlerts
 from exit_policy import plan_exit
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class KamaFama_Dynamic(IStrategy):
+    risk_error = EntryRiskError
     INTERFACE_VERSION = 3
     can_short = True
     timeframe = '5m'  # Freqtrade execution heartbeat; reports use only 1d and 4h.
@@ -67,6 +69,8 @@ class KamaFama_Dynamic(IStrategy):
         self.entry_requests = EntryRequests(
             Path(config.get('user_data_dir', 'user_data')) / 'entry_requests.sqlite'
         )
+        self.risk_limits_file = Path(self.state_file).with_name('assistant_risk.json')
+        self._risk_request_ref = None
         self._state_lock = RLock()
         self.market_monitor = None
         self._commands = Queue()
@@ -97,6 +101,14 @@ class KamaFama_Dynamic(IStrategy):
         future = Future()
         self._commands.put((future, function, args))
         return future
+
+    def preview_entry(self, request, trade):
+        plan = plan_for_entry(self, request, trade)
+        result = assess_entry(self, request, trade, plan)
+        if trade and trade.has_open_orders:
+            result['reasons'].append('该币种有未完成订单，实际入场前须先核实或撤单')
+            result['allowed'] = False
+        return result
 
     def ensure_entry_position(self, pair, trade):
         mode = self.config.get('runmode')

@@ -93,7 +93,7 @@ class EntryRequests:
                 )
             ]
 
-    def unresolved(self, pair):
+    def unresolved(self, pair=None):
         with closing(self._connect()) as db:
             rows = [
                 self._row(row)
@@ -101,4 +101,4 @@ class EntryRequests:
                     "SELECT * FROM entry_requests WHERE state IN ('submitting','unknown')"
                 )
             ]
-        return [row for row in rows if row['request']['pair'] == pair]
+        return [row for row in rows if pair is None or row['request']['pair'] == pair]
