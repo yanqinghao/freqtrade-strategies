@@ -1,4 +1,4 @@
-"""Advisory daily/4h reports. This module has no access to trading plans or orders."""
+"""Advisory reports and closed-candle alerts, with no trading-plan/order access."""
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -12,14 +12,14 @@ MONITOR_PAIRS = ('BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT')
 TIMEFRAMES = {'1d': 86400000, '4h': 14400000, '1h': 3600000, '15m': 900000}
 
 
-def _closed_frame(rows, timeframe, now):
+def _closed_frame(rows, timeframe, now, minimum=50):
     """Use the latest 120 closed candles; never use a forming candle."""
     width = TIMEFRAMES[timeframe]
     now_ms = int(now.timestamp() * 1000)
     closed = [r for r in rows if len(r) >= 6 and r[0] + width <= now_ms]
     closed = sorted({r[0]: r for r in closed}.values(), key=lambda r: r[0])[-120:]
-    if len(closed) < 50:
-        raise ValueError('至少需要50根已收盘K线')
+    if len(closed) < minimum:
+        raise ValueError(f'至少需要{minimum}根已收盘K线')
     if any(not all(isfinite(float(v)) and float(v) > 0 for v in r[1:5]) for r in closed):
         raise ValueError('K线价格无效')
     if now_ms - (closed[-1][0] + width) >= width:
@@ -126,7 +126,15 @@ def build_reports(fetch, now):
 class HourlyMarketMonitor:
     """Fetch public data on a dedicated worker, drain reports on the bot thread."""
 
-    def __init__(self, fetch=None, *, exchange_name='binance', futures=True, executor=None):
+    def __init__(
+        self,
+        fetch=None,
+        *,
+        exchange_name='binance',
+        futures=True,
+        executor=None,
+        alert_state_file=None,
+    ):
         self._client = None
         self._exchange_name = exchange_name
         self._futures = futures
@@ -136,7 +144,13 @@ class HourlyMarketMonitor:
         )
         self._future = None
         self._hour = None
+        self._minute = None
         self._lock = Lock()
+        self._alerts = None
+        if alert_state_file is not None:
+            from market_alerts import MarketAlerts
+
+            self._alerts = MarketAlerts(alert_state_file)
 
     def _fetch_public(self, pair, timeframe):
         if self._client is None:
@@ -156,6 +170,24 @@ class HourlyMarketMonitor:
         with self._lock:
             return build_reports(self._fetch, now or datetime.now(timezone.utc))
 
+    def _run_cycle(self, now, hourly):
+        with self._lock:
+            cache = {}
+
+            def fetch(pair, timeframe):
+                key = pair, timeframe
+                if key not in cache:
+                    cache[key] = self._fetch(pair, timeframe)
+                return cache[key]
+
+            messages = build_reports(fetch, now) if hourly else []
+            if self._alerts is not None:
+                try:
+                    messages.extend(self._alerts.check(fetch, now))
+                except Exception:
+                    logger.exception('Closed-candle monitoring failed; hourly reports retained')
+            return messages
+
     def tick(self, now):
         messages = []
         if self._future is not None:
@@ -164,12 +196,15 @@ class HourlyMarketMonitor:
             try:
                 messages = self._future.result()
             except Exception:
-                logger.exception('Hourly monitoring failed')
+                logger.exception('Market monitoring failed')
             self._future = None
         hour = int(now.timestamp()) // 3600
-        if self._hour != hour:
+        minute = int(now.timestamp()) // 60
+        hourly = self._hour != hour
+        if hourly or (self._alerts is not None and self._minute != minute):
             self._hour = hour
-            self._future = self._executor.submit(self.reports, now)
+            self._minute = minute
+            self._future = self._executor.submit(self._run_cycle, now, hourly)
         return messages
 
     def close(self):

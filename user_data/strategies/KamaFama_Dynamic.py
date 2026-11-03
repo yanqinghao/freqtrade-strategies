@@ -70,6 +70,7 @@ class KamaFama_Dynamic(IStrategy):
             self.market_monitor = HourlyMarketMonitor(
                 exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
+                alert_state_file=Path(self.state_file).with_name('market_alert_state.json'),
             )
 
     def submit_command(self, function, *args):

@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,6 +121,75 @@ class MarketMonitorTests(unittest.TestCase):
             with self.subTest(rows=len(rows)):
                 with self.assertRaises(ValueError):
                     self.module.analyze_candles(rows, '1d', self.now)
+
+    def test_alert_checks_are_minutely_without_repeating_hourly_reports_or_fetches(self):
+        from concurrent.futures import Future
+        import inspect
+
+        self.assertIn(
+            'alert_state_file', inspect.signature(self.module.HourlyMarketMonitor).parameters
+        )
+
+        class Executor:
+            def __init__(self):
+                self.jobs = []
+
+            def submit(self, fn, *args):
+                future = Future()
+                self.jobs.append((fn, args, future))
+                return future
+
+            def finish(self):
+                fn, args, future = self.jobs[-1]
+                future.set_result(fn(*args))
+
+        requests = []
+
+        def fetch(pair, timeframe):
+            requests.append((pair, timeframe))
+            return self.candles(timeframe)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'alerts.json'
+            executor = Executor()
+            monitor = self.module.HourlyMarketMonitor(
+                fetch, executor=executor, alert_state_file=path
+            )
+            self.assertEqual(monitor.tick(self.now), [])
+            self.assertEqual(
+                monitor.tick(self.now.replace(minute=1)), [], 'pending data must never block'
+            )
+            self.assertEqual(len(executor.jobs), 1)
+            executor.finish()
+            self.assertEqual(len(monitor.tick(self.now)), 3)
+            self.assertEqual(len(requests), 12, 'hourly and alerts share a per-cycle snapshot')
+            before = path.read_text()
+            self.assertEqual(len(monitor.reports(self.now)), 3)
+            self.assertEqual(path.read_text(), before, 'manual reports cannot consume alert state')
+            self.now = self.now.replace(minute=1)
+            self.assertEqual(monitor.tick(self.now), [])
+            self.assertEqual(len(executor.jobs), 2)
+            executor.finish()
+            self.assertEqual(monitor.tick(self.now), [])
+            self.now = self.now.replace(hour=13, minute=0)
+            monitor.tick(self.now)
+            executor.finish()
+            self.assertEqual(len(monitor.tick(self.now)), 3)
+
+    def test_alert_storage_failure_does_not_discard_hourly_reports(self):
+        import inspect
+
+        self.assertIn(
+            'alert_state_file', inspect.signature(self.module.HourlyMarketMonitor).parameters
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.module.HourlyMarketMonitor(
+                lambda p, t: self.candles(t), alert_state_file=directory
+            )
+            self.addCleanup(monitor.close)
+            with self.assertLogs('market_monitor', level='ERROR'):
+                messages = monitor._run_cycle(self.now, True)
+            self.assertEqual(len(messages), 3)
 
 
 if __name__ == '__main__':

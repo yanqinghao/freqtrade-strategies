@@ -90,6 +90,14 @@ class ManualStrategyTests(unittest.TestCase):
             current_exit_profit=(rate - 100) / 10,
         )
 
+    def test_live_monitor_enables_alerts_with_separate_state(self):
+        self.strategy.bot_start()
+        self.addCleanup(self.strategy.market_monitor.close)
+        alerts = getattr(self.strategy.market_monitor, '_alerts', None)
+        self.assertIsNotNone(alerts, 'production monitoring must enable closed-candle alerts')
+        self.assertEqual(alerts.state_file.name, 'market_alert_state.json')
+        self.assertNotEqual(str(alerts.state_file), self.strategy.state_file)
+
     def test_all_entry_signals_are_disabled_even_with_legacy_configs(self):
         import pandas as pd
 
