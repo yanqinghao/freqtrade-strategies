@@ -112,6 +112,11 @@ def _evaluate(exchange, trade, ident, row, target):
             _number(row.get('remaining')) if row.get('remaining') is not None else amount - filled
         )
         size = _number(exchange.markets[trade.pair].get('contractSize', 1), positive=True)
+        consistency = _noise(
+            exchange, trade.pair, covered, amount - filled, 'LOT_SIZE', 'stepSize', size
+        )
+        if abs(covered - (amount - filled)) > consistency:
+            raise ValueError('止损总量、成交量与剩余量不一致')
         tolerance = _noise(exchange, trade.pair, covered, required, 'LOT_SIZE', 'stepSize', size)
         if covered + tolerance < required:
             raise ValueError('止损覆盖数量不足')
@@ -167,6 +172,11 @@ def check_protection(strategy, trade, now, *, force=False):
         for order in trade.open_sl_orders:
             try:
                 raw = exchange.fetch_stoploss_order(order.order_id, trade.pair)
+            except Exception as error:
+                logger.warning('Stop verification unavailable (%s)', type(error).__name__)
+                result = {'status': 'unconfirmed', 'reason': '交易所止损状态暂未查询确认'}
+                continue
+            try:
                 result = _evaluate(exchange, trade, order.order_id, raw, target)
                 break
             except ValueError as error:

@@ -2,6 +2,7 @@
 import logging
 import re
 from math import isfinite
+from freqtrade.exceptions import ExchangeError
 from freqtrade.persistence import Trade
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,59 @@ def _receipt(row, trade, order_id):
     return row
 
 
+def install_entry_receipt_guard(strategy, bot):
+    """Validate tracked entry receipts before native code can overwrite fill evidence.
+
+    Keep upstream code intact. Only this exchange instance's two receipt boundaries
+    are wrapped; native code already defers an order on ExchangeError.
+    """
+    exchange = bot.exchange
+    if getattr(exchange, '_assistant_entry_receipts', False):
+        return
+
+    def checked(order_id, pair, row):
+        for trade in Trade.get_trades([Trade.is_open.is_(True), Trade.pair == pair]):
+            order = trade.select_order_by_order_id(order_id)
+            if not order or order.ft_order_side != trade.entry_side or order.order_type != 'limit':
+                continue
+            if not (order.ft_order_tag or '').startswith(('manual_long', 'manual_short')):
+                continue
+            state = strategy._execution(trade)
+            evidence = state.setdefault('entry_observed', {})
+            floor = max(float(order.filled or 0), float(evidence.get(str(order_id), 0)))
+            try:
+                row = _receipt(row, trade, order_id)
+                if row['filled'] < floor:
+                    raise ValueError('累计成交量倒退')
+            except ValueError:
+                if floor > 0:
+                    evidence[str(order_id)] = floor
+                    state.setdefault('entry_reconcile', {})[str(order_id)] = True
+                    strategy._save_execution(trade, state)
+                raise ExchangeError('入场回执无效或累计成交量倒退，保留记录等待核实') from None
+            if row['filled'] > float(evidence.get(str(order_id), 0)):
+                evidence[str(order_id)] = float(row['filled'])
+                strategy._save_execution(trade, state)
+            break
+        return row
+
+    fetch = exchange.fetch_order
+    cancel = exchange.cancel_order_with_result
+
+    def fetch_checked(order_id, pair, *args, **kwargs):
+        return checked(order_id, pair, fetch(order_id, pair, *args, **kwargs))
+
+    def cancel_checked(order_id, pair, *args, **kwargs):
+        return checked(order_id, pair, cancel(order_id, pair, *args, **kwargs))
+
+    exchange.fetch_order = fetch_checked
+    exchange.cancel_order_with_result = cancel_checked
+    exchange._assistant_entry_receipts = True
+    logger.info('Tracked manual entry receipt validation installed')
+
+
 def process_entry_orders(strategy, bot, trade, now):
+    install_entry_receipt_guard(strategy, bot)
     trade_id, pair = trade.id, trade.pair
     pending = strategy._execution(trade).get('entry_reconcile', {})
     for order in [o for o in trade.orders if o.ft_is_open or str(o.order_id) in pending]:

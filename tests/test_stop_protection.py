@@ -205,6 +205,27 @@ class StopProtectionTests(unittest.TestCase):
             self.strategy._execution(self.trade)['protection']['status'], 'confirmed'
         )
 
+    def test_fetch_value_error_never_persists_or_sends_private_text(self):
+        def fail(*args):
+            raise ValueError('SECRET_SIGNED_URL')
+
+        self.exchange.fetch_stoploss_order = fail
+        self.assertFalse(self.check())
+        self.assertNotIn('SECRET_SIGNED_URL', repr(self.strategy._execution(self.trade)))
+        self.assertNotIn('SECRET_SIGNED_URL', ' '.join(self.messages))
+
+    def test_inconsistent_quantity_fields_never_confirm_or_allow_add(self):
+        for change in (
+            {'amount': 1.0, 'remaining': 10.0},
+            {'amount': 10.0, 'remaining': 11.0},
+            {'amount': 11.0, 'remaining': 10.0},
+        ):
+            with self.subTest(change=change):
+                self.raw.update(change)
+                self.assertFalse(self.check())
+                with self.assertRaisesRegex(ValueError, '止损尚未确认'):
+                    self.strategy.ensure_entry_protection(self.trade)
+
     def test_initial_grace_blocks_add_without_alarming_then_recovers_once(self):
         self.trade.open_date = self.now
         self.trade.open_sl_orders = []

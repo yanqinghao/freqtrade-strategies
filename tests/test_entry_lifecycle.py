@@ -256,6 +256,39 @@ class EntryLifecycleTests(unittest.TestCase):
         self.assertEqual(self.order.status, 'closed')
         self.assertFalse(any('已撤' in text for text in self.messages))
 
+    def test_regressing_fill_cannot_be_deleted_by_lifecycle_or_native_loop(self):
+        self.partial()
+        self.cancelled.update(filled=0.0, remaining=10.0, cost=0.0)
+        self.run_check()
+        self.raw = deepcopy(self.cancelled)
+        self.bot.manage_open_orders()
+        self.assertEqual(self.Trade.get_open_trade_count(), 1)
+        self.assertIn(self.trade.pair, self.strategy.manual_open)
+        self.assertEqual(self.order.filled, 1.0)
+        self.assertTrue(self.order.ft_is_open)
+        # The evidence must also protect native startup after a new DB session.
+        ident = self.trade.id
+        self.Trade.session.remove()
+        self.trade = self.Trade.get_trades([self.Trade.id == ident]).first()
+        self.bot.config = {'dry_run': False, 'exchange': {}}
+        self.exchange.fetch_order_or_stoploss_order = (
+            lambda ident, pair, stoploss: self.exchange.fetch_order(ident, pair)
+        )
+        self.bot.startup_update_open_orders()
+        self.assertEqual(self.Trade.get_open_trade_count(), 1)
+        self.raw.update(filled=1.0, remaining=9.0, cost=100.0)
+        self.run_check()
+        self.assertEqual(self.trade.amount, 1.0)
+
+    def test_newly_fetched_fill_is_durable_before_contradictory_cancel(self):
+        self.order.order_date = self.now - timedelta(hours=5)
+        self.raw.update(filled=1.0, remaining=9.0, cost=100.0)
+        self.run_check()
+        self.raw = deepcopy(self.cancelled)
+        self.bot.manage_open_orders()
+        self.assertEqual(self.Trade.get_open_trade_count(), 1)
+        self.assertIn(self.trade.pair, self.strategy.manual_open)
+
     def test_unknown_cancel_keeps_records_and_deduplicates_alerts(self):
         self.order.order_date = self.now - timedelta(hours=5)
 

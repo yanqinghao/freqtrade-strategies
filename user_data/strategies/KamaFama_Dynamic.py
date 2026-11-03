@@ -24,7 +24,7 @@ from market_alerts import MarketAlerts
 from exit_policy import plan_exit
 from entry_guard import ensure_position_matches
 from execution_health import HeartbeatPublisher
-from entry_lifecycle import process_entry_orders
+from entry_lifecycle import process_entry_orders, install_entry_receipt_guard
 from stop_protection import check_protection
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,8 @@ class KamaFama_Dynamic(IStrategy):
         self._health_publisher = None
 
     def bot_start(self, **kwargs):
+        if self.execution_bot is not None:
+            install_entry_receipt_guard(self, self.execution_bot)
         if str(getattr(self.config.get('runmode'), 'value', self.config.get('runmode'))) in (
             'live',
             'dry_run',

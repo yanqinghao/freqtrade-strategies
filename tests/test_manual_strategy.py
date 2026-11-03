@@ -112,8 +112,12 @@ with tempfile.TemporaryDirectory() as directory:
     strategy = KamaFama_Dynamic({'runmode': 'dry_run', 'user_data_dir': Path(directory),
                                 'stake_currency': 'USDT', 'exchange': {'name': 'binance'}})
     strategy.execution_bot = SimpleNamespace(state=SimpleNamespace(name='RUNNING'),
-                                             last_process=datetime.now(timezone.utc))
+                                             last_process=datetime.now(timezone.utc),
+                                             exchange=SimpleNamespace(
+                                                 fetch_order=lambda *a, **kw: None,
+                                                 cancel_order_with_result=lambda *a, **kw: None))
     strategy.bot_start()
+    assert strategy.execution_bot.exchange._assistant_entry_receipts
     assert strategy.market_monitor._alerts is not None
     assert strategy._health_publisher is not None
     strategy._health_publisher.close()

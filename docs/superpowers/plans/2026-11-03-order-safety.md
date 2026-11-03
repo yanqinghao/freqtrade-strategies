@@ -47,7 +47,7 @@ Interfaces: check_protection(strategy,trade,now,force=False) -> bool, updating c
 
 ## Task 3: Review and rollout
 
-- [ ] Fresh read-only whole-change review; fix important findings via RED→GREEN and full green suite.
+- [x] Fresh read-only whole-change review; fix important findings via RED→GREEN and full green suite.
 - [ ] Merge main, test merged source, push; prepare consistent DB/plan backup and query current runtime/account read-only.
 - [ ] Build/update service, verify guarded artifact and native RUNNING + watchdog health; compare prior order IDs and plans without assuming market fills cannot occur.
 - [ ] Record results and push completion docs; retain host-owned worktree, archive own ledger/review artifacts.
