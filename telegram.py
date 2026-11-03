@@ -46,7 +46,7 @@ def parse_entry(args, direction):
     if len(args) < 3:
         raise ValueError(
             '用法：/forcelong 或 /forceshort BTC <保证金USDT> <杠杆> '
-            'sl=<止损> [price=<限价>] [ttl=4h] [tp=<TP1,TP2,TP3>]'
+            'sl=<止损> [price=<限价>] [ttl=24h] [tp=<TP1,TP2,TP3>]'
         )
     result = {
         'pair': normalize_pair(args[0]),
@@ -89,7 +89,7 @@ def parse_entry(args, direction):
     if 'ttl' in values and 'entry_price' not in result:
         raise ValueError('ttl 仅适用于带 price 的限价单')
     if 'entry_price' in result:
-        result['ttl_seconds'] = ttl_seconds(values.get('ttl', '4h'))
+        result['ttl_seconds'] = ttl_seconds(values.get('ttl', '24h'))
     return result
 
 
@@ -426,7 +426,7 @@ class Telegram(UpstreamTelegram):
         await self._send_msg(
             '手动交易助手\n\n'
             '/forcelong BTC 100 3 sl=90000 price=95000 tp=98000,100000,105000\n'
-            '限价单默认4h有效，可填 ttl=1h 或 ttl=1d（1m至5d）；市价单不填ttl。\n'
+            '限价单默认24h有效，可填 ttl=4h 或 ttl=2d（1m至5d）；市价单不填ttl。\n'
             '到期撤单依赖机器人在线和网络；检测到部分成交后撤余量，优先保护已成交仓位。\n'
             '加仓前须实时确认交易所止损；未确认时拒绝加仓，平仓照常。\n'
             '/forceshort BTC 100 3 sl=105000 tp=98000,95000,90000\n'

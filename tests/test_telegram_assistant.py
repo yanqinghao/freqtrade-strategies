@@ -75,11 +75,11 @@ class TelegramAssistantTests(unittest.TestCase):
 
     def test_limit_ttl_defaults_and_market_rejection(self):
         default = self.module.parse_entry(['BTC', '100', '3', 'price=100', 'sl=90'], 'long')
-        self.assertEqual(default.get('ttl_seconds'), 14400)
+        self.assertEqual(default.get('ttl_seconds'), 86400)
         explicit = self.module.parse_entry(
-            ['BTC', '100', '3', 'price=100', 'sl=90', 'ttl=1d'], 'long'
+            ['BTC', '100', '3', 'price=100', 'sl=90', 'ttl=4h'], 'long'
         )
-        self.assertEqual(explicit['ttl_seconds'], 86400)
+        self.assertEqual(explicit['ttl_seconds'], 14400)
         for tail in (
             ['sl=90', 'ttl=4h'],
             ['price=100', 'sl=90', 'ttl=0h'],
