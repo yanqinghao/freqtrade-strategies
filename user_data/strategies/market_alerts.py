@@ -14,14 +14,17 @@ logger = logging.getLogger(__name__)
 def _events(frame, levels):
     previous, latest = frame.iloc[-2], frame.iloc[-1]
     close, prior = float(latest.close), float(previous.close)
-    volumes = [float(v) for v in frame.volume.iloc[-21:]]
     ratio = None
-    if all(isfinite(v) and v >= 0 for v in volumes):
-        average = sum(volumes[:-1]) / 20
-        if average > 0:
-            ratio = volumes[-1] / average
-            if not isfinite(ratio):
-                ratio = None
+    try:
+        volumes = [float(v) for v in frame.volume.iloc[-21:]]
+        if all(isfinite(v) and v >= 0 for v in volumes):
+            average = sum(volumes[:-1]) / 20
+            if isfinite(average) and average > 0:
+                ratio = volumes[-1] / average
+                if not isfinite(ratio):
+                    ratio = None
+    except (TypeError, ValueError, OverflowError):
+        pass  # Unusable volume must not suppress an otherwise valid price cross.
     events = []
     if ratio is not None and ratio >= 2:
         events.append(('volume', f'放量：此前20根均量的 {ratio:.2f} 倍'))
@@ -68,10 +71,17 @@ class MarketAlerts:
                     continue
                 # Freeze references at the event candle's OPEN, before its move.
                 cutoff = datetime.fromtimestamp(candle / 1000, timezone.utc)
-                levels = [
-                    (label, analyze_candles(fetch(pair, timeframe), timeframe, cutoff))
-                    for timeframe, label in (('4h', '4小时'), ('1d', '日线'))
-                ]
+                levels, unavailable = [], []
+                for timeframe, label in (('4h', '4小时'), ('1d', '日线')):
+                    try:
+                        levels.append(
+                            (label, analyze_candles(fetch(pair, timeframe), timeframe, cutoff))
+                        )
+                    except Exception:
+                        unavailable.append(label)
+                        logger.warning(
+                            'Alert reference unavailable for %s %s', pair, timeframe, exc_info=True
+                        )
                 events, close, change, ratio = _events(frame, levels)
                 closed_at = (candle + TIMEFRAMES['15m']) / 1000
                 cooldowns = record['cooldowns']
@@ -81,6 +91,8 @@ class MarketAlerts:
                 lines = [text for kind, text in events if kind in eligible]
                 record['last_candle'] = candle
                 if lines:
+                    if unavailable:
+                        lines.append('参考周期暂不可用：' + '、'.join(unavailable))
                     cooldowns.update({kind: closed_at for kind in eligible})
                     stamp = datetime.fromtimestamp(closed_at, timezone.utc)
                     volume = f'量比 {ratio:.2f}' if ratio is not None else '量比不可用'

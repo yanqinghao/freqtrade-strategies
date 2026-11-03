@@ -93,6 +93,50 @@ class MarketAlertTests(unittest.TestCase):
         self.assertIn('放量', messages[0])
         self.assertNotIn('突破', messages[0])
 
+    def test_failed_reference_timeframe_preserves_volume_and_healthy_reference(self):
+        self.advance(close=110.0, volume=30.0)
+
+        def fetch(pair, timeframe):
+            if timeframe == '4h':
+                raise RuntimeError('4h public data unavailable')
+            return self.fetch(pair, timeframe)
+
+        with self.assertLogs('market_alerts', level='WARNING'):
+            messages = self.check(fetch)
+        self.assertEqual(len(messages), 1)
+        self.assertIn('放量', messages[0])
+        self.assertIn('日线阻力 105', messages[0])
+        self.assertNotIn('4小时阻力', messages[0])
+
+    def test_volume_still_alerts_when_both_reference_timeframes_fail(self):
+        self.advance(volume=30.0)
+
+        def fetch(pair, timeframe):
+            if timeframe != '15m':
+                raise RuntimeError('reference data unavailable')
+            return self.fetch(pair, timeframe)
+
+        with self.assertLogs('market_alerts', level='WARNING'):
+            messages = self.check(fetch)
+        self.assertEqual(len(messages), 1)
+        self.assertIn('放量', messages[0])
+
+    def test_unparseable_or_overflowing_volume_does_not_hide_price_cross(self):
+        for previous, current in (
+            (10.0, None),
+            (10.0, 'invalid'),
+            (None, 10.0),
+            ('invalid', 10.0),
+            (1e308, 1e308),
+        ):
+            with self.subTest(previous=previous, current=current):
+                self.advance(minutes=75, close=110.0, volume=current)
+                self.previous_volume = previous
+                messages = self.check()
+                self.assertEqual(len(messages), 1)
+                self.assertIn('突破', messages[0])
+                self.assertIn('量比不可用', messages[0])
+
     def test_breakdown_is_independent_of_volume(self):
         self.advance(close=90.0)
         messages = self.check()
