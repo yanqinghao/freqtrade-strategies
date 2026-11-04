@@ -9,6 +9,7 @@ from functools import partial
 from html import escape
 from math import isfinite
 
+from telegram import InlineKeyboardButton
 from telegram.ext import CallbackQueryHandler, CommandHandler
 from freqtrade.enums import SignalDirection
 from freqtrade.persistence import Trade, Order
@@ -47,7 +48,7 @@ def entry_command(request):
 def request_html(text):
     return '\n'.join(
         f'<code>{escape(line)}</code>'
-        if line.startswith(('/forcelong ', '/forceshort '))
+        if line.startswith(('/forcelong ', '/forceshort ', '/preview '))
         else escape(line)
         for line in text.splitlines()
     )
@@ -218,6 +219,11 @@ class Telegram(UpstreamTelegram):
             handlers.append(
                 CallbackQueryHandler(getattr(self, '_' + name), pattern=f'^update_{name}$')
             )
+        handlers.append(
+            CallbackQueryHandler(
+                self._preview_history, pattern=r'^preview_request:[0-9a-f]{24}$', block=False
+            )
+        )
         return handlers
 
     def _init(self):
@@ -397,11 +403,33 @@ class Telegram(UpstreamTelegram):
 
     @authorized_only
     async def _preview(self, update, context):
-        args = context.args or []
+        await self._preview_args(context.args or [])
+
+    @authorized_only
+    async def _preview_history(self, update, context):
+        query = update.callback_query
+        await query.answer()
+        await self._preview_args([query.data.removeprefix('preview_request:')])
+
+    async def _preview_args(self, args):
         try:
-            if len(args) < 4 or args[0] not in ('long', 'short'):
+            source = None
+            if len(args) == 1 and re.fullmatch('[0-9a-f]{24}', args[0]):
+                source = args[0]
+                row = await asyncio.to_thread(
+                    self._rpc._freqtrade.strategy.entry_requests.get, source
+                )
+                if row is None:
+                    raise ValueError('未找到历史请求，请用 /request 重新选择。')
+                saved = row['request']
+                # Reuse the normal parser; never reconcile, reserve or mutate the old request.
+                request = parse_entry(entry_command(saved).split()[1:], saved['direction'])
+            elif len(args) >= 4 and args[0] in ('long', 'short'):
+                request = parse_entry(args[1:], args[0])
+            else:
                 raise ValueError(
                     '风险预览（只读，不下单）\n'
+                    '/request 选择历史单的风险预览按钮，或 /preview <请求编号> 带入历史参数。\n'
                     '用法：/preview long|short <币种> <保证金USDT> <杠杆> '
                     'sl=<止损> [price=<限价>] [tp=<TP1,TP2,TP3>] [ttl=24h]\n'
                     'long 做多，short 做空；不填price按市价估算。'
@@ -411,14 +439,46 @@ class Telegram(UpstreamTelegram):
                     '/preview short ETH 10 20 sl=3200 price=3100\n'
                     '预览不会开仓；实际开仓请使用 /forcelong 或 /forceshort。'
                 )
-            request = parse_entry(args[1:], args[0])
-            row = await self._await_command(self._preview_entry, request)
-            await self._send_msg(self._format_risk_preview(row), parse_mode=None)
+            await self._show_preview(request, source)
         except (ValueError, RPCException) as error:
             await self._send_msg(str(error), parse_mode=None)
         except Exception as error:
             logger.warning('Entry preview unavailable (%s)', type(error).__name__)
             await self._send_msg('风险预览暂不可用，本命令未下单。', parse_mode=None)
+
+    async def _show_preview(self, request, source=None):
+        command = entry_command(request)
+        draft = '/preview ' + request['direction'] + ' ' + command.split(' ', 1)[1]
+        text = f'历史参数来自请求 {source}；按当前持仓和额度重新估算。\n' if source else ''
+        text += '复制下面命令，修改金额、杠杆、price、sl、tp或ttl后发送，即可重新预览：\n' + draft
+        if 'stop_loss' not in request:
+            text += '\n未填写SL：有同向持仓时按当前计划估算；新开仓必须补 sl=...。'
+        try:
+            row = await self._await_command(self._preview_entry, request)
+            text += '\n\n' + self._format_risk_preview(row)
+            if row['allowed']:
+                text += (
+                    '\n\n手动开单指令（自行核对后发送）：\n' + command + '\n发送会创建新开仓/加仓请求；同方向已有持仓会申请加仓，实际提交重新检查。'
+                )
+        except (ValueError, RPCException) as error:
+            text += '\n\n预览未通过（未下单）：' + str(error)
+        except Exception as error:
+            logger.warning('Entry preview unavailable (%s)', type(error).__name__)
+            text += '\n\n风险数据暂不可用，保留上面的预览命令供修改重试；未下单。'
+        await self._send_request_text(text)
+
+    @staticmethod
+    def _preview_buttons(rows):
+        return [
+            [
+                InlineKeyboardButton(
+                    f"风险预览 {i} · {row['request']['pair'].split('/')[0][:12]} "
+                    + ('多' if row['request']['direction'] == 'long' else '空'),
+                    callback_data='preview_request:' + row['ref'],
+                )
+            ]
+            for i, row in enumerate(rows, 1)
+        ] or None
 
     def _entry_request_status(self, ref):
         store = self._rpc._freqtrade.strategy.entry_requests
@@ -532,7 +592,10 @@ class Telegram(UpstreamTelegram):
                 store = self._rpc._freqtrade.strategy.entry_requests
                 rows = await asyncio.to_thread(store.recent, page)
                 text = f'开单历史 · 第{page}页\n'
-                text += '\n\n'.join(self._format_entry_request(row, compact=True) for row in rows)
+                text += '\n\n'.join(
+                    f'{i}. ' + self._format_entry_request(row, compact=True)
+                    for i, row in enumerate(rows, 1)
+                )
                 if not rows:
                     text += '这一页暂无开单请求记录。'
                 text += (
@@ -541,7 +604,7 @@ class Telegram(UpstreamTelegram):
                     + (f' · /request page {page - 1} 上一页' if page > 1 else '')
                     + '\n复制命令修改后重新发送，会成为新开仓/加仓请求；先核对当前持仓。'
                 )
-                await self._send_request_text(text)
+                await self._send_request_text(text, keyboard=self._preview_buttons(rows))
             except (ValueError, IndexError):
                 await self._send_msg('用法：/request 或 /request page <正整数页码>', parse_mode=None)
             except Exception as error:
@@ -556,18 +619,20 @@ class Telegram(UpstreamTelegram):
         try:
             function = self._resolve_entry_request if len(args) == 2 else self._entry_request_status
             row = await self._await_command(function, args[0])
-            await self._send_request_text(self._format_entry_request(row))
+            await self._send_request_text(
+                self._format_entry_request(row), keyboard=self._preview_buttons([row])
+            )
         except (ValueError, RPCException) as exc:
             await self._send_msg(str(exc), parse_mode=None)
         except Exception as exc:
             logger.warning('Entry request lookup unavailable (%s)', type(exc).__name__)
             await self._send_msg('请求记录暂不可用，请核对 /order、/status 与交易所；本命令未提交新订单。', parse_mode=None)
 
-    async def _send_request_text(self, text):
+    async def _send_request_text(self, text, keyboard=None):
         # 1500 Unicode code points fit even when every character uses two UTF-16 units.
         chunks, current = [], ''
         for line in text.splitlines():
-            if len(line) > 1500 and line.startswith(('/forcelong ', '/forceshort ')):
+            if len(line) > 1500 and line.startswith(('/forcelong ', '/forceshort ', '/preview ')):
                 line = '原命令过长，无法提供完整复制块；请核对原消息参数。'
             for part in [line[i : i + 1500] for i in range(0, len(line), 1500)] or ['']:
                 if len(current) + len(part) + 1 > 1500:
@@ -576,8 +641,12 @@ class Telegram(UpstreamTelegram):
                 current += ('\n' if current else '') + part
         if current:
             chunks.append(current)
-        for chunk in chunks:
-            await self._send_msg(request_html(chunk), parse_mode='HTML')
+        for i, chunk in enumerate(chunks):
+            await self._send_msg(
+                request_html(chunk),
+                parse_mode='HTML',
+                keyboard=keyboard if i == len(chunks) - 1 else None,
+            )
 
     def _submit_entry(self, request, request_ref=None):
         pair = request['pair']
@@ -780,7 +849,8 @@ class Telegram(UpstreamTelegram):
             '/preview long|short BTC <保证金> <杠杆> sl=... [price=...] [tp=...] [ttl=24h] 只读预览\n'
             '/overview 汇总助手持仓、挂单TTL、TP及止损核验快照\n'
             '风险上限覆盖保证金、杠杆、助手总敞口和该币种加仓后估算止损亏损；超限拒绝，不自动缩量。\n'
-            '/request 历史开单与可复制命令；/request page 2 翻页；/request <编号> 看详情\n'
+            '/request 历史开单、复制命令与风险预览按钮；/request page 2 翻页\n'
+            '/preview <请求编号> 带入历史参数，复制预览命令修改后再算；预览不会下单\n'
             '/request <编号> resolve 核实后解除未知请求阻塞（不重发旧请求）\n'
             '/forceshort BTC 100 3 sl=105000 tp=98000,95000,90000\n'
             '金额为保证金USDT，后接杠杆；不填price则市价，只接受单个入场价。以上数字仅示范格式。\n'
