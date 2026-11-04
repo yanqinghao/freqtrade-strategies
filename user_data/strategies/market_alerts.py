@@ -27,14 +27,56 @@ def _events(frame, levels):
         pass  # Unusable volume must not suppress an otherwise valid price cross.
     events = []
     if ratio is not None and ratio >= 2:
-        events.append(('volume', f'放量：此前20根均量的 {ratio:.2f} 倍'))
+        events.append(('volume', f'放量：此前20根均量的 {ratio:.2f} 倍', None))
     for label, reference in levels:
         resistance, support = reference['resistance'], reference['support']
         if resistance is not None and prior <= resistance < close:
-            events.append(('breakout', f'突破：{label}阻力 {resistance:.8g}'))
+            events.append(
+                (
+                    'breakout',
+                    f'突破观察：{label}阻力 {resistance:.8g}'
+                    f'（高于 {(close / resistance - 1) * 100:.2f}%）',
+                    {'kind': 'breakout', 'label': label, 'price': resistance},
+                )
+            )
         if support is not None and prior >= support > close:
-            events.append(('breakdown', f'跌破：{label}支撑 {support:.8g}'))
+            events.append(
+                (
+                    'breakdown',
+                    f'跌破观察：{label}支撑 {support:.8g}' f'（低于 {(1 - close / support) * 100:.2f}%）',
+                    {'kind': 'breakdown', 'label': label, 'price': support},
+                )
+            )
     return events, close, (close / prior - 1) * 100, ratio
+
+
+def _followup(record, pair, candle, close):
+    pending = record.get('followup')
+    if not pending:
+        return None
+    target = pending['candle'] + TIMEFRAMES['15m']
+    if candle < target:
+        return None
+    record.pop('followup')
+    if candle > target:
+        return None  # Do not substitute a later close or replay stale market advice.
+    stamp = datetime.fromtimestamp((candle + TIMEFRAMES['15m']) / 1000, timezone.utc)
+    origin = datetime.fromtimestamp((pending['candle'] + TIMEFRAMES['15m']) / 1000, timezone.utc)
+    lines = [
+        f"{pair.split('/')[0]} 异动后续 · 原事件 {origin:%m-%d %H:%M} UTC",
+        f'下一根15m收盘 {close:.8g}（{stamp:%m-%d %H:%M} UTC）',
+    ]
+    for reference in pending['levels']:
+        price, kind = reference['price'], reference['kind']
+        if kind == 'breakout':
+            label = '阻力'
+            outcome = '仍在位上' if close > price else '未守住，回到位下' if close < price else '未守住，收于原位'
+        else:
+            label = '支撑'
+            outcome = '仍在位下' if close < price else '已收回' if close > price else '回到原位，未继续位下'
+        lines.append(f"原{reference['label']}{label} {price:.8g}：{outcome}")
+    lines.append('仅核对这一根收盘，不代表趋势确认；本次跟踪结束。')
+    return '\n'.join(lines)
 
 
 class MarketAlerts:
@@ -63,6 +105,9 @@ class MarketAlerts:
                 ):
                     raise ValueError('15分钟行情存在缺失K线')
                 record = pairs.setdefault(pair, {'last_candle': candle, 'cooldowns': {}})
+                followup = _followup(record, pair, candle, float(frame.close.iloc[-1]))
+                if followup:
+                    messages.append(followup)
                 if pair not in primed:
                     record['last_candle'] = max(candle, record['last_candle'])
                     primed.add(pair)
@@ -87,12 +132,12 @@ class MarketAlerts:
                 cooldowns = record['cooldowns']
                 eligible = {
                     kind
-                    for kind, _ in events
+                    for kind, _, _ in events
                     if kind != 'volume' and closed_at - cooldowns.get(kind, 0) >= 3600
                 }
                 lines = [
                     text
-                    for kind, text in events
+                    for kind, text, _ in events
                     if kind in eligible or (kind == 'volume' and eligible)
                 ]
                 record['last_candle'] = candle
@@ -100,27 +145,31 @@ class MarketAlerts:
                     if unavailable:
                         lines.append('参考周期暂不可用：' + '、'.join(unavailable))
                     cooldowns.update({kind: closed_at for kind in eligible})
+                    record['followup'] = {
+                        'candle': candle,
+                        'levels': [level for kind, _, level in events if kind in eligible],
+                    }
                     stamp = datetime.fromtimestamp(closed_at, timezone.utc)
-                    volume = f'量比 {ratio:.2f}' if ratio is not None else '量比不可用'
-                    messages.append(
-                        '\n'.join(
-                            [
-                                f"{pair.split('/')[0]} 15分钟收盘异动",
-                                f'收盘时间：{stamp:%Y-%m-%d %H:%M} UTC',
-                                f'收盘价 {close:.8g} | 本根涨跌幅 {change:+.2f}% | {volume}',
-                                *lines,
-                                '下一步观察：'
-                                + (
-                                    '上下方向信号冲突，等待后续收盘确认。'
-                                    if {'breakout', 'breakdown'} <= eligible
-                                    else '后续15m收盘能否守住上述阻力位；回落其下则突破未站稳。'
-                                    if 'breakout' in eligible
-                                    else '后续15m收盘能否收回上述支撑位；收回则跌破未延续。'
-                                ),
-                                '参考位来自本根开始前已收盘的4小时/日线，仅提醒，不触发下单。',
-                            ]
-                        )
+                    next_check = datetime.fromtimestamp(closed_at + 900, timezone.utc)
+                    volume = (
+                        f'量比 {ratio:.2f}（' + ('达到2倍放量阈值' if ratio >= 2 else '未达2倍放量阈值') + '）'
+                        if ratio is not None
+                        else '量比不可用，无法判断量能'
                     )
+                    message = '\n'.join(
+                        [
+                            f"{pair.split('/')[0]} 15分钟收盘异动 · 越线待观察",
+                            f'收盘时间：{stamp:%Y-%m-%d %H:%M} UTC',
+                            f'收盘价 {close:.8g} | 本根涨跌幅 {change:+.2f}% | {volume}',
+                            *lines,
+                            f'下一步：核对 {next_check:%m-%d %H:%M} UTC 的15m收盘' '与上述原位的关系，仅反馈一次；错过则不补发。',
+                            '参考位来自本根开始前已收盘的4小时/日线，仅提醒，不触发下单。',
+                        ]
+                    )
+                    if followup:
+                        messages[-1] += '\n\n' + message
+                    else:
+                        messages.append(message)
             except Exception:
                 logger.warning('Market alert unavailable for %s', pair, exc_info=True)
         if pairs != self._pairs:

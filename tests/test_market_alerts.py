@@ -140,7 +140,8 @@ class MarketAlertTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn('跌破', messages[0])
         self.assertIn('95', messages[0])
-        self.assertNotIn('放量', messages[0])
+        self.assertNotIn('放量：', messages[0])
+        self.assertIn('未达2倍放量阈值', messages[0])
 
     def test_wicks_do_not_count_as_confirmed_crosses(self):
         self.advance()
@@ -176,11 +177,15 @@ class MarketAlertTests(unittest.TestCase):
         self.assertEqual(len(self.check()), 1)
         self.advance(close=112.0, volume=30.0)
         self.resistance = 106.0
-        self.assertEqual(self.check(), [])
+        followup = self.check()
+        self.assertEqual(len(followup), 1)
+        self.assertIn('原4小时阻力 105', followup[0])
+        self.assertNotIn('收盘异动', followup[0])
         self.advance(minutes=45, close=112.0, volume=30.0)
         self.assertEqual(len(self.check()), 1)
         self.advance(close=100.0)
-        self.assertEqual(self.check(), [], 'suppressed events are never sent later')
+        self.assertIn('未守住', self.check()[0])
+        self.assertEqual(self.check(), [], 'follow-up is once; suppressed events are not replayed')
 
     def test_restart_preserves_cooldown_and_starts_from_current_baseline(self):
         self.advance(close=110.0, volume=30.0)
@@ -188,6 +193,7 @@ class MarketAlertTests(unittest.TestCase):
         self.monitor = self.cls(self.path)
         self.assertEqual(self.check(), [])
         self.advance(close=110.0, volume=30.0)
+        self.assertIn('异动后续', self.check()[0])
         self.assertEqual(self.check(), [])
         self.advance(minutes=45, close=110.0, volume=30.0)
         self.assertEqual(len(self.check()), 1)
@@ -261,3 +267,125 @@ class MarketAlertTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.check()
         self.assertEqual(len(self.check()), 1)
+
+    def test_crossing_magnitude_low_volume_and_exact_next_check_time(self):
+        self.advance(close=105.21, volume=11)
+        message = self.check()[0]
+        self.assertIn('高于 0.20%', message)
+        self.assertIn('未达2倍放量阈值', message)
+        self.assertIn('12:30', message)
+
+    def test_followup_freezes_original_levels_and_emits_only_once(self):
+        self.advance(close=110)
+        self.check()
+        self.resistance = 120
+        self.advance(close=106)
+        messages = self.check()
+        self.assertEqual(len(messages), 1)
+        self.assertIn('异动后续', messages[0])
+        self.assertIn('原4小时阻力 105', messages[0])
+        self.assertIn('仍在位上', messages[0])
+        self.assertNotIn('120', messages[0])
+        self.assertEqual(self.check(), [])
+        self.advance(close=106)
+        self.assertEqual(self.check(), [])
+
+    def test_failed_breakout_and_equal_close_are_not_reported_as_holding(self):
+        for price in (104, 105):
+            with self.subTest(price=price):
+                self.advance(minutes=75, close=110)
+                self.check()
+                self.advance(close=price)
+                message = self.check()[0]
+                self.assertIn('未守住', message)
+                self.assertNotIn('仍在位上', message)
+
+    def test_breakdown_followup_uses_original_support(self):
+        self.advance(close=90)
+        self.check()
+        self.support = 80
+        self.advance(close=96)
+        message = self.check()[0]
+        self.assertIn('原4小时支撑 95', message)
+        self.assertIn('已收回', message)
+
+    def test_restart_retains_pending_followup_but_does_not_replay_initial_event(self):
+        self.advance(close=110)
+        self.check()
+        self.monitor = self.cls(self.path)
+        self.assertEqual(self.check(), [])
+        self.advance(close=106)
+        self.assertIn('异动后续', self.check()[0])
+        self.monitor = self.cls(self.path)
+        self.assertEqual(self.check(), [])
+
+    def test_restart_at_target_candle_checks_pending_but_skipped_target_expires(self):
+        self.advance(close=110)
+        self.check()
+        self.advance(close=106)
+        self.monitor = self.cls(self.path)
+        self.assertIn('异动后续', self.check()[0])
+        self.advance(minutes=75, close=110)
+        self.check()
+        self.advance(minutes=30, close=100)
+        self.monitor = self.cls(self.path)
+        self.assertEqual(self.check(), [])
+        self.assertNotIn('followup', json.loads(self.path.read_text())['pairs']['BTC/USDT:USDT'])
+
+    def test_followup_storage_failure_keeps_event_for_retry(self):
+        self.advance(close=110)
+        self.check()
+        self.advance(close=106)
+        with patch('market_alerts.update_state', side_effect=OSError('disk unavailable')):
+            with self.assertRaises(OSError):
+                self.check()
+        self.assertIn('异动后续', self.check()[0])
+        self.assertEqual(self.check(), [])
+
+    def test_breakdown_below_and_equal_outcomes_are_distinct(self):
+        self.advance(close=90)
+        self.check()
+        self.advance(close=94)
+        self.assertIn('仍在位下', self.check()[0])
+        self.advance(minutes=75, close=90)
+        self.check()
+        self.advance(close=95)
+        message = self.check()[0]
+        self.assertIn('回到原位', message)
+        self.assertNotIn('仍在位下', message)
+
+    def test_followup_retains_pending_when_target_data_temporarily_fails(self):
+        self.advance(close=110)
+        self.check()
+        self.advance(close=106)
+        self.fail_pair = 'BTC/USDT:USDT'
+        with self.assertLogs('market_alerts', level='WARNING'):
+            self.assertEqual(self.check(), [])
+        self.fail_pair = None
+
+        def missing_references(pair, timeframe):
+            if timeframe != '15m':
+                raise ValueError('unavailable')
+            return self.fetch(pair, timeframe)
+
+        with self.assertLogs('market_alerts', level='WARNING'):
+            message = self.check(missing_references)[0]
+        self.assertIn('原4小时阻力 105', message)
+        self.assertIn('仍在位上', message)
+
+    def test_three_coin_followups_and_reverse_events_are_one_bounded_push(self):
+        from market_monitor import HourlyMarketMonitor
+
+        def fetch(pair, timeframe):
+            return self.rows(timeframe)
+
+        worker = HourlyMarketMonitor(fetch=fetch, alerts=self.monitor)
+        self.addCleanup(worker.close)
+        self.advance(close=110)
+        self.assertEqual(len(worker._run_cycle(self.now, False)), 1)
+        self.advance(close=90)
+        messages = worker._run_cycle(self.now, False)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].count('异动后续'), 3)
+        self.assertEqual(messages[0].count('收盘异动'), 3)
+        self.assertLess(len(messages[0].encode('utf-16-le')) // 2, 4096)

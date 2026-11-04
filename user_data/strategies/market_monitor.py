@@ -87,8 +87,22 @@ def observation(trends):
     if daily != h4 or daily == '震荡':
         return '大周期未同向；先观察4小时区间边界能否收盘突破，短线波动不足以确认方向。'
     if daily == '偏多':
-        return '观察回踩4小时支撑后能否守住、短线能否转强；跌破支撑则重新评估偏多判断。'
-    return '观察反弹4小时阻力后能否受阻、短线能否转弱；站上阻力则重新评估偏空判断。'
+        return '回踩4小时支撑后能否守住、短线能否转强；跌破支撑则重新评估偏多判断。'
+    return '反弹4小时阻力后能否受阻、短线能否转弱；站上阻力则重新评估偏空判断。'
+
+
+def level_distance(level, close, *, support):
+    if level is None:
+        return '暂无'
+    if close is None:
+        return f'{level:.8g}（距离不可用）'
+    distance = (close - level) / close * 100
+    if not isfinite(distance):
+        return f'{level:.8g}（距离不可用）'
+    relation = (
+        ('距支撑' if distance >= 0 else '已低于支撑') if support else ('距阻力' if distance <= 0 else '已高于阻力')
+    )
+    return f'{level:.8g}（{relation} {abs(distance):.2f}%）'
 
 
 def build_reports(fetch, now, *, compact=False):
@@ -146,19 +160,29 @@ def build_reports(fetch, now, *, compact=False):
         lines.append('下一步观察：' + observation(trends))
         lines.append('\n点位仅来自已收盘日线与4小时K线；1小时、15分钟仅判断当前走势。不触发下单。')
         reports.append('\n'.join(lines))
-        summary = [f"{pair.split('/')[0]} · {classify_regime(trends)}"]
+        summary = [
+            pair.split('/')[0],
+            '｜'.join(
+                label + trends.get(timeframe, '不可用')
+                for timeframe, label in (('1d', '日线'), ('4h', '4h'), ('1h', '1h'), ('15m', '15m'))
+            ),
+        ]
+        reference = results.get('15m')
         if '15m' in results:
-            summary.append(f"15m收盘 {results['15m']['close']:.8g}{volume_note}")
-        for timeframe, label in (('1d', '日线'), ('4h', '4h')):
-            result = results.get(timeframe)
-            if result:
-                support = f"{result['support']:.8g}" if result['support'] is not None else '暂无'
-                resistance = (
-                    f"{result['resistance']:.8g}" if result['resistance'] is not None else '暂无'
-                )
-                summary.append(f'{label}支撑 {support} / 阻力 {resistance}')
-            else:
-                summary.append(f'{label}行情暂不可用')
+            summary.append(
+                f"15m收盘 {reference['close']:.8g}"
+                f"（{reference['closed_at']:%m-%d %H:%M} UTC）{volume_note}"
+            )
+        else:
+            summary.append('15m收盘价不可用，暂不计算距离')
+        result = results.get('4h')
+        if result:
+            close = reference['close'] if reference else None
+            support = level_distance(result['support'], close, support=True)
+            resistance = level_distance(result['resistance'], close, support=False)
+            summary.append(f'4h支撑 {support} / 阻力 {resistance}')
+        else:
+            summary.append('4h行情暂不可用')
         summary.append('观察：' + observation(trends))
         summaries.append('\n'.join(summary))
     if compact:

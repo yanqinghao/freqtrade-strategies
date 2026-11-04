@@ -70,6 +70,40 @@ class MarketMonitorTests(unittest.TestCase):
         messages = self.module.build_reports(fetch, self.now)
         self.assertFalse(any('行情暂不可用' in message for message in messages))
 
+    def test_digest_exposes_period_trends_and_distances_from_timestamped_close(self):
+        message = self.module.build_reports(
+            lambda p, t: self.candles(t, descending=t == '1d'), self.now, compact=True
+        )[0]
+        self.assertIn('日线偏空｜4h偏多｜1h偏多｜15m偏多', message)
+        self.assertIn('距支撑 34.08%', message)  # (179 - 118) / 179
+        self.assertIn('距阻力 1.12%', message)  # (181 - 179) / 179
+        self.assertIn('11-03 12:00', message)
+        self.assertNotIn('日线支撑', message)
+        self.assertNotIn('观察：观察', message)
+
+    def test_digest_labels_already_crossed_level_instead_of_negative_distance(self):
+        def fetch(pair, timeframe):
+            rows = self.candles(timeframe)
+            if timeframe == '15m':
+                rows[-2][4] = 190
+            return rows
+
+        message = self.module.build_reports(fetch, self.now, compact=True)[0]
+        self.assertIn('已高于阻力 4.74%', message)  # (190 - 181) / 190
+        self.assertNotIn('距阻力 -', message)
+
+    def test_missing_short_price_never_uses_old_price_for_distance(self):
+        def fetch(pair, timeframe):
+            if timeframe == '15m':
+                raise ValueError('missing')
+            return self.candles(timeframe)
+
+        with self.assertLogs('market_monitor', level='WARNING'):
+            message = self.module.build_reports(fetch, self.now, compact=True)[0]
+        self.assertIn('15m不可用', message)
+        self.assertIn('距离不可用', message)
+        self.assertNotIn('距支撑', message)
+
     def test_three_reports_use_four_timeframes_but_only_two_for_levels(self):
         requests = []
 
