@@ -1,3 +1,4 @@
+from notification_helpers import capture_alerts
 import importlib.util
 import sys
 import tempfile
@@ -49,6 +50,7 @@ class EntryLifecycleTests(unittest.TestCase):
             }
         )
         self.messages = []
+        capture_alerts(self.strategy, self.messages)
         self.exchange = RuleExchange(minimum=0.001, step='.001', cost=0.0, pair='BTC/USDT:USDT')
         self.strategy.dp = SimpleNamespace(
             _exchange=self.exchange, send_msg=lambda text, **kw: self.messages.append(text)
@@ -237,6 +239,7 @@ class EntryLifecycleTests(unittest.TestCase):
         self.Trade.session.remove()
         self.trade = self.Trade.get_trades([self.Trade.id == ident]).first()
         self.strategy = type(self.strategy)(self.strategy.config)
+        capture_alerts(self.strategy, self.messages)
         self.strategy.dp = SimpleNamespace(
             _exchange=self.exchange, send_msg=lambda text, **kw: self.messages.append(text)
         )

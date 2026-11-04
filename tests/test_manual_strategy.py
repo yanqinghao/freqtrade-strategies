@@ -1,3 +1,4 @@
+from notification_helpers import capture_alerts
 import importlib
 import sys
 import tempfile
@@ -72,6 +73,7 @@ class ManualStrategyTests(unittest.TestCase):
         }
         self.exchange = RuleExchange(minimum=0.001, step='.001', cost=0.0, pair=self.trade.pair)
         self.messages = []
+        capture_alerts(self.strategy, self.messages)
         self.strategy.dp = SimpleNamespace(
             _exchange=self.exchange,
             send_msg=lambda message, **kwargs: self.messages.append(message),
@@ -396,6 +398,24 @@ with tempfile.TemporaryDirectory() as directory:
         self.assertIsNone(self.adjust(111))
         self.assertIn(self.trade.pair, self.strategy.manual_open)
         self.assertTrue(self.messages)
+
+    def test_failed_exit_notice_survives_queue_failure_and_restart(self):
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        self.exchange.remaining_floor = 800.0
+        self.adjust(111)
+        for row in self.strategy.alert_queue.pending():
+            self.strategy.alert_queue.acknowledge(row)
+        with patch.object(self.strategy.alert_queue, 'put', side_effect=OSError('locked')):
+            self.strategy.check_full_exit(self.trade, self.now + timedelta(seconds=5))
+        restored = type(self.strategy)(self.strategy.config)
+        restored.dp = self.strategy.dp
+        restored.check_full_exit(self.trade, self.now + timedelta(seconds=65))
+        pending = restored.alert_queue.pending()
+        self.assertEqual(len(pending), 1)
+        self.assertIn('全平失败', pending[0]['message'])
+        self.assertTrue(restored._execution(self.trade)['full_exit']['blocked'])
 
     def test_native_adjustment_submits_full_instead_of_skipping_tiny_remainder(self):
         from freqtrade.freqtradebot import FreqtradeBot

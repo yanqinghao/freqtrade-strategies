@@ -86,9 +86,15 @@ class MarketAlerts:
                 closed_at = (candle + TIMEFRAMES['15m']) / 1000
                 cooldowns = record['cooldowns']
                 eligible = {
-                    kind for kind, _ in events if closed_at - cooldowns.get(kind, 0) >= 3600
+                    kind
+                    for kind, _ in events
+                    if kind != 'volume' and closed_at - cooldowns.get(kind, 0) >= 3600
                 }
-                lines = [text for kind, text in events if kind in eligible]
+                lines = [
+                    text
+                    for kind, text in events
+                    if kind in eligible or (kind == 'volume' and eligible)
+                ]
                 record['last_candle'] = candle
                 if lines:
                     if unavailable:
@@ -103,6 +109,14 @@ class MarketAlerts:
                                 f'收盘时间：{stamp:%Y-%m-%d %H:%M} UTC',
                                 f'收盘价 {close:.8g} | 本根涨跌幅 {change:+.2f}% | {volume}',
                                 *lines,
+                                '下一步观察：'
+                                + (
+                                    '上下方向信号冲突，等待后续收盘确认。'
+                                    if {'breakout', 'breakdown'} <= eligible
+                                    else '后续15m收盘能否守住上述阻力位；回落其下则突破未站稳。'
+                                    if 'breakout' in eligible
+                                    else '后续15m收盘能否收回上述支撑位；收回则跌破未延续。'
+                                ),
                                 '参考位来自本根开始前已收盘的4小时/日线，仅提醒，不触发下单。',
                             ]
                         )

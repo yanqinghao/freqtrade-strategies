@@ -2,9 +2,11 @@
 import asyncio
 import logging
 import re
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from functools import partial
+from html import escape
 from math import isfinite
 
 from telegram.ext import CallbackQueryHandler, CommandHandler
@@ -14,6 +16,41 @@ from freqtrade.rpc import RPCException
 from freqtrade.rpc._telegram_base import Telegram as UpstreamTelegram, authorized_only
 
 logger = logging.getLogger(__name__)
+
+
+def entry_command(request):
+    """Round-trip stored parameters without rounding prices or inventing omitted SL/TP."""
+
+    def numeric(value):
+        return (
+            str(int(value))
+            if float(value).is_integer() and abs(value) < 1e16
+            else repr(float(value))
+        )
+
+    parts = [
+        f"/force{request['direction']}",
+        request['pair'],
+        numeric(request['size']),
+        numeric(request['leverage']),
+    ]
+    for field, name in (('stop_loss', 'sl'), ('entry_price', 'price')):
+        if field in request:
+            parts.append(f'{name}={numeric(request[field])}')
+    if request.get('exit_points'):
+        parts.append('tp=' + ','.join(numeric(value) for value in request['exit_points']))
+    if 'ttl_seconds' in request:
+        parts.append(f"ttl={request['ttl_seconds'] // 60}m")
+    return ' '.join(parts)
+
+
+def request_html(text):
+    return '\n'.join(
+        f'<code>{escape(line)}</code>'
+        if line.startswith(('/forcelong ', '/forceshort '))
+        else escape(line)
+        for line in text.splitlines()
+    )
 
 
 def normalize_pair(value):
@@ -189,7 +226,48 @@ class Telegram(UpstreamTelegram):
         self._app = self._init_telegram_app()
         for handler in self._assistant_handlers():
             self._app.add_handler(handler)
-        self._loop.run_until_complete(self._startup_telegram())
+        self._loop.run_until_complete(self._startup_with_alerts())
+
+    async def _startup_with_alerts(self):
+        worker = asyncio.create_task(self._alert_worker())
+        try:
+            await self._startup_telegram()
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    async def _alert_worker(self):
+        while True:
+            await asyncio.sleep(10)
+            if self._app.running:
+                try:
+                    await self._deliver_alerts_once()
+                except Exception as error:
+                    logger.warning('Critical alert queue unavailable (%s)', type(error).__name__)
+
+    async def _deliver_alerts_once(self, now=None):
+        stamp = time.time() if now is None else now
+        queue = self._rpc._freqtrade.strategy.alert_queue
+        for row in queue.pending(now=stamp, limit=3):
+            updated = datetime.fromtimestamp(row['updated'], timezone.utc)
+            message = row['message'] + f'\n状态时间：{updated:%m-%d %H:%M:%S} UTC'
+            if stamp - row['updated'] > 60:
+                message += '\n延迟送达，请用 /overview 核对当前状态。'
+            try:
+                await self._app.bot.send_message(
+                    self._config['telegram']['chat_id'],
+                    text=message,
+                    parse_mode=None,
+                    message_thread_id=self._config['telegram'].get('topic_id'),
+                )
+            except Exception as error:
+                logger.warning('Critical alert remains pending (%s)', type(error).__name__)
+                delay = getattr(error, 'retry_after', 60)
+                if hasattr(delay, 'total_seconds'):
+                    delay = delay.total_seconds()
+                queue.defer(row, stamp + max(60, float(delay)))
+            else:
+                queue.acknowledge(row)
 
     async def _await_command(self, function, *args):
         from freqtrade.enums import State
@@ -412,7 +490,7 @@ class Telegram(UpstreamTelegram):
         )
 
     @staticmethod
-    def _format_entry_request(row):
+    def _format_entry_request(row, compact=False):
         states = {
             'reserved': '待执行',
             'submitting': '提交待核实',
@@ -422,7 +500,17 @@ class Telegram(UpstreamTelegram):
             'resolved': '已核实解除',
         }
         request, result = row['request'], row['result']
+        created = datetime.fromtimestamp(row['created'], timezone.utc)
+        command = entry_command(request)
+        reuse = f'\n参数还原（复制后修改）：\n{command}'
+        if 'stop_loss' not in request:
+            reuse += '\n原请求未填写SL：当时沿用已有计划；新开仓请补 sl=...。'
+        if compact:
+            return (
+                f"{created:%m-%d %H:%M} UTC · {states[row['state']]}\n" f"编号 {row['ref']}" + reuse
+            )
         text = f"请求 {row['ref']}：{states[row['state']]}\n{request['pair']} {request['direction']}\n"
+        text += f'创建时间：{created:%Y-%m-%d %H:%M:%S} UTC\n'
         if row['state'] == 'submitted':
             text += f"交易 #{result['id']}，关联订单 {', '.join(result['order_ids'])}。\n"
             leverage = result.get('leverage')
@@ -433,48 +521,63 @@ class Telegram(UpstreamTelegram):
             text += '本请求不会重复下单；实际成交/退出以 /order、/status 和 /trades 为准。'
         else:
             text += result.get('message', '请稍后查询。')
-        return text
+        return text + reuse + '\n重新发送是新请求；同方向已有持仓时会申请加仓。'
 
     @authorized_only
     async def _request(self, update, context):
         args = context.args or []
+        if not args or args[0] == 'page':
+            try:
+                page = 1 if not args else int(args[1]) if len(args) == 2 else 0
+                store = self._rpc._freqtrade.strategy.entry_requests
+                rows = await asyncio.to_thread(store.recent, page)
+                text = f'开单历史 · 第{page}页\n'
+                text += '\n\n'.join(self._format_entry_request(row, compact=True) for row in rows)
+                if not rows:
+                    text += '这一页暂无开单请求记录。'
+                text += (
+                    '\n\n/request <请求编号> 查看详情\n'
+                    f'/request page {page + 1} 下一页'
+                    + (f' · /request page {page - 1} 上一页' if page > 1 else '')
+                    + '\n复制命令修改后重新发送，会成为新开仓/加仓请求；先核对当前持仓。'
+                )
+                await self._send_request_text(text)
+            except (ValueError, IndexError):
+                await self._send_msg('用法：/request 或 /request page <正整数页码>', parse_mode=None)
+            except Exception as error:
+                logger.warning('Entry history unavailable (%s)', type(error).__name__)
+                await self._send_msg('开单历史暂不可用，本命令未下单。', parse_mode=None)
+            return
         if len(args) > 2 or (len(args) == 2 and args[1] != 'resolve'):
             await self._send_msg(
                 '用法：/request [请求编号]；核实后解除未知阻塞：/request <编号> resolve', parse_mode=None
             )
             return
         try:
-            if args:
-                function = (
-                    self._resolve_entry_request if len(args) == 2 else self._entry_request_status
-                )
-                rows = [await self._await_command(function, args[0])]
-            else:
-                await self._send_msg(
-                    '开单请求查询\n'
-                    '/request 不带参数：最近5条请求\n'
-                    '/request <请求编号>：查询指定请求\n'
-                    '/request <请求编号> resolve：核实仓位和挂单后解除未知请求阻塞，'
-                    '不会重发旧订单。',
-                    parse_mode=None,
-                )
-
-                def recent():
-                    return [
-                        self._entry_request_status(r['ref'])
-                        for r in self._rpc._freqtrade.strategy.entry_requests.recent()
-                    ]
-
-                rows = await self._await_command(recent)
-            if not rows:
-                await self._send_msg('暂无本版本开单请求记录。', parse_mode=None)
-            for row in rows:
-                await self._send_msg(self._format_entry_request(row), parse_mode=None)
+            function = self._resolve_entry_request if len(args) == 2 else self._entry_request_status
+            row = await self._await_command(function, args[0])
+            await self._send_request_text(self._format_entry_request(row))
         except (ValueError, RPCException) as exc:
             await self._send_msg(str(exc), parse_mode=None)
         except Exception as exc:
             logger.warning('Entry request lookup unavailable (%s)', type(exc).__name__)
             await self._send_msg('请求记录暂不可用，请核对 /order、/status 与交易所；本命令未提交新订单。', parse_mode=None)
+
+    async def _send_request_text(self, text):
+        # 1500 Unicode code points fit even when every character uses two UTF-16 units.
+        chunks, current = [], ''
+        for line in text.splitlines():
+            if len(line) > 1500 and line.startswith(('/forcelong ', '/forceshort ')):
+                line = '原命令过长，无法提供完整复制块；请核对原消息参数。'
+            for part in [line[i : i + 1500] for i in range(0, len(line), 1500)] or ['']:
+                if len(current) + len(part) + 1 > 1500:
+                    chunks.append(current)
+                    current = ''
+                current += ('\n' if current else '') + part
+        if current:
+            chunks.append(current)
+        for chunk in chunks:
+            await self._send_msg(request_html(chunk), parse_mode='HTML')
 
     def _submit_entry(self, request, request_ref=None):
         pair = request['pair']
@@ -677,7 +780,7 @@ class Telegram(UpstreamTelegram):
             '/preview long|short BTC <保证金> <杠杆> sl=... [price=...] [tp=...] [ttl=24h] 只读预览\n'
             '/overview 汇总助手持仓、挂单TTL、TP及止损核验快照\n'
             '风险上限覆盖保证金、杠杆、助手总敞口和该币种加仓后估算止损亏损；超限拒绝，不自动缩量。\n'
-            '/request [请求编号] 查询一条或最近5条开单请求\n'
+            '/request 历史开单与可复制命令；/request page 2 翻页；/request <编号> 看详情\n'
             '/request <编号> resolve 核实后解除未知请求阻塞（不重发旧请求）\n'
             '/forceshort BTC 100 3 sl=105000 tp=98000,95000,90000\n'
             '金额为保证金USDT，后接杠杆；不填price则市价，只接受单个入场价。以上数字仅示范格式。\n'
@@ -686,7 +789,7 @@ class Telegram(UpstreamTelegram):
             '/manual 查看手动计划；/status table 查看实际仓位与移动止损\n'
             '/forceexit <ID或all> 全平；/close <ID> 50 部分平仓\n'
             '/coo <ID> 撤销未成交订单\n'
-            '/monitor 推送BTC、ETH、SOL三份日线/4小时报告；运行时每小时也会自动推送\n'
+            '/monitor 查看三币详细报告；每小时自动一条简报，突破/跌破关键位即时提醒\n'
             '/balance /profit /order /trades /performance 查询账户与成交\n'
             '/start /stopentry /stop /reload_config /health /logs 运行控制\n\n'
             'TP1平初始仓位30%，TP2平剩余50%，TP3清仓；两个TP各平50%，一个TP全平。\n'

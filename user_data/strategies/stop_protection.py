@@ -208,15 +208,30 @@ def check_protection(strategy, trade, now, *, force=False):
         result.get('covered_amount'),
         signature,
     ]
-    notify = result['status'] != 'pending' and key != previous.get('notified_key')
-    result['notified_key'] = key if notify else previous.get('notified_key')
+    old_key = previous.get('notified_key') or []
+    notified = previous.get('notified_status') or (old_key[0] if old_key else None)
+    notify = result['status'] != 'pending' and (
+        result['status'] != notified
+        or previous.get('status') == 'unconfirmed'
+        and result['status'] == 'confirmed'
+    )
+    result['notified_status'] = notified
+    result['notified_key'] = previous.get('notified_key')
     state['protection'] = result
     strategy._save_execution(trade, state)
     if notify:
-        strategy._exit_notice(
-            f"{trade.pair}：止损已确认，触发价 {result['stop_price']:g}，覆盖 {result['covered_amount']:g}；"
+        queued = strategy._exit_notice(
+            f"【保护正常】{trade.pair}：止损已确认，触发价 {result['stop_price']:g}，"
+            f"覆盖 {result['covered_amount']:g}；"
             f"核验时间 {now:%Y-%m-%d %H:%M:%S} UTC。"
             if result['status'] == 'confirmed'
-            else f"{trade.pair}：止损尚未确认（{result['reason']}），已暂停加仓，请核对 /order 和交易所；平仓照常。"
+            else f"【需要处理】{trade.pair}：止损尚未确认（{result['reason']}）。\n"
+            '下一步：用 /order 与交易所核对止损单及覆盖数量；已暂停加仓，平仓照常。',
+            key=f'protection:{trade.id}',
         )
+        if queued:
+            result['notified_status'] = result['status']
+            result['notified_key'] = key
+            state['protection'] = result
+            strategy._save_execution(trade, state)
     return result['status'] == 'confirmed'

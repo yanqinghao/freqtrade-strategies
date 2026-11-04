@@ -1,3 +1,4 @@
+from notification_helpers import capture_alerts
 import importlib.util
 import sys
 import tempfile
@@ -89,6 +90,7 @@ class StopProtectionTests(unittest.TestCase):
         }
         self.queries = []
         self.messages = []
+        capture_alerts(self.strategy, self.messages)
         self.exchange.fetch_stoploss_order = lambda ident, pair: self.queries.append(
             ident
         ) or deepcopy(self.raw)
@@ -98,6 +100,42 @@ class StopProtectionTests(unittest.TestCase):
 
     def check(self):
         return self.module.check_protection(self.strategy, self.trade, self.now, force=True)
+
+    def test_same_incident_reason_changes_do_not_spam_and_recovery_is_once(self):
+        self.raw['status'] = 'canceled'
+        self.assertFalse(self.check())
+        self.raw.update(status='open', amount=9, remaining=9)
+        self.assertFalse(self.check())
+        self.assertEqual(len(self.messages), 1)
+        self.raw.update(amount=10, remaining=10)
+        self.assertTrue(self.check())
+        self.raw['stopPrice'] = 91
+        self.assertTrue(self.check())
+        self.assertEqual(len(self.messages), 2)
+
+    def test_queue_storage_failure_does_not_consume_notification(self):
+        from unittest.mock import patch
+
+        self.raw['status'] = 'canceled'
+        with patch.object(self.strategy.alert_queue, 'put', side_effect=OSError('disk full')):
+            self.assertFalse(self.check())
+        self.assertFalse(self.check())
+        self.assertEqual(len(self.strategy.alert_queue.pending()), 1)
+
+    def test_recovery_replaces_unsaved_failure_instead_of_replaying_stale_warning(self):
+        from unittest.mock import patch
+
+        self.assertTrue(self.check())
+        self.strategy.alert_queue.acknowledge(self.strategy.alert_queue.pending()[0])
+        self.raw['status'] = 'canceled'
+        with patch.object(self.strategy.alert_queue, 'put', side_effect=OSError('disk full')):
+            self.assertFalse(self.check())
+        self.raw['status'] = 'open'
+        self.assertTrue(self.check())
+        rows = self.strategy.alert_queue.pending()
+        self.assertEqual(len(rows), 1)
+        self.assertIn('止损已确认', rows[0]['message'])
+        self.assertEqual(self.strategy._unsaved_alerts, {})
 
     def test_active_full_reduce_only_stop_confirms_actual_receipt(self):
         self.assertTrue(self.check())
@@ -246,6 +284,7 @@ class StopProtectionTests(unittest.TestCase):
         self.assertFalse(self.check())
         self.assertEqual(len(self.messages), 1)
         self.strategy = type(self.strategy)(self.strategy.config)
+        capture_alerts(self.strategy, self.messages)
         self.strategy.dp = SimpleNamespace(
             _exchange=self.exchange, send_msg=lambda text, **kw: self.messages.append(text)
         )

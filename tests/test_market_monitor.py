@@ -41,6 +41,35 @@ class MarketMonitorTests(unittest.TestCase):
                 )
                 self.assertEqual(bearish['trend'], '偏空')
 
+    def test_hourly_digest_is_one_short_message_with_observation_conditions(self):
+        monitor = self.module.HourlyMarketMonitor(lambda p, t: self.candles(t))
+        self.addCleanup(monitor.close)
+        messages = monitor._run_cycle(self.now, True)
+        self.assertEqual(len(messages), 1)
+        self.assertLess(len(messages[0]), 1800)
+        for word in ('BTC', 'ETH', 'SOL', '观察', '支撑', '阻力', '/monitor'):
+            self.assertIn(word, messages[0])
+
+    def test_missing_data_digest_does_not_offer_directional_guidance(self):
+        def fail(pair, timeframe):
+            raise ValueError('missing')
+
+        monitor = self.module.HourlyMarketMonitor(fail)
+        self.addCleanup(monitor.close)
+        with self.assertLogs('market_monitor', level='WARNING'):
+            message = monitor._run_cycle(self.now, True)[0]
+        self.assertIn('暂不判断', message)
+        self.assertNotIn('顺势', message)
+
+    def test_bad_volume_does_not_hide_valid_price_trends(self):
+        def fetch(pair, timeframe):
+            rows = self.candles(timeframe)
+            rows[-2][5] = None
+            return rows
+
+        messages = self.module.build_reports(fetch, self.now)
+        self.assertFalse(any('行情暂不可用' in message for message in messages))
+
     def test_three_reports_use_four_timeframes_but_only_two_for_levels(self):
         requests = []
 
@@ -160,7 +189,7 @@ class MarketMonitorTests(unittest.TestCase):
             )
             self.assertEqual(len(executor.jobs), 1)
             executor.finish()
-            self.assertEqual(len(monitor.tick(self.now)), 3)
+            self.assertEqual(len(monitor.tick(self.now)), 1)
             self.assertEqual(len(requests), 12, 'hourly and alerts share a per-cycle snapshot')
             before = path.read_text()
             self.assertEqual(len(monitor.reports(self.now)), 3)
@@ -173,7 +202,7 @@ class MarketMonitorTests(unittest.TestCase):
             self.now = self.now.replace(hour=13, minute=0)
             monitor.tick(self.now)
             executor.finish()
-            self.assertEqual(len(monitor.tick(self.now)), 3)
+            self.assertEqual(len(monitor.tick(self.now)), 1)
 
     def test_alert_storage_failure_does_not_discard_hourly_reports(self):
         import inspect
@@ -187,7 +216,7 @@ class MarketMonitorTests(unittest.TestCase):
             self.addCleanup(monitor.close)
             with self.assertLogs('market_monitor', level='ERROR'):
                 messages = monitor._run_cycle(self.now, True)
-            self.assertEqual(len(messages), 3)
+            self.assertEqual(len(messages), 1)
 
 
 if __name__ == '__main__':

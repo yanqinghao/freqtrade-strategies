@@ -84,12 +84,15 @@ class EntryRequests:
                 raise ValueError('未找到请求')
         return self.get(ref)
 
-    def recent(self):
+    def recent(self, page=1):
+        if type(page) is not int or not 1 <= page <= 1000000:
+            raise ValueError('页码须为1至1000000的整数')
         with closing(self._connect()) as db:
             return [
                 self._row(row)
                 for row in db.execute(
-                    'SELECT * FROM entry_requests ORDER BY created DESC,ref DESC LIMIT 5'
+                    'SELECT * FROM entry_requests ORDER BY created DESC,ref DESC LIMIT 5 OFFSET ?',
+                    ((page - 1) * 5,),
                 )
             ]
 

@@ -80,12 +80,26 @@ def classify_regime(trends):
     return '多周期震荡区' if daily == h4 == h1 == m15 == '震荡' else '大周期分歧区，短线方向不能替代日线与4小时判断'
 
 
-def build_reports(fetch, now):
-    """Generate exactly one report per monitored coin, isolating data failures."""
+def observation(trends):
+    if len(trends) < 4:
+        return '数据不完整，暂不判断；等待行情恢复后再观察。'
+    daily, h4 = trends['1d'], trends['4h']
+    if daily != h4 or daily == '震荡':
+        return '大周期未同向；先观察4小时区间边界能否收盘突破，短线波动不足以确认方向。'
+    if daily == '偏多':
+        return '观察回踩4小时支撑后能否守住、短线能否转强；跌破支撑则重新评估偏多判断。'
+    return '观察反弹4小时阻力后能否受阻、短线能否转弱；站上阻力则重新评估偏空判断。'
+
+
+def build_reports(fetch, now, *, compact=False):
+    """One automatic digest, or detailed per-coin reports on explicit request."""
     reports = []
+    summaries = []
     for pair in MONITOR_PAIRS:
         lines = [f"{pair.split('/')[0]} 日线 / 4小时监控", f"生成时间：{now:%Y-%m-%d %H:%M} UTC"]
         trends = {}
+        results = {}
+        volume_note = ''
         for timeframe, label in (('1d', '日线'), ('4h', '4小时'), ('1h', '1小时'), ('15m', '15分钟')):
             try:
                 rows = fetch(pair, timeframe)
@@ -95,6 +109,17 @@ def build_reports(fetch, now):
                     else analyze_trend(rows, timeframe, now)
                 )
                 trends[timeframe] = result['trend']
+                results[timeframe] = result
+                if timeframe == '15m':
+                    frame = _closed_frame(rows, timeframe, now)
+                    try:
+                        volumes = [float(value) for value in frame.volume.iloc[-21:]]
+                    except (ValueError, TypeError, OverflowError):
+                        volumes = []
+                    if volumes and all(isfinite(value) and value >= 0 for value in volumes):
+                        mean = sum(volumes[:-1]) / 20
+                        if isfinite(mean) and mean > 0 and volumes[-1] / mean >= 2:
+                            volume_note = f'；15m放量 {volumes[-1] / mean:.2f}倍（单独放量不确认方向）'
                 lines.extend(
                     [
                         f"\n{label}：{result['trend']}（收盘 {result['closed_at']:%m-%d %H:%M} UTC）",
@@ -118,8 +143,30 @@ def build_reports(fetch, now):
                 )
                 lines.append(f'\n{label}：行情暂不可用。')
         lines.append('\n走势分区：' + classify_regime(trends))
+        lines.append('下一步观察：' + observation(trends))
         lines.append('\n点位仅来自已收盘日线与4小时K线；1小时、15分钟仅判断当前走势。不触发下单。')
         reports.append('\n'.join(lines))
+        summary = [f"{pair.split('/')[0]} · {classify_regime(trends)}"]
+        if '15m' in results:
+            summary.append(f"15m收盘 {results['15m']['close']:.8g}{volume_note}")
+        for timeframe, label in (('1d', '日线'), ('4h', '4h')):
+            result = results.get(timeframe)
+            if result:
+                support = f"{result['support']:.8g}" if result['support'] is not None else '暂无'
+                resistance = (
+                    f"{result['resistance']:.8g}" if result['resistance'] is not None else '暂无'
+                )
+                summary.append(f'{label}支撑 {support} / 阻力 {resistance}')
+            else:
+                summary.append(f'{label}行情暂不可用')
+        summary.append('观察：' + observation(trends))
+        summaries.append('\n'.join(summary))
+    if compact:
+        return [
+            f'【行情简报】{now:%m-%d %H:%M} UTC\n\n'
+            + '\n\n'.join(summaries)
+            + '\n\n/monitor 查看周期详情；仅为观察条件，不是开仓信号。'
+        ]
     return reports
 
 
@@ -176,10 +223,12 @@ class HourlyMarketMonitor:
                     cache[key] = self._fetch(pair, timeframe)
                 return cache[key]
 
-            messages = build_reports(fetch, now) if hourly else []
+            messages = build_reports(fetch, now, compact=True) if hourly else []
             if self._alerts is not None:
                 try:
-                    messages.extend(self._alerts.check(fetch, now))
+                    alerts = self._alerts.check(fetch, now)
+                    if alerts:
+                        messages.append('【关键异动】\n' + '\n\n'.join(alerts))
                 except Exception:
                     logger.exception('Closed-candle monitoring failed; hourly reports retained')
             return messages

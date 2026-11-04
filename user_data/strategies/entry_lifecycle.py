@@ -27,9 +27,9 @@ def _notice(strategy, trade, order_id, code, message):
     events = state.setdefault('entry_events', {})
     if events.get(str(order_id)) == code:
         return
-    events[str(order_id)] = code
-    strategy._save_execution(trade, state)
-    strategy._exit_notice(f'{trade.pair}：{message}')
+    if strategy._exit_notice(f'{trade.pair}：{message}', key=f'entry:{trade.id}:{order_id}'):
+        events[str(order_id)] = code
+        strategy._save_execution(trade, state)
 
 
 def _reconcile_intent(strategy, trade, order_id, active):

@@ -20,6 +20,7 @@ from freqtrade.persistence import Trade
 from freqtrade.util import FtPrecise
 
 from assistant_state import read_state, update_state
+from assistant_alerts import AlertQueue
 from entry_requests import EntryRequests
 from entry_risk import (
     EntryRiskError,
@@ -78,6 +79,10 @@ class KamaFama_Dynamic(IStrategy):
         self.entry_requests = EntryRequests(
             Path(config.get('user_data_dir', 'user_data')) / 'entry_requests.sqlite'
         )
+        self.alert_queue = AlertQueue(
+            Path(config.get('user_data_dir', 'user_data')) / 'assistant_alerts.sqlite'
+        )
+        self._unsaved_alerts = {}
         self.risk_limits_file = Path(self.state_file).with_name('assistant_risk.json')
         self._risk_request_ref = None
         self._state_lock = RLock()
@@ -154,6 +159,8 @@ class KamaFama_Dynamic(IStrategy):
             raise ValueError('止损尚未确认，本次加仓未提交；请先核对 /order 与交易所')
 
     def bot_loop_start(self, current_time, **kwargs):
+        for key, message in list(self._unsaved_alerts.items()):
+            self._exit_notice(message, key=key)
         # All Telegram mutations run on the trading thread, before native exit
         # processing. Native RPC can acquire its own lock without reentrancy.
         for _ in range(10):
@@ -366,12 +373,17 @@ class KamaFama_Dynamic(IStrategy):
             min_remaining_value=floor or 0.0,
         )
 
-    def _exit_notice(self, message):
+    def _exit_notice(self, message, *, key=None):
         logger.warning(message)
+        key = key or message
         try:
-            self.dp.send_msg(message, always_send=True)
-        except Exception:
-            logger.exception('Unable to enqueue exit alert')
+            self.alert_queue.put(key, message)
+            self._unsaved_alerts.pop(key, None)
+            return True
+        except Exception as error:
+            self._unsaved_alerts[key] = message
+            logger.warning('Unable to persist critical alert (%s)', type(error).__name__)
+            return False
 
     def request_full_exit(self, trade, reason, *, blocked=False):
         state = self._execution(trade)
@@ -380,14 +392,23 @@ class KamaFama_Dynamic(IStrategy):
         full.update(reason=reason, blocked=blocked)
         if blocked:
             full['needs_protection_check'] = True
-        state['full_exit'] = full
-        self._save_execution(trade, state)
         if changed:
-            self._exit_notice(
+            full['notice_pending'] = (
                 f'{trade.pair}：整仓暂不满足平仓规则（{reason}），未平记录已保留，需核实交易所仓位与止损。'
                 if blocked
                 else f'{trade.pair}：分批退出受限（{reason}），已切换为全平计划，实际成交前不会清理记录。'
             )
+        state['full_exit'] = full
+        self._save_execution(trade, state)
+        self._flush_exit_notice(trade)
+
+    def _flush_exit_notice(self, trade):
+        state = self._execution(trade)
+        full = state.get('full_exit') or {}
+        message = full.get('notice_pending')
+        if message and self._exit_notice(message, key=f'exit:{trade.id}'):
+            full.pop('notice_pending', None)
+            self._save_execution(trade, state)
 
     def mark_full_exit_attempt(self, trade, current_time):
         state = self._execution(trade)
@@ -404,6 +425,7 @@ class KamaFama_Dynamic(IStrategy):
         self._save_execution(trade, state)
 
     def check_full_exit(self, trade, current_time):
+        self._flush_exit_notice(trade)
         state = self._execution(trade)
         full = state.get('full_exit')
         if not full or not trade.is_open or not trade.amount:
@@ -427,6 +449,13 @@ class KamaFama_Dynamic(IStrategy):
         full.update(
             attempt_done=True, needs_protection_check=False, blocked=not retry, retry_ready=retry
         )
+        # Commit notification intent together with execution flags; enqueue may fail independently.
+        full['notice_pending'] = (
+            f'{trade.pair}：全平仅部分成交，仍有 {trade.amount:g}，将继续退出余量；请核对 /order。'
+            if retry
+            else f'{trade.pair}：全平失败或未确认完成，仍有 {trade.amount:g}。'
+            '已暂停自动重复提交，请核对 /order、交易所仓位及止损，再用 /forceexit 重试。'
+        )
         self._save_execution(trade, state)
         protection = '尚无法核验止损'
         bot = self.execution_bot
@@ -444,12 +473,18 @@ class KamaFama_Dynamic(IStrategy):
                 logger.exception('Unable to verify stop protection for %s', trade.pair)
         if not trade.is_open or not trade.amount:
             return
-        self._exit_notice(
+        state = self._execution(trade)
+        full = state.get('full_exit')
+        if not full:
+            return
+        full['notice_pending'] = (
             f'{trade.pair}：全平仅部分成交，仍有 {trade.amount:g}，将继续退出余量。{protection}。'
             if retry
             else f'{trade.pair}：全平失败或未确认完成，仍有 {trade.amount:g}。'
             f'已暂停自动重复提交，请通过 /order、交易所核实后用 /forceexit 重试。{protection}。'
         )
+        self._save_execution(trade, state)
+        self._flush_exit_notice(trade)
 
     def _tranche_target(self, trade, state, stage, target_count):
         key = str(stage)

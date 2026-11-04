@@ -3,6 +3,7 @@ import importlib.util
 import sqlite3
 import tempfile
 import unittest
+from html import unescape
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -57,6 +58,15 @@ class EntryRequestStoreTests(unittest.TestCase):
         self.assertEqual(self.cls.reference(-12, 40), self.cls.reference(-12, 40))
         self.assertNotEqual(self.cls.reference(-12, 40), self.cls.reference(-12, 41))
         self.assertNotEqual(self.cls.reference(-12, 40), self.cls.reference(-13, 40))
+
+    def test_history_pages_are_disjoint_and_keep_old_requests(self):
+        for i in range(12):
+            self.store.reserve(f'{i:024x}', self.request)
+        first, second, third = (self.store.recent(page=i) for i in (1, 2, 3))
+        self.assertEqual([len(first), len(second), len(third)], [5, 5, 2])
+        self.assertEqual(len({r['ref'] for r in first + second + third}), 12)
+        with self.assertRaises(ValueError):
+            self.store.recent(page=0)
 
 
 class EntryRequestFlowTests(unittest.TestCase):
@@ -128,10 +138,55 @@ class EntryRequestFlowTests(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertEqual(len(self.calls), 2)
-        self.assertEqual(len(sent), 6)
-        self.assertIn('/request <请求编号>', sent[3])
+        self.assertEqual(len(sent), 4)
+        self.assertIn('/request <请求编号>', unescape(sent[3]))
         self.assertIn(self.strategy.entry_requests.reference(-12, 77), sent[0])
         self.assertIn(self.strategy.entry_requests.reference(-12, 77), sent[1])
+
+    def test_reusable_command_preserves_precision_direction_and_omissions(self):
+        self.prepare()
+        for direction, args in (
+            (
+                'long',
+                [
+                    'BTC',
+                    '10.123456789',
+                    '3',
+                    'sl=90123.456789',
+                    'price=95123.456789',
+                    'ttl=90m',
+                    'tp=98000.123456789,100000',
+                ],
+            ),
+            ('short', ['ETH', '12', '5', 'sl=4000', 'tp=3100,3000']),
+            ('long', ['SOL', '12', '2']),
+        ):
+            request = self.module.parse_entry(args, direction)
+            row, _ = self.strategy.entry_requests.reserve(
+                self.strategy.entry_requests.reference(1, len(args)), request
+            )
+            text = self.bot._format_entry_request(row)
+            command = next(line for line in text.splitlines() if line.startswith('/force'))
+            self.assertEqual(command.split()[0], '/force' + direction)
+            self.assertEqual(self.module.parse_entry(command.split()[1:], direction), request)
+            self.assertIn('UTC', text)
+            if 'stop_loss' not in request:
+                self.assertIn('未填写SL', text)
+
+    def test_history_bounds_message_lengths_and_preserves_copyable_commands(self):
+        self.prepare()
+        sent = []
+
+        async def send(text, **kwargs):
+            sent.append(text)
+
+        self.bot._send_msg = send
+        command = '/forcelong BTC/USDT:USDT 10 3 sl=90'
+        text = '\n\n'.join('记录' * 800 + '\n' + command for _ in range(5))
+        asyncio.run(self.bot._send_request_text(text))
+        self.assertGreater(len(sent), 1)
+        self.assertTrue(all(len(unescape(part).encode('utf-16-le')) // 2 < 4096 for part in sent))
+        self.assertEqual(sum(part.count('<code>' + command + '</code>') for part in sent), 5)
 
     def test_receipt_reports_actual_native_leverage(self):
         self.prepare()

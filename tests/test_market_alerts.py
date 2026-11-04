@@ -86,12 +86,10 @@ class MarketAlertTests(unittest.TestCase):
             self.assertIn(word, message)
         self.assertEqual(self.check(), [], 'same closed candle must not be repeated')
 
-    def test_volume_alert_does_not_require_crossing_a_level(self):
+    def test_volume_without_a_price_cross_does_not_push(self):
         self.advance(volume=30.0)
         messages = self.check()
-        self.assertEqual(len(messages), 1)
-        self.assertIn('放量', messages[0])
-        self.assertNotIn('突破', messages[0])
+        self.assertEqual(messages, [])
 
     def test_failed_reference_timeframe_preserves_volume_and_healthy_reference(self):
         self.advance(close=110.0, volume=30.0)
@@ -108,7 +106,7 @@ class MarketAlertTests(unittest.TestCase):
         self.assertIn('日线阻力 105', messages[0])
         self.assertNotIn('4小时阻力', messages[0])
 
-    def test_volume_still_alerts_when_both_reference_timeframes_fail(self):
+    def test_missing_references_do_not_promote_volume_to_key_alert(self):
         self.advance(volume=30.0)
 
         def fetch(pair, timeframe):
@@ -118,8 +116,7 @@ class MarketAlertTests(unittest.TestCase):
 
         with self.assertLogs('market_alerts', level='WARNING'):
             messages = self.check(fetch)
-        self.assertEqual(len(messages), 1)
-        self.assertIn('放量', messages[0])
+        self.assertEqual(messages, [])
 
     def test_unparseable_or_overflowing_volume_does_not_hide_price_cross(self):
         for previous, current in (
@@ -248,6 +245,7 @@ class MarketAlertTests(unittest.TestCase):
         def fetch(pair, timeframe):
             rows = self.fetch(pair, timeframe)
             if timeframe == '15m':
+                rows[-2][4] = 110.0
                 rows[-2][5] = 30.0
             return rows
 
@@ -258,7 +256,7 @@ class MarketAlertTests(unittest.TestCase):
         self.assertTrue(messages[1].startswith('SOL'))
 
     def test_persistence_failure_does_not_consume_event_or_emit_untracked_alert(self):
-        self.advance(volume=30.0)
+        self.advance(close=110.0, volume=30.0)
         with patch('market_alerts.update_state', side_effect=OSError('disk unavailable')):
             with self.assertRaises(OSError):
                 self.check()
