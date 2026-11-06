@@ -46,6 +46,44 @@ class TelegramAssistantTests(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 self.module.parse_entry(args, 'long')
 
+    def test_empty_entry_commands_explain_candle_rules_without_submitting(self):
+        from freqtrade.enums import SignalDirection
+        from candle_exits import validate_rules
+
+        for direction in (SignalDirection.LONG, SignalDirection.SHORT):
+            with self.subTest(direction=direction):
+                bot = object.__new__(self.module.Telegram)
+                sent = []
+
+                async def send(message, **kwargs):
+                    sent.append(message)
+
+                bot._send_msg = send
+                # No RPC or request store: help must finish before touching trading state.
+                asyncio.run(
+                    bot._force_enter.__wrapped__(bot, None, SimpleNamespace(args=[]), direction)
+                )
+                text = '\n'.join(sent)
+                for field in (
+                    'soft_sl=',
+                    'soft_tf=',
+                    'extend_trigger=',
+                    'extend_tp3=',
+                    'extend_tf=',
+                ):
+                    self.assertIn(field, text)
+                self.assertIn('TP2', text)
+                self.assertIn('硬止损', text)
+                command = '/force' + direction.value
+                examples = [
+                    line for line in text.splitlines() if line.startswith(command + ' BTC ')
+                ]
+                self.assertEqual(len(examples), 1)
+                request = self.module.parse_entry(examples[0].split()[1:], direction.value)
+                validate_rules(request)
+                self.assertEqual(request['soft_tf'], '4h')
+                self.assertEqual(request['extend_tf'], '4h')
+
     def test_handler_registry_has_manual_operations_but_no_retired_commands(self):
         cls = self.module.Telegram
         self.assertTrue(hasattr(cls, '_assistant_handlers'), 'explicit command registry missing')

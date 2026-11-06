@@ -92,12 +92,38 @@ def ttl_seconds(value):
     return seconds
 
 
+def entry_usage(direction):
+    short = direction == 'short'
+    command = '/forceshort' if short else '/forcelong'
+    example = (
+        '/forceshort BTC 10 3 sl=80000 price=78000 tp=77000,76000,74000 '
+        'soft_sl=78850 soft_tf=4h extend_trigger=75000 extend_tp3=72000 extend_tf=4h'
+        if short
+        else '/forcelong BTC 10 3 sl=76000 price=78000 tp=79000,80000,82000 '
+        'soft_sl=77000 soft_tf=4h extend_trigger=81000 extend_tp3=84000 extend_tf=4h'
+    )
+    return (
+        f"{'做空' if short else '做多'}开仓用法（仅说明，本次未下单）\n"
+        f'{command} <币种> <保证金USDT> <杠杆> sl=<硬止损> '
+        '[price=<限价>] [ttl=24h] [tp=<TP1,TP2,TP3>]\n'
+        '不填price为市价；ttl仅用于限价单。已有同向持仓时为加仓。\n\n'
+        '可选软止损：soft_sl=<价格> soft_tf=4h\n'
+        f"{'空单收盘价 ≥' if short else '多单收盘价 ≤'} soft_sl 时全平，盘中越线不触发；"
+        'sl硬止损仍须保留。\n\n'
+        '可选延伸止盈：extend_trigger=<触发价> extend_tp3=<延伸目标> extend_tf=4h\n'
+        f"TP2完成后，{'收盘价 ≤' if short else '收盘价 ≥'} extend_trigger 才延伸TP3，"
+        '同时把即时保护推进到TP2；原TP3先触发仍退出。\n'
+        '触发价须在TP2与原TP3之间，延伸目标须比原TP3更远。\n'
+        '两组参数可各自选填，组内须一起填写；周期支持15m、1h、4h、1d。\n\n'
+        '完整示例（价格仅演示格式，请替换后使用）：\n'
+        f'{example}\n'
+        f"先检查风险可把开头改成 /preview {direction}；预览不会下单。"
+    )
+
+
 def parse_entry(args, direction):
     if len(args) < 3:
-        raise ValueError(
-            '用法：/forcelong 或 /forceshort BTC <保证金USDT> <杠杆> '
-            'sl=<止损> [price=<限价>] [ttl=24h] [tp=<TP1,TP2,TP3>]'
-        )
+        raise ValueError(entry_usage(direction))
     result = {
         'pair': normalize_pair(args[0]),
         'direction': direction,
