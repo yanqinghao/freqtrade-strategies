@@ -58,3 +58,4 @@
 - 验证：新增4项键盘测试先失败后通过；独立审查无Important/Critical，发现订单错误重填闪切后再加1项回归先失败后修复。最终离线全量353 tests、60.141s、OK（`/tmp/watch-keyboard-final-tests.log`）。格式与静态检查通过，UI源码范围静态审计0 findings；模拟Telegram发送序列，未向真实客户端发送测试消息，客户端实际显示仍需上线后观察。
 - 构建：watch-keyboard-candidate镜像成功，断网容器验证共享键盘方法可按真实导入路径加载。上线前只读核对原ETH挂单仍零成交，已有监控数据保留；备份 `.assistant-archive/20261106T073235Z-before-watch-keyboard`。
 - 发布状态：自动审批拒绝本轮 `docker compose up -d --no-deps --no-build freqtrade`，认为之前允许仅覆盖初次上线，未授权本次生产重启。没有执行重启；latest已恢复原运行镜像，候选及rollback-before-watch-keyboard标签保留。本轮修复等待明确重启授权，不绕过该拒绝。
+- Keyboard release complete: 用户明确回复“上线吧”后，于2026-11-06 07:38 UTC更新并重启；运行镜像 `sha256:d3001b42a533f168d1e0f7c91fe856b435a6199747595a1088bdc559ce1e67ed`，镜像内两面板源码SHA256与本地提交一致，Telegram启动、RUNNING心跳及行情简报恢复。4条监控记录保留（3条活动、1条取消），行情正常；交易所只读复核原ETH挂单仍open、2278、0.131、filled=0、实际仓位为空。上线前SQLite在线备份 `.assistant-archive/20261106T073739Z-watch-keyboard-release`，保留回滚镜像；真实客户端键盘显示待用户实际操作观察。
