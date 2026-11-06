@@ -20,6 +20,11 @@ class AlertQueue:
                 'key TEXT PRIMARY KEY, version TEXT NOT NULL, message TEXT NOT NULL, '
                 'created REAL NOT NULL, updated REAL NOT NULL, due REAL NOT NULL)'
             )
+            db.execute(
+                'CREATE TABLE IF NOT EXISTS market_alert_events ('
+                'key TEXT PRIMARY KEY, scope TEXT NOT NULL, '
+                'created REAL NOT NULL, expires REAL NOT NULL)'
+            )
         except Exception:
             db.close()
             raise
@@ -37,14 +42,46 @@ class AlertQueue:
 
     def pending(self, *, limit=3, now=None):
         stamp = time.time() if now is None else now
-        with closing(self._connect()) as db:
+        with closing(self._connect()) as db, db:
+            db.execute(
+                'DELETE FROM alerts WHERE key IN '
+                '(SELECT key FROM market_alert_events WHERE expires<=?)',
+                (stamp,),
+            )
             return [
                 dict(row)
                 for row in db.execute(
-                    'SELECT * FROM alerts WHERE due<=? ORDER BY due,created,key LIMIT ?',
+                    'SELECT * FROM alerts WHERE due<=? '
+                    "ORDER BY (key LIKE 'market-volume:%'),due,created,key LIMIT ?",
                     (stamp, limit),
                 )
             ]
+
+    def put_market_once(self, key, message, *, group, now):
+        """Atomically remember a market event and enqueue a five-minute notice."""
+        with closing(self._connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute(
+                'DELETE FROM alerts WHERE key IN '
+                '(SELECT key FROM market_alert_events WHERE expires<=?)',
+                (now,),
+            )
+            db.execute('DELETE FROM market_alert_events WHERE expires<?', (now - 86400,))
+            if db.execute('SELECT 1 FROM market_alert_events WHERE key=?', (key,)).fetchone():
+                return False
+            last = db.execute(
+                'SELECT MAX(created) FROM market_alert_events WHERE scope=?', (group,)
+            ).fetchone()[0]
+            if last is not None and now - last < 900:
+                return False
+            db.execute(
+                'INSERT INTO market_alert_events VALUES (?,?,?,?)', (key, group, now, now + 300)
+            )
+            db.execute(
+                'INSERT INTO alerts VALUES (?,?,?,?,?,?)',
+                (key, uuid.uuid4().hex, message, now, now, now),
+            )
+        return True
 
     def acknowledge(self, row):
         with closing(self._connect()) as db, db:

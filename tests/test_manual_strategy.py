@@ -96,10 +96,14 @@ class ManualStrategyTests(unittest.TestCase):
     def test_live_monitor_enables_alerts_with_separate_state(self):
         self.strategy.bot_start()
         self.addCleanup(self.strategy.market_monitor.close)
+        self.addCleanup(self.strategy.extreme_volume_monitor.close)
         alerts = getattr(self.strategy.market_monitor, '_alerts', None)
         self.assertIsNotNone(alerts, 'production monitoring must enable closed-candle alerts')
         self.assertEqual(alerts.state_file.name, 'market_alert_state.json')
         self.assertNotEqual(str(alerts.state_file), self.strategy.state_file)
+        urgent = self.strategy.extreme_volume_monitor._alerts
+        self.assertIsNotNone(urgent, 'production monitoring must enable extreme volume alerts')
+        self.assertIs(urgent.queue, self.strategy.alert_queue)
 
     def test_monitor_starts_after_native_strategy_import_path_is_removed(self):
         script = '''
@@ -122,9 +126,11 @@ with tempfile.TemporaryDirectory() as directory:
     strategy.bot_start()
     assert strategy.execution_bot.exchange._assistant_entry_receipts
     assert strategy.market_monitor._alerts is not None
+    assert strategy.extreme_volume_monitor._alerts is not None
     assert strategy._health_publisher is not None
     strategy._health_publisher.close()
     strategy.market_monitor.close()
+    strategy.extreme_volume_monitor.close()
 '''
         result = subprocess.run(
             [sys.executable, '-c', script, str(ROOT / 'user_data' / 'strategies')],

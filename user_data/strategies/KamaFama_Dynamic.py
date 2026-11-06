@@ -33,6 +33,7 @@ from entry_risk import (
 )
 from market_monitor import HourlyMarketMonitor
 from market_alerts import MarketAlerts
+from extreme_volume_alerts import ExtremeVolumeMonitor
 from exit_policy import plan_exit
 from entry_guard import ensure_position_matches, ensure_no_entry_orders
 from execution_health import HeartbeatPublisher
@@ -89,6 +90,7 @@ class KamaFama_Dynamic(IStrategy):
         self._risk_request_ref = None
         self._state_lock = RLock()
         self.market_monitor = None
+        self.extreme_volume_monitor = None
         self._commands = Queue()
         self.execution_bot = None
         self._health_publisher = None
@@ -105,6 +107,11 @@ class KamaFama_Dynamic(IStrategy):
                 exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
                 alerts=MarketAlerts(Path(self.state_file).with_name('market_alert_state.json')),
+            )
+            self.extreme_volume_monitor = ExtremeVolumeMonitor(
+                self.alert_queue,
+                exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
+                futures=self.config.get('trading_mode', 'futures') == 'futures',
             )
             if self.execution_bot is not None:
                 self._health_publisher = HeartbeatPublisher(
@@ -185,6 +192,8 @@ class KamaFama_Dynamic(IStrategy):
                 self.check_full_exit(trade, current_time)
             for trade in Trade.get_open_trades():
                 check_protection(self, trade, current_time)
+        if self.extreme_volume_monitor:
+            self.extreme_volume_monitor.tick(current_time)
         if self.market_monitor:
             for message in self.market_monitor.tick(current_time):
                 self.dp.send_msg(message, always_send=True)
@@ -202,6 +211,8 @@ class KamaFama_Dynamic(IStrategy):
             future.cancel()
         if self.market_monitor:
             self.market_monitor.close()
+        if self.extreme_volume_monitor:
+            self.extreme_volume_monitor.close()
         super().ft_bot_cleanup()
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:

@@ -954,6 +954,7 @@ class Telegram(UpstreamTelegram):
             '/forceexit <ID或all> 全平；/close <ID> 50 部分平仓\n'
             '/coo <ID> 撤销未成交订单\n'
             '/monitor 查看三币详细报告；每小时自动一条简报，突破/跌破关键位即时提醒\n'
+            '极端放量：每10秒检查三币5m累计量≥前24根均量10倍，盘中通知；同向15分钟冷却，仅提醒。\n'
             '/balance /profit /order /trades /performance 查询账户与成交\n'
             '/start /stopentry /stop /reload_config /health /logs 运行控制\n\n'
             'TP1平初始仓位30%，TP2平剩余50%，TP3清仓；两个TP各平50%，一个TP全平。\n'
