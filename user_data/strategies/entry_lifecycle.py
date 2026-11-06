@@ -11,7 +11,9 @@ TERMINAL = {'closed', 'canceled', 'expired', 'rejected'}
 
 def entry_ttl(order):
     tag = order.ft_order_tag or ''
-    match = re.fullmatch(r'manual_(?:long|short)\|ttl=(\d+)(?:\|req=[0-9a-f]{24})?', tag)
+    match = re.fullmatch(
+        r'manual_(?:long|short)\|ttl=(\d+)(?:\|until=(\d+))?(?:\|req=[0-9a-f]{24})?', tag
+    )
     if not match:
         if '|ttl=' in tag:
             raise ValueError('订单有效期元数据无效')
@@ -19,6 +21,8 @@ def entry_ttl(order):
     seconds = int(match[1])
     if not 60 <= seconds <= 5 * 86400:
         raise ValueError('订单有效期元数据无效')
+    if match[2]:
+        return int(match[2]) - order.order_date_utc.timestamp()
     return seconds
 
 

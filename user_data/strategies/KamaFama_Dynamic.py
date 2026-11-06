@@ -295,7 +295,11 @@ class KamaFama_Dynamic(IStrategy):
         plan['trade_id'] = trade.id
         if self.manual_open.get(trade.pair, {}).get('trade_id') is None:
             self.set_manual_plan(trade.pair, plan, reset_rules=False)
-        if saved and saved.get('exit_points') != plan.get('exit_points'):
+        if (
+            saved
+            and saved.get('exit_points') != plan.get('exit_points')
+            and plan.get('tp_keep_progress_from') != saved.get('exit_points')
+        ):
             state = self._execution(trade)
             state.pop('tp2_completed_at', None)
             state.pop('final_tp_started', None)
@@ -545,7 +549,7 @@ class KamaFama_Dynamic(IStrategy):
                 if blocked
                 else f'{trade.pair}：分批退出受限（{reason}），已切换为全平计划，实际成交前不会清理记录。'
             )
-            if exit_tag == 'manual_soft_sl' and not blocked:
+            if exit_tag in ('manual_soft_sl', 'manual_panel_close') and not blocked:
                 full['notice_pending'] = f'{trade.pair}：{reason}，已记录全平意图，等待成交确认。'
         state['full_exit'] = full
         self._save_execution(trade, state)

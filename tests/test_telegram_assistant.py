@@ -18,6 +18,15 @@ def load_telegram():
     except ModuleNotFoundError:
         import freqtrade.rpc.telegram as upstream
     sys.modules['freqtrade.rpc._telegram_base'] = upstream
+    for name in ('order_management', 'order_panel'):
+        qualified = 'freqtrade.rpc.' + name
+        if qualified not in sys.modules:
+            helper = importlib.util.spec_from_file_location(
+                qualified, ROOT / 'user_data' / 'strategies' / (name + '.py')
+            )
+            loaded = importlib.util.module_from_spec(helper)
+            sys.modules[qualified] = loaded
+            helper.loader.exec_module(loaded)
     spec = importlib.util.spec_from_file_location('assistant_telegram', ROOT / 'telegram.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

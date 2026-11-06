@@ -3,7 +3,11 @@
 .env
 .assistant-archive
 deploy
-user_data
+user_data/*
+!user_data/strategies/
+user_data/strategies/*
+!user_data/strategies/order_panel.py
+!user_data/strategies/order_management.py
 logs
 tests
 docs

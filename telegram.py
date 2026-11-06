@@ -11,12 +11,14 @@ from html import escape
 from math import isfinite
 
 from telegram import InlineKeyboardButton
-from telegram.ext import CallbackQueryHandler, CommandHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from freqtrade.enums import SignalDirection
 from freqtrade.persistence import Trade, Order
 from freqtrade.rpc import RPCException
 from freqtrade.rpc._telegram_base import Telegram as UpstreamTelegram, authorized_only
 from candle_exits import RULE_GROUPS, RULE_FIELDS, TIMEFRAMES, validate_rules, describe_rules
+
+from freqtrade.rpc.order_panel import OrderPanelMixin
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +186,7 @@ def parse_entry(args, direction):
     return result
 
 
-class Telegram(UpstreamTelegram):
+class Telegram(OrderPanelMixin, UpstreamTelegram):
     def __init__(self, rpc, config):
         self._manual_order_lock = asyncio.Lock()
         rpc._freqtrade.strategy.execution_bot = rpc._freqtrade
@@ -193,7 +195,7 @@ class Telegram(UpstreamTelegram):
     def _init_keyboard(self):
         self._keyboard = [
             ['/overview', '/preview', '/request'],
-            ['/status table', '/balance', '/manual'],
+            ['/orders', '/balance', '/manual'],
             ['/forcelong', '/forceshort', '/forceexit'],
             ['/setmanual', '/close', '/coo'],
             ['/monitor', '/profit', '/help'],
@@ -203,6 +205,7 @@ class Telegram(UpstreamTelegram):
         pause_entries = getattr(self, '_pause', None) or self._stopentry
         commands = {
             'status': self._status,
+            'orders': self._orders,
             'balance': self._balance,
             'profit': self._profit,
             'start': self._start,
@@ -242,6 +245,8 @@ class Telegram(UpstreamTelegram):
                 callback,
                 block=name
                 not in {
+                    'orders',
+                    'status',
                     'monitor',
                     'request',
                     'preview',
@@ -274,6 +279,14 @@ class Telegram(UpstreamTelegram):
         handlers.append(
             CallbackQueryHandler(
                 self._preview_history, pattern=r'^preview_request:[0-9a-f]{24}$', block=False
+            )
+        )
+        handlers.append(
+            CallbackQueryHandler(self._panel_callback, pattern=r'^om:[0-9a-f]{24}$', block=False)
+        )
+        handlers.append(
+            MessageHandler(
+                filters.TEXT & filters.REPLY & ~filters.COMMAND, self._panel_reply, block=False
             )
         )
         return handlers
@@ -632,7 +645,10 @@ class Telegram(UpstreamTelegram):
             leverage = result.get('leverage')
             leverage_text = f'{leverage:g}x' if leverage is not None else '未核实'
             text += f"请求保证金 {request['size']:g} USDT，实际杠杆 {leverage_text}。\n"
-            if 'ttl_seconds' in request:
+            if 'entry_deadline' in request:
+                deadline = datetime.fromtimestamp(request['entry_deadline'], timezone.utc)
+                text += f'沿用原挂单截止时间 {deadline:%Y-%m-%d %H:%M:%S} UTC。\n'
+            elif 'ttl_seconds' in request:
                 text += f"限价有效期 {request['ttl_seconds'] // 60} 分钟，从订单创建时计算。\n"
             text += '本请求不会重复下单；实际成交/退出以 /order、/status 和 /trades 为准。'
         else:
@@ -727,7 +743,11 @@ class Telegram(UpstreamTelegram):
         if not existing:
             plan.pop('trade_id', None)
         plan.update(
-            {k: v for k, v in request.items() if k not in ('pair', 'entry_price', 'ttl_seconds')}
+            {
+                k: v
+                for k, v in request.items()
+                if k not in ('pair', 'entry_price', 'ttl_seconds', 'entry_deadline')
+            }
         )
         plan.setdefault('exit_points', [])
         validate_rules(plan)
@@ -765,6 +785,11 @@ class Telegram(UpstreamTelegram):
                     enter_tag='manual_'
                     + request['direction']
                     + ('|ttl=' + str(request['ttl_seconds']) if 'entry_price' in request else '')
+                    + (
+                        '|until=' + str(request['entry_deadline'])
+                        if 'entry_deadline' in request
+                        else ''
+                    )
                     + ('|req=' + request_ref if request_ref else ''),
                 )
             if trade is None:
@@ -851,6 +876,8 @@ class Telegram(UpstreamTelegram):
                 'exit_points', plan.get('exit_points')
             ) != plan.get('exit_points'):
                 raise ValueError('仍有未完成订单，请先撤单或等待成交再修改TP；可以单独收紧SL')
+            if changed_tp:
+                plan.pop('tp_keep_progress_from', None)
             plan.update({k: v for k, v in request.items() if k not in ('pair', 'entry_price')})
             validate_rules(plan)
             if not plan.get('stop_loss'):
@@ -862,6 +889,9 @@ class Telegram(UpstreamTelegram):
     @authorized_only
     async def _set_manual(self, update, context):
         args = context.args or []
+        if not args:
+            await self._panel_list(update)
+            return
         if len(args) < 2:
             await self._send_msg(
                 '用法：/setmanual <交易ID或币种> sl=<止损> [tp=<TP1,TP2,TP3>]；也可只修改TP。\n'
@@ -929,6 +959,8 @@ class Telegram(UpstreamTelegram):
     async def _help(self, update, context):
         await self._send_msg(
             '手动交易助手\n\n'
+            '/orders 或 /status table：订单列表 → 点详情 → 点 TP/SL/开仓价，回复数字修改。\n'
+            '软止损与延伸TP3分步设置；快速全平与撤单需再次确认。\n'
             '底部键盘可直接选择命令；点击 /preview 查看参数说明和示例。\n'
             '/forcelong BTC 100 3 sl=90000 price=95000 tp=98000,100000,105000\n'
             '限价单默认24h有效，可填 ttl=4h 或 ttl=2d（1m至5d）；市价单不填ttl。\n'
