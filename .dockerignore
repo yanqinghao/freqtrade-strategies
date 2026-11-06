@@ -8,6 +8,7 @@ user_data/*
 user_data/strategies/*
 !user_data/strategies/order_panel.py
 !user_data/strategies/order_management.py
+!user_data/strategies/watch_panel.py
 logs
 tests
 docs

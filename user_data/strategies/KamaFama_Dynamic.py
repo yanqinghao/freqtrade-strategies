@@ -34,6 +34,7 @@ from entry_risk import (
 from market_monitor import HourlyMarketMonitor
 from market_alerts import MarketAlerts
 from extreme_volume_alerts import ExtremeVolumeMonitor
+from condition_watch import WatchStore, ConditionMonitor
 from exit_policy import plan_exit
 from entry_guard import ensure_position_matches, ensure_no_entry_orders
 from execution_health import HeartbeatPublisher
@@ -85,12 +86,14 @@ class KamaFama_Dynamic(IStrategy):
         self.alert_queue = AlertQueue(
             Path(config.get('user_data_dir', 'user_data')) / 'assistant_alerts.sqlite'
         )
+        self.watches = WatchStore(self.alert_queue)
         self._unsaved_alerts = {}
         self.risk_limits_file = Path(self.state_file).with_name('assistant_risk.json')
         self._risk_request_ref = None
         self._state_lock = RLock()
         self.market_monitor = None
         self.extreme_volume_monitor = None
+        self.condition_monitor = None
         self._commands = Queue()
         self.execution_bot = None
         self._health_publisher = None
@@ -110,6 +113,11 @@ class KamaFama_Dynamic(IStrategy):
             )
             self.extreme_volume_monitor = ExtremeVolumeMonitor(
                 self.alert_queue,
+                exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
+                futures=self.config.get('trading_mode', 'futures') == 'futures',
+            )
+            self.condition_monitor = ConditionMonitor(
+                self.watches,
                 exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
             )
@@ -194,6 +202,8 @@ class KamaFama_Dynamic(IStrategy):
                 check_protection(self, trade, current_time)
         if self.extreme_volume_monitor:
             self.extreme_volume_monitor.tick(current_time)
+        if self.condition_monitor:
+            self.condition_monitor.tick(current_time)
         if self.market_monitor:
             for message in self.market_monitor.tick(current_time):
                 self.dp.send_msg(message, always_send=True)
@@ -213,6 +223,8 @@ class KamaFama_Dynamic(IStrategy):
             self.market_monitor.close()
         if self.extreme_volume_monitor:
             self.extreme_volume_monitor.close()
+        if self.condition_monitor:
+            self.condition_monitor.close()
         super().ft_bot_cleanup()
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:

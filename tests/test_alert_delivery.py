@@ -68,3 +68,41 @@ class AlertDeliveryTests(unittest.TestCase):
         with self.assertRaises(Exception):
             self.cls(bad).put('x', 'x')
         self.assertEqual(bad.read_bytes(), b'broken')
+
+    def test_cancelled_or_replaced_watch_is_rechecked_before_starting_send(self):
+        from condition_watch import WatchStore, evaluate
+
+        module = load_telegram()
+        bot = object.__new__(module.Telegram)
+        bot._rpc = SimpleNamespace(
+            _freqtrade=SimpleNamespace(strategy=SimpleNamespace(alert_queue=self.queue))
+        )
+        bot._config = {'telegram': {'chat_id': 123}}
+        store = WatchStore(self.queue)
+        spec = dict(
+            mode='reject',
+            side='short',
+            pair='BTC/USDT:USDT',
+            tf='1h',
+            low=100,
+            high=102,
+            confirm=99,
+            invalid=None,
+            window=3,
+            ttl=86400,
+        )
+        w = store.create(spec, [123, 7, None], 'create', now=100)
+        new, message = evaluate(w, [], dict(price=101, time=101), 101)
+        store.apply(w, new, message, now=101)
+        self.queue.put('critical:first', 'urgent', now=102)
+        sent = []
+
+        async def send(*args, **kwargs):
+            sent.append(kwargs['text'])
+            if len(sent) == 1:
+                store.cancel(w['id'], [123, 7, None], now=103)
+
+        bot._app = SimpleNamespace(bot=SimpleNamespace(send_message=send))
+        asyncio.run(bot._deliver_alerts_once(now=104))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(self.queue.pending(now=104), [])

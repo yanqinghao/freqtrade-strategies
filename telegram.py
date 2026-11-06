@@ -19,6 +19,7 @@ from freqtrade.rpc._telegram_base import Telegram as UpstreamTelegram, authorize
 from candle_exits import RULE_GROUPS, RULE_FIELDS, TIMEFRAMES, validate_rules, describe_rules
 
 from freqtrade.rpc.order_panel import OrderPanelMixin
+from freqtrade.rpc.watch_panel import WatchPanelMixin
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +187,7 @@ def parse_entry(args, direction):
     return result
 
 
-class Telegram(OrderPanelMixin, UpstreamTelegram):
+class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
     def __init__(self, rpc, config):
         self._manual_order_lock = asyncio.Lock()
         rpc._freqtrade.strategy.execution_bot = rpc._freqtrade
@@ -198,7 +199,8 @@ class Telegram(OrderPanelMixin, UpstreamTelegram):
             ['/orders', '/balance', '/manual'],
             ['/forcelong', '/forceshort', '/forceexit'],
             ['/setmanual', '/close', '/coo'],
-            ['/monitor', '/profit', '/help'],
+            ['/watch', '/monitor', '/profit'],
+            ['/help'],
         ]
 
     def _assistant_handlers(self):
@@ -223,6 +225,7 @@ class Telegram(OrderPanelMixin, UpstreamTelegram):
             'overview': self._overview,
             'setmanual': self._set_manual,
             'monitor': self._monitor,
+            'watch': self._watch,
             'coo': self._cancel_open_order,
             'cancel_open_order': self._cancel_open_order,
             'order': self._order,
@@ -248,6 +251,7 @@ class Telegram(OrderPanelMixin, UpstreamTelegram):
                     'orders',
                     'status',
                     'monitor',
+                    'watch',
                     'request',
                     'preview',
                     'overview',
@@ -280,6 +284,9 @@ class Telegram(OrderPanelMixin, UpstreamTelegram):
             CallbackQueryHandler(
                 self._preview_history, pattern=r'^preview_request:[0-9a-f]{24}$', block=False
             )
+        )
+        handlers.append(
+            CallbackQueryHandler(self._watch_callback, pattern=r'^cw:[0-9a-f]{24}$', block=False)
         )
         handlers.append(
             CallbackQueryHandler(self._panel_callback, pattern=r'^om:[0-9a-f]{24}$', block=False)
@@ -320,10 +327,14 @@ class Telegram(OrderPanelMixin, UpstreamTelegram):
         stamp = time.time() if now is None else now
         queue = self._rpc._freqtrade.strategy.alert_queue
         for row in queue.pending(now=stamp, limit=3):
+            delivery_time = time.time() if now is None else now
+            if not queue.is_current(row, now=delivery_time):
+                continue
             updated = datetime.fromtimestamp(row['updated'], timezone.utc)
             message = row['message'] + f'\n状态时间：{updated:%m-%d %H:%M:%S} UTC'
             if stamp - row['updated'] > 60:
-                message += '\n延迟送达，请用 /overview 核对当前状态。'
+                command = '/watch' if row['key'].startswith('market-watch:') else '/overview'
+                message += f'\n延迟送达，请用 {command} 核对当前状态。'
             try:
                 await self._app.bot.send_message(
                     self._config['telegram']['chat_id'],
@@ -986,6 +997,8 @@ class Telegram(OrderPanelMixin, UpstreamTelegram):
             '/forceexit <ID或all> 全平；/close <ID> 50 部分平仓\n'
             '/coo <ID> 撤销未成交订单\n'
             '/monitor 查看三币详细报告；每小时自动一条简报，突破/跌破关键位即时提醒\n'
+            '/watch 条件监控：按钮选择到价、收盘、触区确认、突破回踩、假突破收回；分步填价、确认创建。\n'
+            '列表可查进度、取消、复制新建；设置仅提醒，不会自动开单。\n'
             '极端放量：每10秒检查三币5m累计量≥前24根均量10倍，盘中通知；同向15分钟冷却，仅提醒。\n'
             '/balance /profit /order /trades /performance 查询账户与成交\n'
             '/start /stopentry /stop /reload_config /health /logs 运行控制\n\n'

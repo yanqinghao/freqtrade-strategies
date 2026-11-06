@@ -118,7 +118,7 @@ class OrderPanelMixin:
                 and row['message'] != update.effective_message.message_id
             )
         ):
-            raise ValueError('按钮已过期或不属于你，请重新发送 /orders。')
+            raise ValueError('按钮已过期或不属于你，请重新发送 /orders 或 /watch。')
         if consume:
             tokens.pop(token)
         return row['payload']
@@ -136,7 +136,7 @@ class OrderPanelMixin:
             b.callback_data[3:]
             for row in (buttons or [])
             for b in row
-            if b.callback_data and b.callback_data.startswith('om:')
+            if b.callback_data and b.callback_data.startswith(('om:', 'cw:'))
         }
         tokens = getattr(self, '_panel_tokens', {})
         identity = self._panel_identity(update)
@@ -467,6 +467,8 @@ class OrderPanelMixin:
 
     @authorized_only
     async def _panel_reply(self, update, context):
+        if await self._watch_reply(update):
+            return
         edits = getattr(self, '_panel_edits', {})
         key = self._panel_identity(update)
         draft = edits.get(key)

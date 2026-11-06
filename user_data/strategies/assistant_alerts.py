@@ -52,7 +52,8 @@ class AlertQueue:
                 dict(row)
                 for row in db.execute(
                     'SELECT * FROM alerts WHERE due<=? '
-                    "ORDER BY (key LIKE 'market-volume:%'),due,created,key LIMIT ?",
+                    "ORDER BY (key LIKE 'market-volume:%' OR key LIKE 'market-watch:%'),"
+                    'due,created,key LIMIT ?',
                     (stamp, limit),
                 )
             ]
@@ -86,6 +87,19 @@ class AlertQueue:
     def acknowledge(self, row):
         with closing(self._connect()) as db, db:
             db.execute('DELETE FROM alerts WHERE key=? AND version=?', (row['key'], row['version']))
+
+    def is_current(self, row, *, now=None):
+        stamp = time.time() if now is None else now
+        with closing(self._connect()) as db:
+            return (
+                db.execute(
+                    'SELECT 1 FROM alerts WHERE key=? AND version=? AND due<=? '
+                    'AND NOT EXISTS (SELECT 1 FROM market_alert_events '
+                    'WHERE key=alerts.key AND expires<=?)',
+                    (row['key'], row['version'], stamp, stamp),
+                ).fetchone()
+                is not None
+            )
 
     def defer(self, row, until):
         with closing(self._connect()) as db, db:
