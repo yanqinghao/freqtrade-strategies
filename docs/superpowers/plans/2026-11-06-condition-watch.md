@@ -53,3 +53,8 @@
 - 更新后交易所只读复核：原ETH挂单仍open，价格2278、数量0.131、filled=0、remaining=0.131，ETH实际仓位为空。保留原订单，没有撤单或重复下单。启动日志无ERROR/Traceback/Condition异常，健康快照及交易循环新鲜。
 - Git收尾：用户指出未提交改动后，核对17个文件均属于本功能；提交前再次离线运行全套回归，348 tests、49.885s、OK（`/tmp/condition-commit-tests.log`），`git diff --check`通过。本地提交包含实现、集成、测试、文档与部署验证记录，不包含运行配置、凭据或数据库。
 - 提交钩子收尾：应用仓库Black/字符串格式，修正长行、未使用导入、测试变量名，并将按钮绑定lambda替换为等效functools.partial。修正后再次全量回归348 tests、55.047s、OK（`/tmp/condition-commit-final-tests.log`）；末次字符串格式调整经AST比较无语义变化。此次仅代码仓库收尾，不重启运行服务。
+- Keyboard follow-up: 用户报告/watch后底部快捷键隐藏，定时简报后恢复；用户不确定发生于刚打开还是填写价格阶段。核对固定上游_send_msg会携带ReplyKeyboardMarkup，而面板使用InlineKeyboardMarkup/ForceReply，原流程未恢复底部键盘。按Telegram Bot API的键盘类型与is_persistent定义，统一共享输入和恢复路径。
+- 修复：面板入口静默发送持久底部键盘，ForceReply结束/取消后立即恢复；数字连续填写和错误重填不恢复以免闪切，普通按钮刷新不额外发送恢复消息。原身份/话题/消息绑定保留，监控规则和交易行为未改变。
+- 验证：新增4项键盘测试先失败后通过；独立审查无Important/Critical，发现订单错误重填闪切后再加1项回归先失败后修复。最终离线全量353 tests、60.141s、OK（`/tmp/watch-keyboard-final-tests.log`）。格式与静态检查通过，UI源码范围静态审计0 findings；模拟Telegram发送序列，未向真实客户端发送测试消息，客户端实际显示仍需上线后观察。
+- 构建：watch-keyboard-candidate镜像成功，断网容器验证共享键盘方法可按真实导入路径加载。上线前只读核对原ETH挂单仍零成交，已有监控数据保留；备份 `.assistant-archive/20261106T073235Z-before-watch-keyboard`。
+- 发布状态：自动审批拒绝本轮 `docker compose up -d --no-deps --no-build freqtrade`，认为之前允许仅覆盖初次上线，未授权本次生产重启。没有执行重启；latest已恢复原运行镜像，候选及rollback-before-watch-keyboard标签保留。本轮修复等待明确重启授权，不绕过该拒绝。

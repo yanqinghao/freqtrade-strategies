@@ -141,6 +141,46 @@ class OrderPanelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.bot._panel_take(u, token)
 
+    def test_opening_panel_publishes_persistent_shortcuts_before_inline_controls(self):
+        from telegram import InlineKeyboardMarkup, ReplyKeyboardMarkup
+
+        u = update()
+        button = self.bot._panel_button(u, '返回列表', action='list')
+        asyncio.run(self.bot._panel_send(u, '订单管理', [[button]]))
+        calls = self.bot._app.bot.send_message.call_args_list
+        keyboard = calls[0].kwargs['reply_markup']
+        self.assertIsInstance(keyboard, ReplyKeyboardMarkup)
+        self.assertTrue(keyboard.is_persistent)
+        self.assertFalse(keyboard.one_time_keyboard)
+        self.assertIn('/watch', [b.text for row in keyboard.keyboard for b in row])
+        self.assertIsInstance(calls[-1].kwargs['reply_markup'], InlineKeyboardMarkup)
+        self.assertEqual(
+            self.bot._panel_take(update(message=99), button.callback_data[3:]), {'action': 'list'}
+        )
+
+    def test_leaving_force_reply_restores_shortcuts_once_in_the_same_topic(self):
+        from telegram import ForceReply, ReplyKeyboardMarkup
+
+        u = update(query=True)
+        u.effective_message.message_thread_id = 42
+        asyncio.run(self.bot._panel_send(u, '输入价格', prompt=True))
+        self.assertIsInstance(
+            self.bot._app.bot.send_message.call_args.kwargs['reply_markup'], ForceReply
+        )
+        before = self.bot._app.bot.send_message.call_count
+        asyncio.run(
+            self.bot._panel_send(u, '已取消', [[self.bot._panel_button(u, '返回', action='list')]])
+        )
+        self.assertEqual(self.bot._app.bot.send_message.call_count, before + 1)
+        sent = self.bot._app.bot.send_message.call_args.kwargs
+        self.assertIsInstance(sent['reply_markup'], ReplyKeyboardMarkup)
+        self.assertEqual(sent['message_thread_id'], 42)
+        self.assertTrue(sent['disable_notification'])
+        asyncio.run(
+            self.bot._panel_send(u, '再次刷新', [[self.bot._panel_button(u, '返回', action='list')]])
+        )
+        self.assertEqual(self.bot._app.bot.send_message.call_count, before + 1)
+
     def test_reply_saves_single_existing_rule_value_and_duplicate_reply_is_ignored(self):
         self.bot._panel_edits = {
             (123, 7, None): dict(
@@ -154,6 +194,22 @@ class OrderPanelTests(unittest.TestCase):
             asyncio.run(self.bot._panel_reply.__wrapped__(self.bot, u, None))
         self.bot._await_command.assert_awaited_once()
         self.assertEqual(self.bot._await_command.call_args.args[-1], {'soft_sl': 123})
+
+    def test_invalid_price_retry_keeps_input_without_restoring_menu_between_prompts(self):
+        from telegram import ForceReply, ReplyKeyboardMarkup
+
+        draft = dict(id=1, revision='r', field='stop_loss', current=90, existing=True)
+        asyncio.run(self.bot._panel_prompt_value(update(query=True), draft))
+        before = self.bot._app.bot.send_message.call_count
+        u = update(reply=99)
+        u.message.text = 'nan'
+        asyncio.run(self.bot._panel_reply.__wrapped__(self.bot, u, None))
+        sent = self.bot._app.bot.send_message.call_args_list[before:]
+        self.assertFalse(
+            any(isinstance(c.kwargs['reply_markup'], ReplyKeyboardMarkup) for c in sent)
+        )
+        self.assertIsInstance(sent[-1].kwargs['reply_markup'], ForceReply)
+        self.bot._await_command.assert_not_called()
 
     def test_extension_wizard_saves_only_after_complete_timeframe_selection(self):
         self.bot._panel_edits = {

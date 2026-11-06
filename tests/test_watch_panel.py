@@ -147,6 +147,39 @@ class WatchPanelTests(unittest.TestCase):
         self.assertEqual(w['spec']['confirm'], 98)
         self.assertEqual(w['spec']['high'], 102)
 
+    def test_price_entry_returns_to_shortcuts_without_waiting_for_a_report(self):
+        from telegram import ForceReply, ReplyKeyboardMarkup
+
+        self.start('到价')
+        self.assertIsInstance(self.sent[-1]['reply_markup'], ForceReply)
+        before = sum(isinstance(v.get('reply_markup'), ReplyKeyboardMarkup) for v in self.sent)
+        self.reply('100')
+        self.assertIsInstance(self.sent[-1]['reply_markup'], ForceReply)
+        self.assertEqual(
+            sum(isinstance(v.get('reply_markup'), ReplyKeyboardMarkup) for v in self.sent), before
+        )
+        self.reply('102')
+        self.click('不设价格失效')
+        self.assertTrue(
+            any(isinstance(v.get('reply_markup'), ReplyKeyboardMarkup) for v in self.sent[-2:])
+        )
+        self.assertIn('有效期', self.sent[-1]['text'])
+
+    def test_cancelling_price_prompt_restores_keyboard_and_ignores_old_reply(self):
+        from telegram import ReplyKeyboardMarkup
+
+        self.start('到价')
+        prompt = self.sent[-1]['message_id']
+        before = len(self.sent)
+        self.click('取消创建')
+        self.assertTrue(
+            any(isinstance(v.get('reply_markup'), ReplyKeyboardMarkup) for v in self.sent[before:])
+        )
+        count = len(self.sent)
+        self.reply('100', prompt=prompt)
+        self.assertEqual(len(self.sent), count)
+        self.assertEqual(self.store.list([123, 7, None]), [])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -30,6 +30,8 @@ omitted:
 
 输入和按钮的身份/消息绑定由 `order_panel.py` 的共享面板工具负责；`watch_panel.py` 持有监控向导和文案，`condition_watch.py` 持有价格规则与生命周期。两种面板共用回复入口，依据提示消息分流，不接受无关回复。未完成草稿10分钟过期，重启后重新创建；已创建监控持久保存。创建、取消、结果与行情不可用均使用文字状态。监控确认只代表自定义条件满足，不能显示“已开单”或声称趋势成立。
 
+底部快捷命令与消息上的操作按钮分开管理。打开订单/监控面板时，以静默消息附带持久快捷键，再展示操作卡片；ForceReply期间允许切换到文字输入，完成、取消或退出输入后立即恢复快捷键，不依赖下一次定时推送。连续价格输入不反复恢复，普通按钮切换不额外刷恢复消息。共享输入/恢复逻辑由 `order_panel.py` 负责，发送到原会话和话题；回复仍绑定原提示消息。Telegram客户端拥有最终键盘显示行为。
+
 | Capability | Canonical owner | Source of truth | Allowed variants | Verification |
 |---|---|---|---|---|
 | Select/Listbox | Telegram InlineKeyboard、共享面板发送与token工具 | DESIGN.md | Telegram原生按钮 | tests/test_watch_panel.py、tests/test_order_panel.py |

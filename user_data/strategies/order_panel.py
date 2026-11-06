@@ -5,7 +5,7 @@ import time
 from math import fsum
 from datetime import datetime, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, ReplyKeyboardMarkup
 from freqtrade.persistence import Trade
 from freqtrade.rpc._telegram_base import authorized_only
 from candle_exits import RULE_GROUPS, TIMEFRAMES, describe_rules
@@ -126,12 +126,35 @@ class OrderPanelMixin:
     def _panel_button(self, update, label, **payload):
         return InlineKeyboardButton(label, callback_data='om:' + self._panel_token(update, payload))
 
-    async def _panel_send(self, update, text, buttons=None, *, prompt=False):
-        markup = (
-            ForceReply(selective=False, input_field_placeholder='回复价格，或回复“取消”')
-            if prompt
-            else InlineKeyboardMarkup(buttons or [])
+    async def _panel_input(self, update, text, placeholder='回复价格，或回复“取消”'):
+        active = getattr(self, '_panel_reply_active', set())
+        active.add(self._panel_identity(update))
+        self._panel_reply_active = active
+        return await self._app.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            message_thread_id=update.effective_message.message_thread_id,
+            reply_markup=ForceReply(selective=False, input_field_placeholder=placeholder),
+            parse_mode=None,
         )
+
+    async def _panel_restore_keyboard(self, update):
+        if not hasattr(self, '_keyboard'):
+            self._init_keyboard()
+        await self._app.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text='底部快捷命令已恢复。',
+            message_thread_id=update.effective_message.message_thread_id,
+            reply_markup=ReplyKeyboardMarkup(
+                self._keyboard, resize_keyboard=True, one_time_keyboard=False, is_persistent=True
+            ),
+            disable_notification=True,
+            parse_mode=None,
+        )
+        getattr(self, '_panel_reply_active', set()).discard(self._panel_identity(update))
+
+    async def _panel_send(self, update, text, buttons=None, *, prompt=False, keep_reply=False):
+        markup = InlineKeyboardMarkup(buttons or [])
         current = {
             b.callback_data[3:]
             for row in (buttons or [])
@@ -150,7 +173,21 @@ class OrderPanelMixin:
             ):
                 tokens.pop(token)
         query = update.callback_query
-        if query and not prompt:
+        if (
+            not prompt
+            and not keep_reply
+            and (
+                identity in getattr(self, '_panel_reply_active', set())
+                or (not query and not update.effective_message.reply_to_message)
+            )
+        ):
+            # Inline controls and the bottom reply keyboard need separate messages.
+            # Restore only on entry/after input, never after every button click.
+            await self._panel_restore_keyboard(update)
+        if prompt:
+            result = await self._panel_input(update, text)
+            message_id = result.message_id
+        elif query:
             result = await query.edit_message_text(text=text, reply_markup=markup, parse_mode=None)
             message_id = query.message.message_id
         else:
@@ -532,7 +569,7 @@ class OrderPanelMixin:
             if saving:
                 await self._panel_detail(update, draft['id'], str(exc))
             else:
-                await self._panel_send(update, str(exc))
+                await self._panel_send(update, str(exc), keep_reply=True)
                 await self._panel_prompt_value(update, draft)
         except Exception as exc:
             logger.warning('Order panel edit unavailable (%s)', type(exc).__name__)

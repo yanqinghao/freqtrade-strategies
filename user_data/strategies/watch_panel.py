@@ -6,7 +6,7 @@ import time
 from copy import deepcopy
 from functools import partial
 
-from telegram import InlineKeyboardButton, ForceReply
+from telegram import InlineKeyboardButton
 from freqtrade.rpc._telegram_base import authorized_only
 from condition_watch import MODES, STATES, ACTIVE, MONITOR_PAIRS, describe, validate, price, stamp
 
@@ -207,14 +207,12 @@ class WatchPanelMixin:
         if index:
             nav.insert(0, b('上一步', 'step', draft=draft, index=index - 1))
         buttons.append(nav)
-        await self._panel_send(update, text, buttons)
+        await self._panel_send(update, text, buttons, keep_reply=field not in choices)
         if field not in choices:
-            prompt = await self._app.bot.send_message(
-                chat_id=update.effective_chat.id,
-                message_thread_id=update.effective_message.message_thread_id,
-                text=f"请输入{LABELS[field]}（只回复一个数字，例如 95000.5；示例不是建议点位）。\n回复“取消”退出。",
-                parse_mode=None,
-                reply_markup=ForceReply(selective=False, input_field_placeholder=LABELS[field]),
+            prompt = await self._panel_input(
+                update,
+                f"请输入{LABELS[field]}（只回复一个数字，例如 95000.5；示例不是建议点位）。\n回复“取消”退出。",
+                LABELS[field],
             )
             inputs = getattr(self, '_watch_inputs', {})
             # ponytail: one draft per authorized user/topic; restart discards unfinished input.
