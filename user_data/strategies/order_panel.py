@@ -2,6 +2,7 @@
 import logging
 import secrets
 import time
+from math import fsum
 from datetime import datetime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
@@ -25,23 +26,63 @@ LABELS = {
 KINDS = {'pending': '挂单未成交', 'partial': '部分成交 / 入场余量', 'position': '持仓'}
 
 
-def order_list(scope, page):
-    rows = []
+def order_list(owner, scope, page):
+    rows, profits = [], []
+    missing, positions = 0, 0
     for trade in Trade.get_open_trades():
         pending = any(o.ft_order_side == trade.entry_side for o in trade.open_orders)
-        if scope == 'pending' and not pending or scope == 'position' and trade.amount <= 0:
+        rate = None
+        if trade.amount > 0:
+            try:
+                rate = owner._rpc._freqtrade.exchange.get_rate(
+                    trade.pair, side='exit', is_short=trade.is_short, refresh=True
+                )
+            except Exception:
+                pass  # Keep the row unavailable, never silently count a missing quote as zero.
+        pnl = management.position_profit(trade, rate)
+        if pnl['pnl_status'] != '未成交':
+            positions += 1
+            if pnl['profit_abs'] is None:
+                missing += 1
+            else:
+                profits.append(pnl['profit_abs'])
+        if scope == 'pending' and not pending or scope == 'position' and pnl['pnl_status'] == '未成交':
             continue
         kind = '部分成交' if pending and trade.amount > 0 else ('挂单' if pending else '持仓')
+        if pnl['pnl_status'] == '成交待记账':
+            kind = '成交待记账'
         rows.append(
-            (
-                trade.id,
-                f"#{trade.id} {trade.pair.split('/')[0]} {'空' if trade.is_short else '多'} · {kind}",
+            dict(
+                id=trade.id,
+                label=(
+                    f"#{trade.id} {trade.pair.split('/')[0]} "
+                    f"{'空' if trade.is_short else '多'} · {kind}"
+                ),
+                **pnl,
             )
         )
-    rows.sort(reverse=True)
+    rows.sort(key=lambda row: row['id'], reverse=True)
     pages = max(1, (len(rows) + 5) // 6)
     page = min(max(0, page), pages - 1)
-    return rows[page * 6 : (page + 1) * 6], page, pages, len(rows)
+    return dict(
+        rows=rows[page * 6 : (page + 1) * 6],
+        page=page,
+        pages=pages,
+        total=len(rows),
+        profit_total=fsum(profits),
+        profit_missing=missing,
+        positions=positions,
+        checked=datetime.now(timezone.utc).strftime('%m-%d %H:%M:%S UTC'),
+    )
+
+
+def profit_text(row):
+    if row['profit_abs'] is None:
+        return '未成交 · 不计浮盈亏' if row['pnl_status'] == '未成交' else row['pnl_status']
+    # Avoid displaying a tiny signed loss as -0.0000.
+    amount = round(row['profit_abs'], 4) or 0.0
+    percent = round(row['profit'], 2) or 0.0
+    return f'浮盈亏 {amount:+.4f} USDT · 收益率 {percent:+.2f}%'
 
 
 class OrderPanelMixin:
@@ -127,7 +168,8 @@ class OrderPanelMixin:
         return result
 
     async def _panel_list(self, update, scope='all', page=0, notice=''):
-        rows, page, pages, total = await self._await_command(order_list, scope, page)
+        data = await self._await_command(order_list, self, scope, page)
+        rows, page, pages, total = (data[key] for key in ('rows', 'page', 'pages', 'total'))
 
         def button(label, **data):
             return self._panel_button(update, label, **data)
@@ -139,7 +181,7 @@ class OrderPanelMixin:
                 for key, label in labels.items()
             ]
         ]
-        buttons += [[button(label, action='detail', id=ident)] for ident, label in rows]
+        buttons += [[button(row['label'], action='detail', id=row['id'])] for row in rows]
         navigation = []
         if page:
             navigation.append(button('上一页', action='list', scope=scope, page=page - 1))
@@ -148,7 +190,23 @@ class OrderPanelMixin:
         navigation.append(button('刷新', action='list', scope=scope, page=page))
         buttons.append(navigation)
         text = f'订单管理 · {labels[scope]} {total} 笔 · {page + 1}/{pages}\n'
-        text += '点击订单查看最新价格、成交状态与 TP / SL。' if rows else '当前没有此类订单。新挂单可用 /forcelong 或 /forceshort。'
+        text += '\n\n'.join(row['label'] + '\n' + profit_text(row) for row in rows)
+        if not rows:
+            text += '当前没有此类订单。新挂单可用 /forcelong 或 /forceshort。'
+        amount = round(data['profit_total'], 4) or 0.0
+        if data['profit_missing']:
+            text += (
+                f"\n\n汇总不完整：{data['profit_missing']} 笔盈亏待更新。"
+                f"\n已取得小计：{amount:+.4f} USDT"
+                f"（{data['positions'] - data['profit_missing']}/{data['positions']} 笔）"
+            )
+        else:
+            text += f'\n\n全部持仓浮盈亏：{amount:+.4f} USDT'
+        text += (
+            '\n汇总含全部持仓（跨页、不受筛选影响）。'
+            '\n按已记账余仓与最新参考价估算，含手续费口径，不含已实现止盈。'
+            '\n查询时间 ' + data['checked'] + '\n点击下方订单管理，刷新可更新盈亏。'
+        )
         if notice:
             text = notice + '\n\n' + text
         await self._panel_send(update, text, buttons)
@@ -202,8 +260,9 @@ class OrderPanelMixin:
             lines.append(f'挂单到期 {deadline:%m-%d %H:%M:%S} UTC')
         if data['rate'] is not None:
             lines.append(f"最新平仓参考价 {data['rate']:g}")
-        if data['profit'] is not None:
-            lines.append(f"参考收益率 {data['profit']:+.2f}%（含杠杆，非成交承诺）")
+        lines.append(profit_text(data))
+        if data['profit_abs'] is not None:
+            lines.append('按已记账余仓估算；收益率含杠杆，浮盈亏不含已实现止盈。')
         lines.append('查询时间 ' + data['checked'])
         lines.append(f"硬 SL {plan.get('stop_loss', '未设置')} · 有效保护价 {data['stop'] or '未确认'}")
         lines.append('有效保护价为策略目标；交易所保护状态见 /overview。')

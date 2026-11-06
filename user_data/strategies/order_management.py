@@ -3,6 +3,7 @@ import hashlib
 import json
 from copy import deepcopy
 from datetime import datetime, timezone
+from math import isfinite, ulp
 
 from freqtrade.enums import SignalDirection
 from freqtrade.persistence import Trade
@@ -15,7 +16,7 @@ from entry_lifecycle import (
     install_entry_receipt_guard,
     _reconcile_intent,
 )
-from entry_risk import number, saved_plan, effective_stop
+from entry_risk import number, saved_plan, effective_stop, observed_quantities
 
 
 def get_trade(ident):
@@ -23,6 +24,28 @@ def get_trade(ident):
     if not trade:
         raise ValueError('订单已结束或不存在，请返回订单列表。')
     return trade
+
+
+def position_profit(trade, rate):
+    """Native remaining-position PnL, never realized proceeds or unfilled entry notional."""
+    result = dict(profit=None, profit_abs=None, pnl_status='盈亏待更新')
+    try:
+        amount = number(trade.amount)
+        observed, _ = observed_quantities(trade)
+        # Display-only tolerance for floating-point accounting noise.
+        noise = number(4 * max(ulp(float(observed)), ulp(float(amount))))
+        if observed - amount > noise:
+            return {**result, 'pnl_status': '成交待记账'}
+        if not amount:
+            return {**result, 'pnl_status': '未成交'}
+        rate = float(number(rate, positive=True))
+        profit = trade.calculate_profit(rate)
+        percent = profit.profit_ratio * 100
+        if not all(isfinite(value) for value in (profit.profit_abs, percent)):
+            return result
+        return dict(profit=profit.profit_ratio * 100, profit_abs=profit.profit_abs, pnl_status='可用')
+    except (ValueError, TypeError, ArithmeticError):
+        return result
 
 
 def snapshot(owner, ident):
@@ -122,7 +145,7 @@ def snapshot(owner, ident):
         error='\n'.join(dict.fromkeys(errors)),
         checked=datetime.now(timezone.utc).strftime('%m-%d %H:%M:%S UTC'),
     )
-    data['profit'] = float(trade.calc_profit_ratio(rate) * 100) if rate and trade.amount else None
+    data.update(position_profit(trade, rate))
     data['deadline'] = None
     if len(entries) == 1:
         order = trade.select_order_by_order_id(entries[0]['id'])

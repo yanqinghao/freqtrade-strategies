@@ -241,15 +241,23 @@ class OrderManagementTests(unittest.TestCase):
         self.prepare(pending=True)
         for _ in range(6):
             self.position()
-        first, page, pages, total = order_list('all', 0)
-        second = order_list('all', 1)[0]
-        self.assertEqual((len(first), len(second), pages, total), (6, 1, 2, 7))
-        self.assertEqual(len({r[0] for r in first + second}), 7)
-        self.assertEqual(order_list('pending', 0)[3], 1)
-        self.assertEqual(order_list('position', 0)[3], 6)
+        first = order_list(self.bot, 'all', 0)
+        second = order_list(self.bot, 'all', 1)
+        self.assertEqual(
+            (len(first['rows']), len(second['rows']), first['pages'], first['total']), (6, 1, 2, 7)
+        )
+        self.assertEqual(len({r['id'] for r in first['rows'] + second['rows']}), 7)
+        self.assertEqual(order_list(self.bot, 'pending', 0)['total'], 1)
+        self.assertEqual(order_list(self.bot, 'position', 0)['total'], 6)
         self.Trade.session.query(self.Trade).update({'is_open': False})
         self.Trade.commit()
-        self.assertEqual(order_list('all', 0), ([], 0, 1, 0))
+        empty = order_list(self.bot, 'all', 0)
+        self.assertEqual(
+            (empty['rows'], empty['page'], empty['pages'], empty['total']), ([], 0, 1, 0)
+        )
+        self.assertEqual(
+            (empty['positions'], empty['profit_total'], empty['profit_missing']), (0, 0, 0)
+        )
 
     def test_deadline_is_rechecked_after_native_leverage_setup(self):
         from types import SimpleNamespace

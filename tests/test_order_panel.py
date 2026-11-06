@@ -96,6 +96,8 @@ class OrderPanelTests(unittest.TestCase):
             error='',
             checked='now',
             profit=15,
+            profit_abs=5,
+            pnl_status='可用',
             deadline=None,
         )
         self.bot._await_command.return_value = data
