@@ -10,6 +10,8 @@ sys.path[:] = [p for p in sys.path if p and Path(p).resolve() != ROOT]
 
 
 def load_telegram():
+    # Production loads the strategy (and its shared rules) before RPCManager imports Telegram.
+    sys.path.insert(0, str(ROOT / 'user_data' / 'strategies'))
     # Docker keeps the official Telegram implementation under this private name.
     try:
         import freqtrade.rpc._telegram_base as upstream

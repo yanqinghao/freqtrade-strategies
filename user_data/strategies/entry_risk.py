@@ -1,4 +1,5 @@
 """Pure entry estimates and strict, assistant-only risk limits."""
+
 import json
 import logging
 from copy import deepcopy
@@ -7,6 +8,7 @@ from math import isfinite, ulp
 from pathlib import Path
 
 from freqtrade.persistence import Order, Trade
+from candle_exits import validate_rules
 
 logger = logging.getLogger(__name__)
 LIMITS = ('max_margin_usdt', 'max_leverage', 'max_total_notional_usdt', 'max_stop_loss_usdt')
@@ -66,6 +68,8 @@ def saved_plan(strategy, trade):
 
 
 def plan_for_entry(strategy, request, trade):
+    if trade and strategy._execution(trade).get('extension'):
+        raise EntryRiskError('该持仓延伸止盈已生效，不允许加仓重置保护阶段')
     if trade and trade.is_short != (request['direction'] == 'short'):
         raise EntryRiskError('同一币种只允许单方向持仓，请先平掉原方向')
     if (
@@ -82,6 +86,7 @@ def plan_for_entry(strategy, request, trade):
     if not plan.get('stop_loss'):
         raise EntryRiskError('开仓必须提供 sl=<止损价>')
     number(plan['stop_loss'], positive=True)
+    validate_rules(plan)
     return plan
 
 
@@ -110,6 +115,8 @@ def effective_stop(strategy, trade, plan, fee_open=0, fee_close=0):
     for value in (state.get('protected_stop'), getattr(trade, 'stop_loss', None)):
         if value is not None and value != 0:
             candidates.append(number(value, positive=True))
+    if state.get('extension'):
+        candidates.append(number(state['extension']['stop'], positive=True))
     return min(candidates) if trade.is_short else max(candidates)
 
 
@@ -343,6 +350,11 @@ def install_risk_guard(strategy, bot):
         if kwargs.get('reduceOnly') is True:
             return original(**kwargs)
         current = exchange._assistant_risk_strategy
+        trade = Trade.get_trades(
+            [Trade.is_open.is_(True), Trade.pair == kwargs.get('pair')]
+        ).first()
+        if trade and current._execution(trade).get('extension'):
+            raise EntryRiskError('该持仓延伸止盈已生效，不允许加仓重置保护阶段')
         if load_limits(current.risk_limits_file) is None:
             return original(**kwargs)
         try:
@@ -380,7 +392,6 @@ def install_risk_guard(strategy, bot):
                     or pending['request']['direction'] != direction
                 ):
                     raise EntryRiskError('原生提交与当前请求上下文不匹配，本次未提交')
-            trade = Trade.get_trades([Trade.is_open.is_(True), Trade.pair == pair]).first()
             plan = (
                 saved_plan(current, trade)
                 if trade

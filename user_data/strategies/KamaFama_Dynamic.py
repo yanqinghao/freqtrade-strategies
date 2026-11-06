@@ -3,6 +3,7 @@
 The historical class name is kept for compatibility with existing configurations.
 There are deliberately no signal entries or unattended position increases.
 """
+
 import logging
 import os
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ from execution_health import HeartbeatPublisher
 from entry_lifecycle import process_entry_orders, install_entry_receipt_guard
 from stop_protection import check_protection
 from trade_overview import overview_messages
+from candle_exits import RULE_GROUPS, validate_rules, closed_candle, describe_rules
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,7 @@ class KamaFama_Dynamic(IStrategy):
     def preview_entry(self, request, trade):
         plan = plan_for_entry(self, request, trade)
         result = assess_entry(self, request, trade, plan)
+        result['candle_rules'] = describe_rules(plan)
         if trade and trade.has_open_orders:
             result['reasons'].append('该币种有未完成订单，实际入场前须先核实或撤单')
             result['allowed'] = False
@@ -204,6 +207,20 @@ class KamaFama_Dynamic(IStrategy):
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
 
+    def informative_pairs(self):
+        plans = dict(self.manual_open)
+        # A saved trade plan also survives a missing manual-plan file after restart.
+        for trade in Trade.get_open_trades():
+            plans.setdefault(trade.pair, trade.get_custom_data('assistant_plan', default={}) or {})
+        return sorted(
+            {
+                (pair, plan[group[-1]])
+                for pair, plan in plans.items()
+                for key, group in RULE_GROUPS.items()
+                if plan.get(key) is not None and plan.get(group[-1])
+            }
+        )
+
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe['enter_long'] = 0
         dataframe['enter_short'] = 0
@@ -215,8 +232,16 @@ class KamaFama_Dynamic(IStrategy):
         dataframe['exit_short'] = 0
         return dataframe
 
-    def set_manual_plan(self, pair, plan):
+    def set_manual_plan(self, pair, plan, *, reset_rules=True):
         """Merge one explicit command without overwriting other coins' plans."""
+        validate_rules(plan)
+        plan = deepcopy(plan)
+        old = self.manual_open.get(pair) or {}
+        for key, group in RULE_GROUPS.items():
+            if reset_rules and any(plan.get(field) != old.get(field) for field in group):
+                plan['soft_sl_since' if key == 'soft_sl' else 'extend_since'] = datetime.now(
+                    timezone.utc
+                ).timestamp()
 
         def change(state):
             plans = state.setdefault('manual_open', {})
@@ -258,9 +283,11 @@ class KamaFama_Dynamic(IStrategy):
             return {}
         plan['trade_id'] = trade.id
         if self.manual_open.get(trade.pair, {}).get('trade_id') is None:
-            self.set_manual_plan(trade.pair, plan)
+            self.set_manual_plan(trade.pair, plan, reset_rules=False)
         if saved and saved.get('exit_points') != plan.get('exit_points'):
             state = self._execution(trade)
+            state.pop('tp2_completed_at', None)
+            state.pop('final_tp_started', None)
             state.update(
                 stage=0,
                 initial_amount=trade.amount,
@@ -275,9 +302,15 @@ class KamaFama_Dynamic(IStrategy):
 
     @staticmethod
     def _targets(plan, trade):
-        return sorted(
+        targets = sorted(
             set(float(p) for p in plan.get('exit_points', []) if p), reverse=trade.is_short
         )[:3]
+        extension = (trade.get_custom_data('assistant_execution', default={}) or {}).get(
+            'extension'
+        )
+        if extension and len(targets) == 3:
+            targets[2] = extension['target']
+        return targets
 
     def _stop_price(self, trade, plan):
         targets = self._targets(plan, trade)
@@ -295,6 +328,8 @@ class KamaFama_Dynamic(IStrategy):
             candidates.append(trade.open_rate * (1 - fee if trade.is_short else 1 + fee))
         if stage >= 2 and targets:
             candidates.append(targets[0])
+        if state.get('extension'):
+            candidates.append(state['extension']['stop'])
         old = state.get('protected_stop')
         if old:
             candidates.append(float(old))
@@ -305,6 +340,101 @@ class KamaFama_Dynamic(IStrategy):
             state['protected_stop'] = stop
             self._save_execution(trade, state)
         return stop
+
+    def _evaluate_candle_rules(self, trade, plan, current_time, current_rate):
+        if not any(plan.get(key) is not None for key in RULE_GROUPS):
+            return
+        state = self._execution(trade)
+        if state.get('full_exit'):
+            return
+        if 'position_opened_at' not in state:
+            # Native open_date is the order submission time, possibly hours before a fill.
+            filled_at = getattr(trade, 'date_entry_fill_utc', None) or current_time
+            state['position_opened_at'] = filled_at.timestamp()
+            self._save_execution(trade, state)
+        for key, group in RULE_GROUPS.items():
+            if plan.get(key) is None:
+                continue
+            if key == 'extend_trigger':
+                if state.get('extension') or state.get('final_tp_started'):
+                    continue
+                if any(
+                    order.ft_order_side == trade.exit_side
+                    and (order.ft_order_tag or '').startswith(
+                        ('manual_long_tp3', 'manual_short_tp3')
+                    )
+                    for order in trade.orders
+                ):
+                    state['final_tp_started'] = True
+                    self._save_execution(trade, state)
+                    continue
+                targets = sorted(set(plan.get('exit_points', [])), reverse=trade.is_short)
+                if len(targets) != 3 or state.get('stage') != 2 or trade.has_open_orders:
+                    continue
+                if current_rate <= targets[2] if trade.is_short else current_rate >= targets[2]:
+                    state['final_tp_started'] = True
+                    self._save_execution(trade, state)
+                    continue
+                if 'tp2_completed_at' not in state:
+                    state['tp2_completed_at'] = current_time.timestamp()
+                    self._save_execution(trade, state)
+            since_key = 'soft_sl_since' if key == 'soft_sl' else 'extend_since'
+            if plan.get(since_key) is None:
+                # Pre-upgrade plans without an activation timestamp start from this loop.
+                baselines = state.setdefault('candle_baselines', {})
+                if key not in baselines:
+                    baselines[key] = current_time.timestamp()
+                    self._save_execution(trade, state)
+                since = baselines[key]
+            else:
+                since = plan[since_key]
+            after = max(since, state['position_opened_at'])
+            if key == 'extend_trigger':
+                after = max(after, state['tp2_completed_at'])
+            timeframe = plan[group[-1]]
+            try:
+                frame = self.dp.get_pair_dataframe(pair=trade.pair, timeframe=timeframe)
+                candle = closed_candle(frame, timeframe, current_time, after)
+            except Exception as error:
+                logger.debug(
+                    'Closed-candle exit data unavailable for %s %s (%s)',
+                    trade.pair,
+                    timeframe,
+                    type(error).__name__,
+                )
+                continue
+            if candle is None:
+                continue
+            close = candle['close']
+            if key == 'soft_sl':
+                if close >= plan[key] if trade.is_short else close <= plan[key]:
+                    self.request_full_exit(
+                        trade, f'{timeframe}收盘软止损 {close:g}', exit_tag='manual_soft_sl'
+                    )
+                    return
+            else:
+                # A wick reaching the original final target before this close wins too.
+                if candle['low'] <= targets[2] if trade.is_short else candle['high'] >= targets[2]:
+                    state['final_tp_started'] = True
+                    self._save_execution(trade, state)
+                    continue
+                if close <= plan[key] if trade.is_short else close >= plan[key]:
+                    state['extension'] = {
+                        'target': plan['extend_tp3'],
+                        'stop': targets[1],
+                        'closed_at': candle['closed_at'],
+                        'timeframe': timeframe,
+                    }
+                    protected = state.get('protected_stop', targets[1])
+                    state['protected_stop'] = (min if trade.is_short else max)(
+                        protected, targets[1]
+                    )
+                    self._save_execution(trade, state)
+                    self._exit_notice(
+                        f'{trade.pair}：{timeframe}收盘 {close:g}，延伸止盈已生效；'
+                        f"TP3 改为 {plan['extend_tp3']:g}，保护推进至 TP2 {targets[1]:g}（只收紧）。",
+                        key=f'extension:{trade.id}',
+                    )
 
     def custom_stoploss(
         self, pair, trade, current_time, current_rate, current_profit, after_fill=False, **kwargs
@@ -332,6 +462,10 @@ class KamaFama_Dynamic(IStrategy):
         if hit:
             stage = self._execution(trade).get('stage', 0)
             return 'manual_pullback_stop' if stage else 'manual_sl_hit'
+        self._evaluate_candle_rules(trade, plan, current_time, current_rate)
+        stop = self._stop_price(trade, plan)
+        if stop is not None and (current_rate >= stop if trade.is_short else current_rate <= stop):
+            return 'manual_pullback_stop'
         full = self._execution(trade).get('full_exit')
         if full and not full.get('blocked'):
             if full.get('attempt_at') and not full.get('retry_ready'):
@@ -340,7 +474,7 @@ class KamaFama_Dynamic(IStrategy):
             if quantity is None:
                 self.request_full_exit(trade, reason, blocked=True)
                 return None
-            return 'manual_minimum_full_exit'
+            return full.get('exit_tag', 'manual_minimum_full_exit')
         return None
 
     def exit_decision(self, trade, rate, quantity, *, manual=False):
@@ -385,11 +519,13 @@ class KamaFama_Dynamic(IStrategy):
             logger.warning('Unable to persist critical alert (%s)', type(error).__name__)
             return False
 
-    def request_full_exit(self, trade, reason, *, blocked=False):
+    def request_full_exit(self, trade, reason, *, blocked=False, exit_tag=None):
         state = self._execution(trade)
         full = state.get('full_exit') or {}
         changed = not full or full.get('blocked') != blocked or full.get('reason') != reason
         full.update(reason=reason, blocked=blocked)
+        if exit_tag:
+            full['exit_tag'] = exit_tag
         if blocked:
             full['needs_protection_check'] = True
         if changed:
@@ -398,6 +534,8 @@ class KamaFama_Dynamic(IStrategy):
                 if blocked
                 else f'{trade.pair}：分批退出受限（{reason}），已切换为全平计划，实际成交前不会清理记录。'
             )
+            if exit_tag == 'manual_soft_sl' and not blocked:
+                full['notice_pending'] = f'{trade.pair}：{reason}，已记录全平意图，等待成交确认。'
         state['full_exit'] = full
         self._save_execution(trade, state)
         self._flush_exit_notice(trade)
@@ -524,7 +662,7 @@ class KamaFama_Dynamic(IStrategy):
             if full.get('blocked') or (full.get('attempt_at') and not full.get('retry_ready')):
                 return None
             self.mark_full_exit_attempt(trade, current_time)
-            return -trade.stake_amount, 'manual_minimum_full_exit'
+            return -trade.stake_amount, full.get('exit_tag', 'manual_minimum_full_exit')
         if exit_reason:
             return -trade.stake_amount, 'manual_protective_exit'
         plan = self._plan(trade)
@@ -536,6 +674,8 @@ class KamaFama_Dynamic(IStrategy):
         if not (rate <= targets[stage] if trade.is_short else rate >= targets[stage]):
             return None
         if stage == len(targets) - 1:
+            state['final_tp_started'] = True
+            self._save_execution(trade, state)
             amount = trade.amount
         else:
             target = self._tranche_target(trade, state, stage + 1, len(targets))
@@ -592,6 +732,8 @@ class KamaFama_Dynamic(IStrategy):
         if order.ft_order_side == trade.entry_side:
             self._plan(trade)
             state = self._execution(trade)
+            filled_at = getattr(trade, 'date_entry_fill_utc', None) or current_time
+            state.setdefault('position_opened_at', filled_at.timestamp())
             state.update(
                 initial_amount=trade.amount,
                 stage2_amount=None,
@@ -599,6 +741,8 @@ class KamaFama_Dynamic(IStrategy):
                 tp_targets={},
                 stage=0,
             )
+            state.pop('tp2_completed_at', None)
+            state.pop('final_tp_started', None)
             state['protection'] = {
                 'status': 'pending',
                 'pending_since': current_time.timestamp(),
@@ -613,6 +757,8 @@ class KamaFama_Dynamic(IStrategy):
             targets = self._targets(plan, trade)
             if not 1 <= stage < len(targets):
                 # The final TP remains active until the actual position closes.
+                state['final_tp_started'] = True
+                self._save_execution(trade, state)
                 return
             state = self._execution(trade)
             required = self._tranche_target(trade, state, stage, len(targets))
@@ -622,6 +768,8 @@ class KamaFama_Dynamic(IStrategy):
                 state['stage'] = max(stage, state.get('stage', 0))
                 if stage == 1:
                     state['stage2_amount'] = trade.amount
+                if stage == 2 and 'tp2_completed_at' not in state:
+                    state['tp2_completed_at'] = current_time.timestamp()
         else:
             return
         state.setdefault('seen', {})[str(order.order_id)] = filled
@@ -664,7 +812,7 @@ class KamaFama_Dynamic(IStrategy):
         self.mark_full_exit_attempt(trade, current_time)
         return True  # Never remove a plan or reject a protective exit before a fill.
 
-    def _cancel_for_stop(self, trade):
+    def _cancel_for_stop(self, trade, current_time=None):
         if not getattr(self, 'dp', None):
             return False
         rate = self.dp._exchange.get_rate(
@@ -672,13 +820,17 @@ class KamaFama_Dynamic(IStrategy):
         )
         plan = self._plan(trade)
         stop = self._stop_price(trade, plan) if plan else None
+        if current_time and plan and trade.amount:
+            self._evaluate_candle_rules(trade, plan, current_time, rate)
+        if self._execution(trade).get('full_exit'):
+            return True
         return stop is not None and (rate >= stop if trade.is_short else rate <= stop)
 
     def check_entry_timeout(self, pair, trade, order, current_time, **kwargs):
-        return self._cancel_for_stop(trade)
+        return self._cancel_for_stop(trade, current_time)
 
     def check_exit_timeout(self, pair, trade, order, current_time, **kwargs):
         # Release a pending TP limit order so a protective exit can run this loop.
         if (order.ft_order_tag or '').startswith(('manual_long_tp', 'manual_short_tp')):
-            return self._cancel_for_stop(trade)
+            return self._cancel_for_stop(trade, current_time)
         return False

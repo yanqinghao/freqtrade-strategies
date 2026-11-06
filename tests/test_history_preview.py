@@ -178,6 +178,36 @@ class HistoryPreviewTests(unittest.TestCase):
         self.assertIn('未找到', message)
         self.assertEqual(self.store.recent(), before)
 
+    def test_candle_rules_survive_history_preview_and_remain_read_only(self):
+        request = self.module.parse_entry(
+            [
+                'BTC',
+                '5',
+                '3',
+                'sl=103',
+                'price=100',
+                'tp=98,96,94',
+                'soft_sl=102',
+                'soft_tf=4h',
+                'extend_trigger=95',
+                'extend_tp3=92',
+                'extend_tf=4h',
+            ],
+            'short',
+        )
+        ref = 'd' * 24
+        self.store.reserve(ref, request)
+        before = deepcopy(self.store.get(ref))
+        message = self.preview([ref])
+        draft = re.search(r'<code>(/preview [^<]+)</code>', message)
+        parts = draft.group(1).split()
+        self.assertEqual(self.module.parse_entry(parts[2:], parts[1]), request)
+        self.assertIn('软SL', message)
+        self.assertIn('待延伸', message)
+        self.assertIn('风险估算仍按硬SL', message)
+        self.assertEqual(self.store.get(ref), before)
+        self.assertFalse(Path(self.strategy.state_file).exists())
+
     def test_button_handler_is_nonblocking_and_matches_only_preview_ids(self):
         handlers = self.bot._assistant_handlers()
         matching = [

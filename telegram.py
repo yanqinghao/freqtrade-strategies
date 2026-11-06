@@ -1,4 +1,5 @@
 """Small Telegram extension on top of the pinned, unmodified Freqtrade runtime."""
+
 import asyncio
 import logging
 import re
@@ -15,6 +16,7 @@ from freqtrade.enums import SignalDirection
 from freqtrade.persistence import Trade, Order
 from freqtrade.rpc import RPCException
 from freqtrade.rpc._telegram_base import Telegram as UpstreamTelegram, authorized_only
+from candle_exits import RULE_GROUPS, RULE_FIELDS, TIMEFRAMES, validate_rules, describe_rules
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,15 @@ def entry_command(request):
         parts.append('tp=' + ','.join(numeric(value) for value in request['exit_points']))
     if 'ttl_seconds' in request:
         parts.append(f"ttl={request['ttl_seconds'] // 60}m")
+    for key, group in RULE_GROUPS.items():
+        if key not in request:
+            continue
+        if request[key] is None:
+            parts.append(f'{key}=off')
+        else:
+            for field in group:
+                value = request[field] if field.endswith('_tf') else numeric(request[field])
+                parts.append(f'{field}={value}')
     return ' '.join(parts)
 
 
@@ -106,7 +117,10 @@ def parse_entry(args, direction):
             if '=' not in token:
                 raise ValueError('请使用 key=value 参数')
             key, value = token.split('=', 1)
-            if key not in ('sl', 'price', 'tp', 'tp1', 'tp2', 'tp3', 'ttl') or key in values:
+            if (
+                key not in ('sl', 'price', 'tp', 'tp1', 'tp2', 'tp3', 'ttl', *RULE_FIELDS)
+                or key in values
+            ):
                 raise ValueError(f'不支持或重复的参数：{key}；不支持自动分段入场')
             values[key] = value
     if 'tp' in values and any(k in values for k in ('tp1', 'tp2', 'tp3')):
@@ -129,6 +143,18 @@ def parse_entry(args, direction):
         raise ValueError('ttl 仅适用于带 price 的限价单')
     if 'entry_price' in result:
         result['ttl_seconds'] = ttl_seconds(values.get('ttl', '24h'))
+    for key, group in RULE_GROUPS.items():
+        if not any(field in values for field in group):
+            continue
+        if values.get(key) == 'off' and not any(field in values for field in group[1:]):
+            result.update({field: None for field in group})
+            continue
+        if not all(field in values for field in group):
+            raise ValueError('收盘规则参数须成组填写：' + '、'.join(group))
+        if values[group[-1]] not in TIMEFRAMES:
+            raise ValueError('收盘周期仅支持 15m、1h、4h、1d')
+        result.update({field: positive(values[field], field) for field in group[:-1]})
+        result[group[-1]] = values[group[-1]]
     return result
 
 
@@ -434,6 +460,8 @@ class Telegram(UpstreamTelegram):
                     'sl=<止损> [price=<限价>] [tp=<TP1,TP2,TP3>] [ttl=24h]\n'
                     'long 做多，short 做空；不填price按市价估算。'
                     '限价单默认24h有效，ttl仅用于限价单。\n'
+                    '可选收盘软SL：soft_sl=... soft_tf=4h；sl硬止损仍必填。\n'
+                    '可选延伸：extend_trigger=... extend_tp3=... extend_tf=4h（需三档TP）。\n'
                     '示例（价格仅演示格式，请替换）：\n'
                     '/preview long BTC 10 20 sl=90000 price=95000\n'
                     '/preview short ETH 10 20 sl=3200 price=3100\n'
@@ -450,12 +478,14 @@ class Telegram(UpstreamTelegram):
         command = entry_command(request)
         draft = '/preview ' + request['direction'] + ' ' + command.split(' ', 1)[1]
         text = f'历史参数来自请求 {source}；按当前持仓和额度重新估算。\n' if source else ''
-        text += '复制下面命令，修改金额、杠杆、price、sl、tp或ttl后发送，即可重新预览：\n' + draft
+        text += '复制下面命令，修改金额、杠杆、price、sl、tp、ttl或收盘规则后发送，即可重新预览：\n' + draft
         if 'stop_loss' not in request:
             text += '\n未填写SL：有同向持仓时按当前计划估算；新开仓必须补 sl=...。'
         try:
             row = await self._await_command(self._preview_entry, request)
             text += '\n\n' + self._format_risk_preview(row)
+            if row.get('candle_rules'):
+                text += '\n' + row['candle_rules'] + '\n风险估算仍按硬SL，不按软SL承诺亏损上限。'
             if row['allowed']:
                 text += (
                     '\n\n手动开单指令（自行核对后发送）：\n' + command + '\n发送会创建新开仓/加仓请求；同方向已有持仓会申请加仓，实际提交重新检查。'
@@ -656,6 +686,8 @@ class Telegram(UpstreamTelegram):
         if existing:
             if strategy._execution(existing).get('full_exit'):
                 raise ValueError('该持仓正在全平兜底处理中，请确认退出完成后再开仓')
+            if strategy._execution(existing).get('extension'):
+                raise ValueError('该持仓延伸止盈已生效，不允许加仓重置保护阶段')
             if existing.is_short != (request['direction'] == 'short'):
                 raise ValueError('同一币种只允许单方向持仓，请先平掉原方向')
             if existing.has_open_orders:
@@ -672,6 +704,7 @@ class Telegram(UpstreamTelegram):
             {k: v for k, v in request.items() if k not in ('pair', 'entry_price', 'ttl_seconds')}
         )
         plan.setdefault('exit_points', [])
+        validate_rules(plan)
         if not plan.get('stop_loss'):
             raise ValueError('开仓必须提供 sl=<止损价>；本助手不自动生成止损')
         try:
@@ -716,7 +749,7 @@ class Telegram(UpstreamTelegram):
             if old is None:
                 strategy.delete_manual_plan(pair)
             else:
-                strategy.set_manual_plan(pair, old)
+                strategy.set_manual_plan(pair, old, reset_rules=False)
             raise
         bound = deepcopy(strategy.manual_open.get(pair) or plan)
         bound['trade_id'] = trade.id
@@ -735,11 +768,19 @@ class Telegram(UpstreamTelegram):
         plans = self._rpc._freqtrade.strategy.manual_open
         if not plans:
             await self._send_msg('当前没有手动交易计划。', parse_mode=None)
+        trades = {trade.pair: trade for trade in Trade.get_open_trades()}
         for pair, plan in list(plans.items()):
+            state = (
+                trades[pair].get_custom_data('assistant_execution', default={}) or {}
+                if pair in trades
+                else {}
+            )
             await self._send_msg(
                 f"{pair} {plan.get('direction')}\n"
-                f"SL：{plan.get('stop_loss')}\nTP：{plan.get('exit_points', [])}\n"
-                '实际持仓与移动保护价请查看 /status。',
+                f"硬SL：{plan.get('stop_loss')}\n原TP：{plan.get('exit_points', [])}\n"
+                + describe_rules(plan, state)
+                + '\n'
+                + '实际持仓与移动保护价请查看 /overview。',
                 parse_mode=None,
             )
 
@@ -764,11 +805,28 @@ class Telegram(UpstreamTelegram):
             )
             strategy = self._rpc._freqtrade.strategy
             plan = deepcopy(strategy.manual_open.get(trade.pair) or strategy._plan(trade))
+            changed_rules = any(
+                field in request and request[field] != plan.get(field) for field in RULE_FIELDS
+            )
+            changed_tp = request.get('exit_points', plan.get('exit_points')) != plan.get(
+                'exit_points'
+            )
+            if trade.has_open_orders and changed_rules:
+                raise ValueError('仍有未完成订单，请先撤单或等待成交再修改收盘规则')
+            if strategy._execution(trade).get('extension') and (
+                changed_tp
+                or any(
+                    field in request and request[field] != plan.get(field)
+                    for field in RULE_GROUPS['extend_trigger']
+                )
+            ):
+                raise ValueError('延伸止盈已生效，不能修改 TP 或延伸条件；仍可收紧SL或平仓')
             if trade.has_open_orders and request.get(
                 'exit_points', plan.get('exit_points')
             ) != plan.get('exit_points'):
                 raise ValueError('仍有未完成订单，请先撤单或等待成交再修改TP；可以单独收紧SL')
             plan.update({k: v for k, v in request.items() if k not in ('pair', 'entry_price')})
+            validate_rules(plan)
             if not plan.get('stop_loss'):
                 raise ValueError('请提供 sl=<止损价>')
             plan['trade_id'] = trade.id
@@ -780,13 +838,19 @@ class Telegram(UpstreamTelegram):
         args = context.args or []
         if len(args) < 2:
             await self._send_msg(
-                '用法：/setmanual <交易ID或币种> sl=<止损> [tp=<TP1,TP2,TP3>]；也可只修改TP。', parse_mode=None
+                '用法：/setmanual <交易ID或币种> sl=<止损> [tp=<TP1,TP2,TP3>]；也可只修改TP。\n'
+                '软SL：soft_sl=<价> soft_tf=4h；延伸：extend_trigger=<价> extend_tp3=<价> extend_tf=4h。\n'
+                'soft_sl=off 或 extend_trigger=off 关闭尚未触发的规则。',
+                parse_mode=None,
             )
             return
         try:
             async with self._manual_order_lock:
                 pair = await self._await_command(self._update_plan, args[0], args[1:])
-            await self._send_msg(f'{pair} 计划已更新；保护止损只向盈利方向收紧。', parse_mode=None)
+            await self._send_msg(
+                f'{pair} 计划已更新；保护止损只向盈利方向收紧。' '收盘规则变更从下一次新收盘起判断；/overview 查看当前规则。',
+                parse_mode=None,
+            )
         except (ValueError, RPCException) as exc:
             await self._send_msg(str(exc), parse_mode=None)
 
@@ -842,6 +906,10 @@ class Telegram(UpstreamTelegram):
             '底部键盘可直接选择命令；点击 /preview 查看参数说明和示例。\n'
             '/forcelong BTC 100 3 sl=90000 price=95000 tp=98000,100000,105000\n'
             '限价单默认24h有效，可填 ttl=4h 或 ttl=2d（1m至5d）；市价单不填ttl。\n'
+            '收盘软SL：soft_sl=<价> soft_tf=4h；sl仍是必填硬止损。\n'
+            '延伸TP3：extend_trigger=<价> extend_tp3=<延伸价> extend_tf=4h（需三档TP）。\n'
+            'TP2成交后新收盘满足条件，才延伸TP3并把即时保护推进至TP2；原TP3先到仍退出。\n'
+            '收盘周期：15m/1h/4h/1d；/setmanual 也支持，soft_sl=off 或 extend_trigger=off 关闭未触发规则。\n'
             '到期撤单依赖机器人在线和网络；检测到部分成交后撤余量，优先保护已成交仓位。\n'
             '加仓前须实时确认交易所止损；未确认时拒绝加仓，平仓照常。\n'
             '新入场前核对同币种普通/条件挂单；只减仓或整仓退出单可保留，不自动撤外部单。\n'

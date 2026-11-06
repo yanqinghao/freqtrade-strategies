@@ -1,8 +1,10 @@
 """Read-only, cost-basis overview. Never query an exchange or mutate trade state."""
+
 from datetime import datetime, timedelta, timezone
 
 from entry_lifecycle import entry_ttl
 from entry_risk import effective_stop, estimate_exposure, load_limits, number, saved_plan
+from candle_exits import describe_rules
 
 
 def _protection(trade, state, quantity, goal, now):
@@ -111,6 +113,9 @@ def _trade_message(strategy, trade, snapshot, now):
             lines.append('TP执行阶段不可用。')
         else:
             lines.append(f'已记录TP阶段 {stage}；目标 {targets}。')
+        rules = describe_rules(plan, state)
+        if rules:
+            lines.append(rules)
         applied = trade.get_custom_data('assistant_plan', default={}) or {}
         if applied and applied.get('exit_points') != targets:
             lines.append('TP计划存在待应用更新，上述阶段仍为原生已记录阶段。')
