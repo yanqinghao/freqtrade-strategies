@@ -18,7 +18,7 @@ Partial fills during amendment; stale cross-user replies; TP progress reset; dup
 - [x] Add failing UI tests for scoped reply/callback state, pagination, confirmation and errors in tests/test_order_panel.py.
 - [x] Implement user_data/strategies/order_panel.py and register handlers in telegram.py; document native UI in DESIGN.md.
 - [x] Run pinned-container targeted/full tests and pre-commit; request independent safety review and fix findings.
-- [ ] Commit/push/deploy with backup, preserve plans/orders, verify runtime health and hashes; report usage and limitations.
+- [x] Commit/push/deploy with backup, preserve plans/orders, verify runtime health and hashes; report usage and limitations.
 
 ## Verification and rulings
 - Pinned offline suite: 322 tests passed; pre-commit passed; candidate Docker build and native import/handler smoke passed without network access.
@@ -26,3 +26,8 @@ Partial fills during amendment; stale cross-user replies; TP progress reset; dup
 - Ruling: use a durable TP edit marker to preserve execution progress across the JSON/native database write boundary; completed/partially filled targets cannot be edited.
 - Ruling: a pending-price amendment cancels then recreates under the existing request ledger. Unknown outcomes block replacement; an absolute deadline survives new order timestamps and is checked immediately before the SDK request, after leverage preparation. Network transit after initiation cannot be time-bounded locally.
 - Ruling: all panel callbacks are single-use and user/chat/topic/message bound; new views invalidate older mutation buttons. Telegram owns rendering. Text/keyboard/interaction tests validate native UI behavior; no live test order or close is executed.
+
+## Deployment
+- Feature commit e10f42b pushed to main and deployed on 2026-11-06 UTC.
+- Runtime RUNNING with fresh trading-loop heartbeat; Telegram and both monitor workers started. No new startup errors.
+- Container source hashes match reviewed files; existing plan checksum and pending order preserved. Consistent database backups and rollback image retained before restart.
