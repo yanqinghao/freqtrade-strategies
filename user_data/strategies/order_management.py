@@ -226,6 +226,8 @@ def edit_plan(owner, ident, revision, changes):
         # Persist intent in the same JSON update. _plan observes this marker after a crash too.
         if targets != data['plan'].get('exit_points', []):
             plan['tp_keep_progress_from'] = data['plan'].get('exit_points', [])
+        if bot.strategy.entry_pause:
+            bot.strategy.entry_pause.revise_trade(trade.id, plan)
         bot.strategy.set_manual_plan(trade.pair, plan)
         bot.strategy._plan(trade)
         return '已保存；保护只收紧，收盘规则从下一次新收盘开始判断。'
@@ -280,6 +282,8 @@ def replace_entry(owner, ident, revision, price, ref):
     _, fresh = store.reserve(ref, request)
     if not fresh:
         return owner._entry_request_status(ref)
+    if bot.strategy.entry_pause:
+        bot.strategy.entry_pause.cancel_trade(trade.id, 'replaced')
     store.set_status(ref, 'submitting', {'message': '正在撤旧单并核对成交，未确认前不会重挂。'})
     try:
         with bot._exit_lock:
@@ -307,6 +311,8 @@ def replace_entry(owner, ident, revision, price, ref):
             if Trade.get_trades([Trade.id == int(ident)]).first() is not None:
                 raise ValueError('旧单清理尚未确认')
             bot.strategy.delete_manual_plan(request['pair'], trade_id=int(ident))
+            if bot.strategy.entry_pause:
+                bot.strategy.entry_pause.retire_replaced(int(ident))
         if datetime.now(timezone.utc).timestamp() >= deadline - 60:
             return store.set_status(ref, 'rejected', {'message': '旧单已撤；临近原到期时间，未重挂。'})
         try:
@@ -334,6 +340,8 @@ def close_or_cancel(owner, ident, revision, action):
         if not data['orders'] or any(r['side'] != trade.entry_side for r in data['orders']):
             raise ValueError('当前没有可撤的入场挂单，请刷新。')
         bot = owner._rpc._freqtrade
+        if bot.strategy.entry_pause:
+            bot.strategy.entry_pause.cancel_trade(trade.id)
         with bot._exit_lock:
             install_entry_receipt_guard(bot.strategy, bot)
             for row in data['orders']:

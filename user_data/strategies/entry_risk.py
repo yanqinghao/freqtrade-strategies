@@ -351,7 +351,7 @@ def install_risk_guard(strategy, bot):
         return
     original = exchange.create_order
 
-    def check_deadline(current):
+    def check_entry_context(current):
         ref = current._risk_request_ref
         if not ref:
             return
@@ -359,6 +359,8 @@ def install_risk_guard(strategy, bot):
             row = current.entry_requests.get(ref)
             if not row:
                 raise EntryRiskError('无法核对入场请求，本次未提交')
+            if current.entry_pause:
+                current.entry_pause.guard(ref)
             deadline = row['request'].get('entry_deadline')
             if deadline is not None and time.time() >= number(deadline, positive=True):
                 raise EntryRiskError('已超过原挂单截止时间，旧单已撤，本次不再重挂')
@@ -377,7 +379,7 @@ def install_risk_guard(strategy, bot):
         if trade and current._execution(trade).get('extension'):
             raise EntryRiskError('该持仓延伸止盈已生效，不允许加仓重置保护阶段')
         if load_limits(current.risk_limits_file) is None:
-            check_deadline(current)
+            check_entry_context(current)
             return original(**kwargs)
         try:
             if kwargs.get('reduceOnly', False) is not False or kwargs.get('side') not in (
@@ -432,7 +434,7 @@ def install_risk_guard(strategy, bot):
             logger.warning('Final entry risk guard unavailable (%s)', type(error).__name__)
             raise EntryRiskError('最终风险核对不可用，本次未向交易所提交') from None
         # Network preflight can cross the original expiry. Check at the final boundary.
-        check_deadline(current)
+        check_entry_context(current)
         # Never classify an exception from the actual exchange call as a local rejection.
         return original(**kwargs)
 
@@ -443,7 +445,9 @@ def install_risk_guard(strategy, bot):
     if callable(api_create):
 
         def submit_after_leverage(*args, **kwargs):
-            check_deadline(exchange._assistant_risk_strategy)
+            params = kwargs.get('params', args[5] if len(args) > 5 else {})
+            if not params.get('reduceOnly', False):
+                check_entry_context(exchange._assistant_risk_strategy)
             return api_create(*args, **kwargs)
 
         api.create_order = submit_after_leverage

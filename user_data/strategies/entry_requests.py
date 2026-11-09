@@ -25,6 +25,9 @@ class EntryRequests:
             'ref TEXT PRIMARY KEY, request TEXT NOT NULL, state TEXT NOT NULL, '
             'result TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL)'
         )
+        db.execute(
+            'CREATE TABLE IF NOT EXISTS entry_pauses (ref TEXT PRIMARY KEY, body TEXT NOT NULL)'
+        )
         return db
 
     @staticmethod
@@ -105,3 +108,32 @@ class EntryRequests:
                 )
             ]
         return [row for row in rows if pair is None or row['request']['pair'] == pair]
+
+    def get_pause(self, ref):
+        self._ref(ref)
+        with closing(self._connect()) as db:
+            row = db.execute('SELECT body FROM entry_pauses WHERE ref=?', (ref,)).fetchone()
+            return json.loads(row['body']) if row else None
+
+    def pauses(self):
+        with closing(self._connect()) as db:
+            return [json.loads(row['body']) for row in db.execute('SELECT body FROM entry_pauses')]
+
+    def put_pause(self, meta):
+        self._ref(meta['ref'])
+        payload = json.dumps(meta, sort_keys=True, allow_nan=False)
+        with closing(self._connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            old = db.execute('SELECT body FROM entry_pauses WHERE ref=?', (meta['ref'],)).fetchone()
+            if old:
+                decision = json.loads(old['body']).get('decision')
+                if (
+                    decision in ('invalidated', 'expired', 'cancelled', 'replaced')
+                    and meta.get('decision') != decision
+                ):
+                    raise ValueError('已结束的入场计划不能恢复')
+            db.execute(
+                'INSERT INTO entry_pauses VALUES (?,?) '
+                'ON CONFLICT(ref) DO UPDATE SET body=excluded.body',
+                (meta['ref'], payload),
+            )

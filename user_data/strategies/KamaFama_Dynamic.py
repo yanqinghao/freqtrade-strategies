@@ -93,6 +93,7 @@ class KamaFama_Dynamic(IStrategy):
         self._state_lock = RLock()
         self.market_monitor = None
         self.extreme_volume_monitor = None
+        self.entry_pause = None
         self.condition_monitor = None
         self._commands = Queue()
         self.execution_bot = None
@@ -116,6 +117,13 @@ class KamaFama_Dynamic(IStrategy):
                 exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
             )
+            if self.entry_pause:
+                from entry_pause_monitor import EntryPauseMonitor
+
+                self.entry_pause.monitor = EntryPauseMonitor(
+                    exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
+                    futures=self.config.get('trading_mode', 'futures') == 'futures',
+                )
             self.condition_monitor = ConditionMonitor(
                 self.watches,
                 exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
@@ -200,6 +208,11 @@ class KamaFama_Dynamic(IStrategy):
                 self.check_full_exit(trade, current_time)
             for trade in Trade.get_open_trades():
                 check_protection(self, trade, current_time)
+        if self.entry_pause:
+            try:
+                self.entry_pause.tick(current_time)
+            except Exception as error:
+                logger.warning('Entry pause unavailable (%s)', type(error).__name__)
         if self.extreme_volume_monitor:
             self.extreme_volume_monitor.tick(current_time)
         if self.condition_monitor:
@@ -221,6 +234,8 @@ class KamaFama_Dynamic(IStrategy):
             future.cancel()
         if self.market_monitor:
             self.market_monitor.close()
+        if self.entry_pause and self.entry_pause.monitor:
+            self.entry_pause.monitor.close()
         if self.extreme_volume_monitor:
             self.extreme_volume_monitor.close()
         if self.condition_monitor:

@@ -191,6 +191,11 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
     def __init__(self, rpc, config):
         self._manual_order_lock = asyncio.Lock()
         rpc._freqtrade.strategy.execution_bot = rpc._freqtrade
+        from entry_pause import EntryPause
+
+        rpc._freqtrade.strategy.entry_pause = EntryPause(
+            rpc._freqtrade.strategy, rpc._freqtrade, self._execute_entry_request
+        )
         super().__init__(rpc, config)
 
     def _init_keyboard(self):
@@ -377,10 +382,24 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             await self._send_msg('用法：/forceexit <交易ID或all>', parse_mode=None)
             return
         try:
-            result = await self._await_command(self._rpc._rpc_force_exit, args[0])
+            result = await self._await_command(self._user_force_exit, args[0])
             await self._send_msg(result['result'], parse_mode=None)
         except (ValueError, RPCException) as exc:
             await self._send_msg(str(exc), parse_mode=None)
+
+    def _user_force_exit(self, ident):
+        controller = self._rpc._freqtrade.strategy.entry_pause
+        if controller:
+            for meta in controller.store.pauses():
+                if ident == 'all' or str(meta.get('trade_id')) == ident:
+                    controller.cancel(meta['ref'])
+        return self._rpc._rpc_force_exit(ident)
+
+    def _cancel_user_order(self, ident):
+        controller = self._rpc._freqtrade.strategy.entry_pause
+        if controller:
+            controller.cancel_trade(ident)
+        return self._rpc._rpc_cancel_open_order(ident)
 
     @authorized_only
     async def _cancel_open_order(self, update, context):
@@ -389,7 +408,7 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             await self._send_msg('用法：/coo <交易ID>', parse_mode=None)
             return
         try:
-            result = await self._await_command(self._rpc._rpc_cancel_open_order, int(args[0]))
+            result = await self._await_command(self._cancel_user_order, int(args[0]))
             await self._send_msg(str(result), parse_mode=None)
         except (ValueError, RPCException) as exc:
             await self._send_msg(str(exc), parse_mode=None)
@@ -591,7 +610,15 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             )
         if row['state'] == 'reserved':
             return store.set_status(ref, 'rejected', {'message': '请求在提交前中断，未自动重放；请核实后发送新指令。'})
+        row['pause'] = store.get_pause(ref)
         return row
+
+    def _cancel_entry_request(self, ref):
+        controller = self._rpc._freqtrade.strategy.entry_pause
+        if not controller:
+            raise ValueError('暂停计划控制未启动')
+        controller.cancel(ref)
+        return self._entry_request_status(ref)
 
     def _execute_entry_request(self, request, ref):
         store = self._rpc._freqtrade.strategy.entry_requests
@@ -640,6 +667,42 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             'resolved': '已核实解除',
         }
         request, result = row['request'], row['result']
+        pause = row.get('pause')
+        if pause:
+            labels = {
+                'watching': '原价挂单',
+                'paused': '暂停观察',
+                'canceling': '撤单核对中',
+                'resuming': '恢复提交中',
+                'submitting': '首次提交中',
+                'unknown': '回执待核实',
+                'filled': '已有成交，原持仓管理',
+                'done': '计划结束',
+            }
+            reasons = {
+                'invalidated': '触及原硬SL，永久失效',
+                'expired': '原有效期到期',
+                'cancelled': '用户已取消',
+                'replaced': '已被新计划替换',
+                'waiting_history': '历史不足，继续等待',
+                'waiting_range': '等待进入¼R范围',
+                'waiting_reclaim': '等待完整1m收回原价',
+                'waiting_continuity': '重新确认安静15分钟',
+            }
+            from datetime import timedelta
+
+            deadline = datetime.fromtimestamp(pause['deadline'], timezone(timedelta(hours=8)))
+            entry = pause['request']['entry_price']
+            reason = reasons.get(pause['decision'], '4倍逆向放量暂停；安静15分钟、¼R及收回条件通过后恢复原价限价')
+            return (
+                f"计划 {row['ref']}：{labels.get(pause['phase'], pause['phase'])}\n"
+                f"{request['pair']} {request['direction']}，原限价 {entry:g}\n"
+                f"{reason}\n"
+                f"原截止时间：{deadline:%Y-%m-%d %H:%M:%S} 北京时间\n"
+                f"/request {row['ref']} cancel 取消计划；已成交部分仍由原保护流程管理。"
+            )
+        if result.get('pause_ref'):
+            return f"入场计划 {row['ref']} 暂缓，尚未下单；/request {row['ref']} 查询或追加 cancel 取消。"
         created = datetime.fromtimestamp(row['created'], timezone.utc)
         command = entry_command(request)
         reuse = f'\n参数还原（复制后修改）：\n{command}'
@@ -674,6 +737,8 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
                 page = 1 if not args else int(args[1]) if len(args) == 2 else 0
                 store = self._rpc._freqtrade.strategy.entry_requests
                 rows = await asyncio.to_thread(store.recent, page)
+                for row in rows:
+                    row['pause'] = await asyncio.to_thread(store.get_pause, row['ref'])
                 text = f'开单历史 · 第{page}页\n'
                 text += '\n\n'.join(
                     f'{i}. ' + self._format_entry_request(row, compact=True)
@@ -694,13 +759,19 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
                 logger.warning('Entry history unavailable (%s)', type(error).__name__)
                 await self._send_msg('开单历史暂不可用，本命令未下单。', parse_mode=None)
             return
-        if len(args) > 2 or (len(args) == 2 and args[1] != 'resolve'):
+        if len(args) > 2 or (len(args) == 2 and args[1] not in ('resolve', 'cancel')):
             await self._send_msg(
                 '用法：/request [请求编号]；核实后解除未知阻塞：/request <编号> resolve', parse_mode=None
             )
             return
         try:
-            function = self._resolve_entry_request if len(args) == 2 else self._entry_request_status
+            function = self._entry_request_status
+            if len(args) == 2:
+                function = (
+                    self._resolve_entry_request
+                    if args[1] == 'resolve'
+                    else self._cancel_entry_request
+                )
             row = await self._await_command(function, args[0])
             await self._send_request_text(
                 self._format_entry_request(row), keyboard=self._preview_buttons([row])
@@ -782,6 +853,8 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
         if request_ref:
             # Account queries can take time while a Telegram pause arrives.
             self._rpc._force_entry_validations(pair, SignalDirection(request['direction']))
+            if strategy.entry_pause and strategy.entry_pause.prepare(request, request_ref):
+                return {'pause_ref': request_ref}
             strategy.entry_requests.set_status(request_ref, 'submitting', {})
         strategy.set_manual_plan(pair, plan)
         try:
@@ -823,7 +896,10 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
         ]
         if request_ref and not order_ids:
             raise RPCException('订单关联尚未确认')
-        return {'id': trade.id, 'leverage': trade.leverage, 'order_ids': order_ids}
+        result = {'id': trade.id, 'leverage': trade.leverage, 'order_ids': order_ids}
+        if strategy.entry_pause:
+            strategy.entry_pause.submitted(request_ref, result)
+        return result
 
     @authorized_only
     async def _manual(self, update, context):
@@ -894,6 +970,8 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             if not plan.get('stop_loss'):
                 raise ValueError('请提供 sl=<止损价>')
             plan['trade_id'] = trade.id
+            if strategy.entry_pause:
+                strategy.entry_pause.revise_trade(trade.id, plan)
             strategy.set_manual_plan(trade.pair, plan)
             return trade.pair
 
