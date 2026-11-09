@@ -15,7 +15,19 @@ Long proximity, freshness/continuity, hard SL, TTL and receipt checks stay intac
   recovery regressions first failed with `waiting_range`, then passed.
 - Candidate image built as `freqtrade-strategies-freqtrade:short-resume-20261109`
   (`sha256:93cb10e9b207e39468bb57c0ae9288931db194bbf07f34ef80d78c6c05a94df3`).
-- Runtime activation remains separate from the local code change.
+- User separately approved deployment. Candidate-image offline verification passed
+  all 395 tests in 56.542s. Commit `59ddf30` was pushed to origin/main before restart.
+- Container started at 2026-11-09 12:51:35 UTC and entered RUNNING at 12:51:46 UTC;
+  the running image and Telegram/policy source hashes match the candidate.
+- ETH plan `91828316cd108d39e5fe671f` moved from `waiting_range` to
+  `waiting_continuity` at 20:51:52 Beijing, attempts=0. The restart requires a
+  fresh 15-minute continuous observation period; no restored ETH order was
+  claimed at verification time. Original deadline and BTC order `1189351748904`
+  remain unchanged.
+- Rollback image: `freqtrade-strategies-freqtrade:rollback-before-short-resume-20261109`.
+  Private snapshots and prior source are under ignored
+  `.assistant-archive/short-resume-20261109T124935Z`; never restore an old trading
+  database over subsequent live activity.
 
 > Execute inline using superpowers:executing-plans; updated user constraints override the withdrawn permanent-cancellation plan.
 
