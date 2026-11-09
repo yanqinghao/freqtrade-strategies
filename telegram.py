@@ -190,12 +190,7 @@ def parse_entry(args, direction):
 class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
     def __init__(self, rpc, config):
         self._manual_order_lock = asyncio.Lock()
-        rpc._freqtrade.strategy.execution_bot = rpc._freqtrade
-        from entry_pause import EntryPause
-
-        rpc._freqtrade.strategy.entry_pause = EntryPause(
-            rpc._freqtrade.strategy, rpc._freqtrade, self._execute_entry_request
-        )
+        rpc._freqtrade.strategy.attach_execution_bot(rpc._freqtrade, self._execute_entry_request)
         super().__init__(rpc, config)
 
     def _init_keyboard(self):

@@ -23,6 +23,8 @@ from freqtrade.util import FtPrecise
 from assistant_state import read_state, update_state
 from assistant_alerts import AlertQueue
 from entry_requests import EntryRequests
+from entry_pause import EntryPause
+from entry_pause_monitor import EntryPauseMonitor
 from entry_risk import (
     EntryRiskError,
     plan_for_entry,
@@ -99,6 +101,10 @@ class KamaFama_Dynamic(IStrategy):
         self.execution_bot = None
         self._health_publisher = None
 
+    def attach_execution_bot(self, bot, submit_entry):
+        self.execution_bot = bot
+        self.entry_pause = EntryPause(self, bot, submit_entry)
+
     def bot_start(self, **kwargs):
         if self.execution_bot is not None:
             install_entry_receipt_guard(self, self.execution_bot)
@@ -118,8 +124,6 @@ class KamaFama_Dynamic(IStrategy):
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
             )
             if self.entry_pause:
-                from entry_pause_monitor import EntryPauseMonitor
-
                 self.entry_pause.monitor = EntryPauseMonitor(
                     exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                     futures=self.config.get('trading_mode', 'futures') == 'futures',

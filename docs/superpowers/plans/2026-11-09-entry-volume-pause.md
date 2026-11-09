@@ -48,3 +48,9 @@ no replacement before terminal zero fill; no duplicate resumes after crash; neve
 - Fresh whole-change reviewer found four material issues; all received failing regressions, fixes and targeted reviewer confirmation. Additional observed-signal retention regressions verify forming-candle reversals cannot erase prior evidence.
 - Final full suite:392 tests passed in17.706s; `git diff --check` clean. Container used no network or production databases.
 - Ruling: retain reviewed changes as local project edits, without committing/merging/pushing or restarting the trading process. User approved implementation; runtime activation is a separate operational action.
+
+## Authorized deployment follow-up
+
+- User explicitly authorized deployment, then required commit and push first. Commit45e645b was pushed to origin/main before any production restart. SSH22 failed; GitHub SSH443 succeeded without changing remote configuration or host-key checking.
+- Preserved the previous image and private database/plan snapshots. First candidate passed392 tests but failed real startup because StrategyResolver removes its temporary import path before Telegram construction. Rolled back to the prior image and verified RUNNING heartbeats; never restored an old trading database.
+- Startup fix imports pause modules while the strategy resolver path is active and lets Telegram attach execution through the strategy. A fresh-process native-resolver regression reproduced the original ModuleNotFoundError before the fix;393 full offline tests now pass. The fix will be committed/pushed before redeployment.
