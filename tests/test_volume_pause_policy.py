@@ -126,13 +126,39 @@ class VolumePausePolicyTests(unittest.TestCase):
         )
         self.assertEqual(result['decision'], 'invalidated')
 
-    def test_short_reclaim_and_proximity_are_symmetric(self):
+    def test_short_quote_above_entry_requires_reclaim(self):
         self.meta['request'] = dict(direction='short', entry_price=105.0, stop_loss=110.0)
         data = rows(self.now, 60, 10, price=104)
         result = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=104)
         self.assertEqual(result['decision'], 'ready')
         result = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=105.1)
         self.assertEqual(result['decision'], 'waiting_reclaim')
+
+    def test_short_far_below_entry_resumes_only_after_quiet_period(self):
+        self.meta['request'] = dict(direction='short', entry_price=2200.0, stop_loss=2290.0)
+        data = rows(self.now, 60, 10, price=2130)
+        for elapsed, expected in [(899, 'paused'), (900, 'ready')]:
+            with self.subTest(elapsed=elapsed):
+                self.meta['last_adverse'] = self.now - elapsed
+                result = self.module.advance_pause(
+                    self.meta, data, None, self.now, self.now, quote=2127.47
+                )
+                self.assertEqual(result['decision'], expected)
+                self.assertFalse(result['crossed'])
+                self.assertEqual(result['request'], self.meta['request'])
+                self.assertEqual(result['deadline'], self.meta['deadline'])
+
+    def test_short_far_below_entry_still_requires_post_cross_reclaim(self):
+        self.meta['request'] = dict(direction='short', entry_price=2200.0, stop_loss=2290.0)
+        data = rows(self.now, 60, 10, price=2130)
+        crossed = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=2201)
+        self.assertEqual(crossed['decision'], 'waiting_reclaim')
+        result = self.module.advance_pause(crossed, data, None, self.now, self.now, quote=2130)
+        self.assertEqual(result['decision'], 'waiting_reclaim')
+        later = self.now + 60
+        data.append([int(later) // 60 * 60000, 2130, 2131, 2129, 2130, 10])
+        result = self.module.advance_pause(result, data, None, later, later, quote=2130)
+        self.assertEqual(result['decision'], 'ready')
 
     def test_second_cross_requires_a_new_completed_reclaim(self):
         self.meta.update(crossed=True, crossed_at=self.now - 120)

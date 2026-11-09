@@ -107,7 +107,9 @@ def advance_pause(meta, rows, signal, observed_at, now, *, quote=None):
         result['decision'] = 'ready' if reclaimed else 'waiting_reclaim'
     else:
         result['decision'] = 'ready'
-    if result['decision'] == 'ready':
+    # Shorts can rest at the original sell limit while price remains below it.
+    # A crossed entry still needs the completed reclaim checked above.
+    if result['decision'] == 'ready' and not short:
         closed = [r for r in rows if r[0] / 1000 + 60 <= observed_at]
         if not closed or max(abs(closed[-1][4] - entry), abs(quote - entry)) > 0.25 * abs(
             entry - stop

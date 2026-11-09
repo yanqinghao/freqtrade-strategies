@@ -688,7 +688,12 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
 
             deadline = datetime.fromtimestamp(pause['deadline'], timezone(timedelta(hours=8)))
             entry = pause['request']['entry_price']
-            reason = reasons.get(pause['decision'], '4倍逆向放量暂停；安静15分钟、¼R及收回条件通过后恢复原价限价')
+            recovery = (
+                '安静15分钟；涨过原价需完整1m收回，空单无需接近原价即可恢复原价限价'
+                if pause['request']['direction'] == 'short'
+                else '安静15分钟、¼R及收回条件通过后恢复原价限价'
+            )
+            reason = reasons.get(pause['decision'], '4倍逆向放量暂停；' + recovery)
             return (
                 f"计划 {row['ref']}：{labels.get(pause['phase'], pause['phase'])}\n"
                 f"{request['pair']} {request['direction']}，原限价 {entry:g}\n"

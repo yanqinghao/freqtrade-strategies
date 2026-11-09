@@ -1,5 +1,22 @@
 # Entry Volume Pause Implementation Plan
 
+## Follow-up: short original-limit restoration (2026-11-09)
+
+User approved removing the short proximity gate: after 900 quiet seconds, restore
+the original sell limit even when price is far below entry. A prior cross still
+requires a subsequent completed 1m close and current quote at or below entry.
+Long proximity, freshness/continuity, hard SL, TTL and receipt checks stay intact.
+
+- [x] Reproduce 2200 short / 2290 SL / 2130 market with failing pure-policy tests,
+  including the 899/900-second boundary and a new cross requiring a later close.
+- [x] Restrict the existing range gate to longs and update request status wording.
+- [x] Run the pinned Freqtrade offline suite and review the diff: 395 tests passed
+  in 53.352s, including 16 policy tests; `git diff --check` clean. Both new
+  recovery regressions first failed with `waiting_range`, then passed.
+- Candidate image built as `freqtrade-strategies-freqtrade:short-resume-20261109`
+  (`sha256:93cb10e9b207e39468bb57c0ae9288931db194bbf07f34ef80d78c6c05a94df3`).
+- Runtime activation remains separate from the local code change.
+
 > Execute inline using superpowers:executing-plans; updated user constraints override the withdrawn permanent-cancellation plan.
 
 **Goal:** Pause unsafe initial limit entries, preserve intent, and resume only on safe original-price conditions.
