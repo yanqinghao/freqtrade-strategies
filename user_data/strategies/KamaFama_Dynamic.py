@@ -33,7 +33,7 @@ from entry_risk import (
     enforce,
     install_risk_guard,
 )
-from market_monitor import HourlyMarketMonitor
+from market_monitor import HourlyMarketMonitor, SharedVolumeCandles
 from market_alerts import MarketAlerts
 from extreme_volume_alerts import ExtremeVolumeMonitor
 from condition_watch import WatchStore, ConditionMonitor
@@ -118,13 +118,16 @@ class KamaFama_Dynamic(IStrategy):
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
                 alerts=MarketAlerts(Path(self.state_file).with_name('market_alert_state.json')),
             )
+            volume_candles = SharedVolumeCandles()
             self.extreme_volume_monitor = ExtremeVolumeMonitor(
                 self.alert_queue,
+                volume_candles=volume_candles,
                 exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
             )
             if self.entry_pause:
                 self.entry_pause.monitor = EntryPauseMonitor(
+                    volume_candles=volume_candles,
                     exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                     futures=self.config.get('trading_mode', 'futures') == 'futures',
                 )

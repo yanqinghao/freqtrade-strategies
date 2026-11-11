@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'user_data' / 'stra
 from assistant_state import read_state, update_state
 
 logger = logging.getLogger(__name__)
+PROBE_FAILURE_GRACE = 180
 PROBES = {
     'spot': 'https://api.binance.com/api/v3/exchangeInfo?symbol=BTCUSDT',
     'futures': 'https://fapi.binance.com/fapi/v1/ping',
@@ -39,6 +40,7 @@ def _initial_state(started_at):
         'started_at': started_at,
         'faults': {},
         'probe_failures': {},
+        'probe_failed_since': {},
         'pending': False,
         'incident': {},
         'incident_since': None,
@@ -111,13 +113,15 @@ class Watchdog:
         try:
             stored = self._state if self._state is not None else read_state(self.state_file)
             state = deepcopy(stored) if stored else _initial_state(now)
+            state.setdefault('probe_failed_since', {})  # Existing watchdog state remains valid.
             if (
                 not _timestamp(state.get('started_at'))
                 or state['started_at'] > now + 5
                 or not {'faults', 'probe_failures', 'incident', 'pending', 'incident_since'}
                 <= state.keys()
                 or not all(
-                    isinstance(state.get(k), dict) for k in ('faults', 'probe_failures', 'incident')
+                    isinstance(state.get(k), dict)
+                    for k in ('faults', 'probe_failures', 'probe_failed_since', 'incident')
                 )
                 or not all(
                     isinstance(k, str) and isinstance(v, str)
@@ -128,6 +132,9 @@ class Watchdog:
                 or any(
                     not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 2
                     for v in state['probe_failures'].values()
+                )
+                or any(
+                    not _timestamp(v) or v > now + 5 for v in state['probe_failed_since'].values()
                 )
                 or (
                     state.get('incident_since') is not None
@@ -165,7 +172,14 @@ class Watchdog:
                 0 if probes.get(name) is True else min(2, state['probe_failures'].get(name, 0) + 1)
             )
             state['probe_failures'][name] = count
-            if count >= 2:
+            if count == 0:
+                state['probe_failed_since'].pop(name, None)
+                continue
+            # Preserve already announced faults when upgrading from the count-only state.
+            since = state['probe_failed_since'].setdefault(
+                name, now - PROBE_FAILURE_GRACE if name in state['faults'] else now
+            )
+            if count >= 2 and now - since >= PROBE_FAILURE_GRACE:
                 label = '现货元数据' if name == 'spot' else 'USDT合约'
                 faults[name] = f'Binance {label}公共接口不可达'
         candidate = _transition(state, faults, now)
@@ -210,23 +224,42 @@ class Watchdog:
 
 
 def probe_public(url):
+    started = time.monotonic()
+    status, reason = None, 'invalid_payload'
     try:
         with urlopen(url, timeout=5) as response:
-            if response.status != 200:
-                return False
-            data = json.loads(response.read(65536))
-            if url == PROBES['spot']:
-                return any(
-                    item.get('symbol') == 'BTCUSDT'
-                    and item.get('baseAsset') == 'BTC'
-                    and item.get('quoteAsset') == 'USDT'
-                    and isinstance(item.get('filters'), list)
-                    and bool(item['filters'])
-                    for item in data.get('symbols', [])
-                )
-            return data == {}
-    except Exception:
-        return False
+            status = response.status
+            if status == 200:
+                data = json.loads(response.read(65536))
+                if url == PROBES['spot']:
+                    healthy = any(
+                        item.get('symbol') == 'BTCUSDT'
+                        and item.get('baseAsset') == 'BTC'
+                        and item.get('quoteAsset') == 'USDT'
+                        and isinstance(item.get('filters'), list)
+                        and bool(item['filters'])
+                        for item in data.get('symbols', [])
+                    )
+                else:
+                    healthy = data == {}
+                if healthy:
+                    return True
+            else:
+                reason = 'http_status'
+    except Exception as error:
+        reason = type(error).__name__
+        code = getattr(error, 'code', None)
+        status = code if isinstance(code, int) else status
+    # Never log exception text or a request URL: transport errors may contain secrets.
+    name = next((name for name, endpoint in PROBES.items() if endpoint == url), 'other')
+    logger.warning(
+        'Public probe failed: probe=%s reason=%s http_status=%s elapsed_ms=%d',
+        name,
+        reason,
+        status,
+        (time.monotonic() - started) * 1000,
+    )
+    return False
 
 
 def send_telegram(config, message):
@@ -270,7 +303,7 @@ def main():
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *args: stopped.set())
     watchdog = Watchdog(args.state_file)
-    logger.info('Independent watchdog started; poll=30s grace=180s stale=180s')
+    logger.info('Independent watchdog started; poll=30s grace=180s stale=180s probe_grace=180s')
     previous = None
     while not stopped.is_set():
         started = time.monotonic()

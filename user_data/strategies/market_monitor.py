@@ -1,5 +1,7 @@
 """Advisory reports and closed-candle alerts, with no trading-plan/order access."""
 import logging
+import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from math import isfinite
@@ -194,6 +196,39 @@ def build_reports(fetch, now, *, compact=False):
     return reports
 
 
+class SharedVolumeCandles:
+    """Coalesce concurrent 5m reads without changing the original sample time."""
+
+    def __init__(self, clock=time.time):
+        self._clock = clock
+        self._lock = Lock()
+        self._pair_locks = {}
+        self._samples = {}
+
+    def get(self, pair, fetch, *, refresh=False):
+        if refresh:
+            # Live plans never wait behind advisory I/O, even for the same coin.
+            observed = self._clock()
+            rows = fetch()
+            self._publish(pair, observed, rows)
+            return observed, deepcopy(rows)
+        with self._lock:
+            pair_lock = self._pair_locks.setdefault(pair, Lock())
+        with pair_lock:
+            now = self._clock()
+            observed, rows = self._samples.get(pair, (0, None))
+            if rows is None or not (0 <= now - observed < 10 and now // 300 == observed // 300):
+                rows = fetch()
+                observed = now  # Time before I/O, so a slow request cannot extend freshness.
+                self._publish(pair, observed, rows)
+            return observed, deepcopy(rows)
+
+    def _publish(self, pair, observed, rows):
+        with self._lock:
+            if observed >= self._samples.get(pair, (0, None))[0]:
+                self._samples[pair] = (observed, rows)
+
+
 class HourlyMarketMonitor:
     """Fetch public data on a dedicated worker, drain reports on the bot thread."""
 
@@ -205,6 +240,7 @@ class HourlyMarketMonitor:
         futures=True,
         executor=None,
         alerts=None,
+        volume_candles=None,
     ):
         self._client = None
         self._exchange_name = exchange_name
@@ -218,8 +254,10 @@ class HourlyMarketMonitor:
         self._minute = None
         self._lock = Lock()
         self._alerts = alerts
+        self._volume_candles = volume_candles
+        self._volume_observed_at = None
 
-    def _fetch_public(self, pair, timeframe):
+    def _get_client(self):
         if self._client is None:
             import ccxt
 
@@ -230,8 +268,20 @@ class HourlyMarketMonitor:
                     'options': {'defaultType': 'future' if self._futures else 'spot'},
                 }
             )
+        return self._client
+
+    def _fetch_public(self, pair, timeframe, *, refresh=False):
+        if timeframe == '5m' and self._volume_candles is not None:
+            observed, rows = self._volume_candles.get(
+                pair, lambda: self._fetch_uncached(pair, timeframe), refresh=refresh
+            )
+            self._volume_observed_at = observed
+            return rows
+        return self._fetch_uncached(pair, timeframe)
+
+    def _fetch_uncached(self, pair, timeframe):
         symbol = pair if self._futures else pair.split(':')[0]
-        return self._client.fetch_ohlcv(symbol, timeframe=timeframe, limit=121)
+        return self._get_client().fetch_ohlcv(symbol, timeframe=timeframe, limit=121)
 
     def reports(self, now=None):
         with self._lock:

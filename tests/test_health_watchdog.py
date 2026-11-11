@@ -87,17 +87,52 @@ class WatchdogTests(unittest.TestCase):
                 result = self.call(1300.0, snapshot)
                 self.assertTrue(result['faults'])
 
-    def test_exchange_failure_requires_two_observations_then_recovers_once(self):
-        self.call(1010.0, probes={'spot': False, 'futures': True})
-        self.assertEqual(self.messages, [])
-        self.call(1040.0, probes={'spot': False, 'futures': True})
+    def test_exchange_failure_requires_three_minutes_then_recovers_once(self):
+        for now in (1010.0, 1040.0, 1070.0, 1100.0, 1130.0, 1160.0, 1189.0):
+            self.call(now, probes={'spot': False, 'futures': True})
+            self.assertEqual(self.messages, [])
+        self.call(1190.0, probes={'spot': False, 'futures': True})
         self.assertEqual(len(self.messages), 1)
         self.assertIn('Binance', self.messages[-1])
-        self.call(1070.0, probes={'spot': False, 'futures': True})
+        self.call(1220.0, probes={'spot': False, 'futures': True})
         self.assertEqual(len(self.messages), 1)
-        self.call(1100.0)
+        self.call(1250.0)
         self.assertEqual(len(self.messages), 2)
         self.assertIn('恢复', self.messages[-1])
+
+    def test_brief_exchange_failures_and_recoveries_are_silent(self):
+        for now in (1010.0, 1100.0, 1190.0):
+            self.call(now, probes={'spot': False, 'futures': False})
+            self.call(now + 30, probes={'spot': False, 'futures': False})
+            self.call(now + 59)
+        self.assertEqual(self.messages, [])
+
+    def test_exchange_failure_deadlines_are_independent_and_survive_restart(self):
+        self.call(1010.0, probes={'spot': False, 'futures': True})
+        self.call(1100.0, probes={'spot': False, 'futures': False})
+        self.watch = self.module.Watchdog(self.path)
+        result = self.call(1190.0, probes={'spot': False, 'futures': False})
+        self.assertEqual(set(result['faults']), {'spot'})
+        self.assertEqual(len(self.messages), 1)
+        result = self.call(1280.0, probes={'spot': True, 'futures': False})
+        self.assertEqual(set(result['faults']), {'futures'})
+
+    def test_legacy_active_exchange_fault_does_not_falsely_recover_on_upgrade(self):
+        state = json.loads(self.path.read_text())
+        state.pop('probe_failed_since', None)
+        state.update(
+            faults={'spot': 'Binance 现货元数据公共接口不可达'},
+            probe_failures={'spot': 2, 'futures': 0},
+            incident={'spot': 'Binance 现货元数据公共接口不可达'},
+            incident_since=1000.0,
+        )
+        self.path.write_text(json.dumps(state))
+        self.watch = self.module.Watchdog(self.path)
+        self.call(1030.0, probes={'spot': False, 'futures': True})
+        self.assertEqual(self.messages, [])
+        self.call(1060.0)
+        self.assertEqual(len(self.messages), 1)
+        self.assertIn('恢复', self.messages[0])
 
     def test_send_failure_is_persisted_and_retry_survives_watchdog_restart(self):
         def fail(message):
@@ -246,6 +281,19 @@ class WatchdogTests(unittest.TestCase):
             with self.assertLogs('health_watchdog', level='WARNING') as logs:
                 self.assertFalse(self.module.send_telegram(config, 'alert'))
         self.assertNotIn('FAKE_SECRET_TOKEN', ' '.join(logs.output))
+
+    def test_probe_failure_logs_status_reason_and_duration_without_exception_url(self):
+        from urllib.error import HTTPError
+
+        error = HTTPError('https://example.invalid/SECRET', 429, 'SECRET', {}, None)
+        with patch.object(self.module, 'urlopen', side_effect=error):
+            with patch.object(self.module.time, 'monotonic', side_effect=[10.0, 15.0]):
+                with self.assertLogs('health_watchdog', level='WARNING') as logs:
+                    self.assertFalse(self.module.probe_public(self.module.PROBES['spot']))
+        output = ' '.join(logs.output)
+        for value in ('spot', 'HTTPError', '429', '5000'):
+            self.assertIn(value, output)
+        self.assertNotIn('SECRET', output)
 
     def test_telegram_transport_posts_only_intended_payload_and_checks_ack(self):
         requests = []

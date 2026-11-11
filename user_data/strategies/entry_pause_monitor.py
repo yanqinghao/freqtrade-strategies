@@ -28,10 +28,12 @@ class EntryPauseMonitor(HourlyMarketMonitor):
             try:
                 observed = self.clock()
                 volume = (
-                    self._fetch_public(pair, '5m')
-                    if self._client is None
-                    else self._client.fetch_ohlcv(pair, timeframe='5m', limit=28)
+                    self._fetch_public(pair, '5m', refresh=True)
+                    if needs[pair] is not None
+                    else self._fetch(pair, '5m')
                 )
+                if self._volume_candles is not None:
+                    observed = self._volume_observed_at
                 current = self.clock()
                 fresh = {
                     direction: analyze_volume(volume, observed, current, direction)
@@ -53,22 +55,26 @@ class EntryPauseMonitor(HourlyMarketMonitor):
                 )
                 volumes[pair] = snapshot
                 self._updates.put((pair, snapshot))
+                results[pair] = snapshot
             except Exception as error:
                 logger.warning(
                     'Public entry volume unavailable for %s (%s)', pair, type(error).__name__
                 )
         for pair, snapshot in volumes.items():
+            if needs[pair] is None:
+                continue  # Idle pairs need volume for preflight, no book or price backfill.
             try:
+                client = self._get_client()
                 observed = snapshot['observed_at']
                 minute = []
                 cursor = int(needs[pair]) // 60 * 60000
                 while cursor <= int(observed) // 60 * 60000:
-                    batch = self._client.fetch_ohlcv(pair, timeframe='1m', since=cursor, limit=1000)
+                    batch = client.fetch_ohlcv(pair, timeframe='1m', since=cursor, limit=1000)
                     if not batch or batch[-1][0] < cursor:
                         raise ValueError('历史行情不可用')
                     minute.extend(r for r in batch if r[0] >= cursor)
                     cursor = batch[-1][0] + 60000
-                book = self._client.fetch_order_book(pair, limit=5)
+                book = client.fetch_order_book(pair, limit=5)
                 bid, ask = book['bids'][0][0], book['asks'][0][0]
                 checked_rows(minute, 60, observed, self.clock(), 2)
                 if not all(isfinite(v) and v > 0 for v in (bid, ask)) or bid > ask:
@@ -102,11 +108,12 @@ class EntryPauseMonitor(HourlyMarketMonitor):
         results = self.drain()
         stamp = now.timestamp()
         if stamp - self._scheduled >= 10:
-            needs = {pair: stamp - 120 for pair in PAIRS}
+            needs = dict.fromkeys(PAIRS)
             for meta in plans:
                 if meta['phase'] not in ('filled', 'done') and meta['request']['pair'] in needs:
                     pair = meta['request']['pair']
-                    needs[pair] = min(needs[pair], meta.get('checked_until', meta['created']))
+                    since = meta.get('checked_until', meta['created'])
+                    needs[pair] = min(stamp - 120 if needs[pair] is None else needs[pair], since)
             self._scheduled = stamp
             self._future = self._executor.submit(self.collect, needs)
         return results

@@ -2,11 +2,100 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from datetime import datetime, timezone
 from pathlib import Path
 
 STRATEGIES = Path(__file__).resolve().parents[1] / 'user_data' / 'strategies'
 sys.path.insert(0, str(STRATEGIES))
+
+
+class SharedVolumeTests(unittest.TestCase):
+    def test_live_refresh_does_not_wait_for_advisory_or_get_overwritten_by_older_result(self):
+        from market_monitor import SharedVolumeCandles
+
+        now = [1800000030.0]
+        cache = SharedVolumeCandles(clock=lambda: now[0])
+        started, release = Event(), Event()
+
+        def slow_fetch():
+            started.set()
+            release.wait(2)
+            return [['old']]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slow = pool.submit(cache.get, 'BTC', slow_fetch)
+            try:
+                self.assertTrue(started.wait(1))
+                now[0] += 1
+                live = pool.submit(cache.get, 'BTC', lambda: [['new']], refresh=True)
+                self.assertEqual(live.result(timeout=1)[1], [['new']])
+            finally:
+                release.set()
+            slow.result(timeout=1)
+        self.assertEqual(
+            cache.get('BTC', lambda: self.fail('must reuse newest sample'))[1], [['new']]
+        )
+
+    def test_slow_sol_fetch_cannot_block_entry_volume_for_btc(self):
+        from market_monitor import SharedVolumeCandles
+
+        cache = SharedVolumeCandles()
+        started, release = Event(), Event()
+
+        def slow_fetch():
+            started.set()
+            release.wait(2)
+            return [[1]]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slow = pool.submit(cache.get, 'SOL', slow_fetch)
+            try:
+                self.assertTrue(started.wait(1))
+                fast = pool.submit(cache.get, 'BTC', lambda: [[2]])
+                self.assertEqual(fast.result(timeout=1)[1], [[2]])
+            finally:
+                release.set()
+            self.assertEqual(slow.result(timeout=1)[1], [[1]])
+
+    def test_concurrent_consumers_share_one_fetch_and_original_observation_time(self):
+        from market_monitor import SharedVolumeCandles
+
+        now, calls = [1800000030.0], []
+        cache = SharedVolumeCandles(clock=lambda: now[0])
+
+        def fetch():
+            calls.append(True)
+            now[0] += 1
+            return [[1, 2, 3]]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = list(pool.map(lambda _: cache.get('BTC', fetch), range(2)))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first, (1800000030.0, [[1, 2, 3]]))
+        self.assertEqual(second, first)
+        first[1][0][0] = 99
+        self.assertEqual(cache.get('BTC', fetch)[1], [[1, 2, 3]])
+
+    def test_cache_expires_at_ten_seconds_and_at_candle_boundary_without_stale_fallback(self):
+        from market_monitor import SharedVolumeCandles
+
+        now, calls = [1800000299.0], []
+        cache = SharedVolumeCandles(clock=lambda: now[0])
+
+        def fetch():
+            calls.append(now[0])
+            return [[now[0]]]
+
+        cache.get('BTC', fetch)
+        now[0] += 1  # New 5m candle must be fetched even though only one second passed.
+        self.assertEqual(cache.get('BTC', fetch)[1], [[1800000300.0]])
+        now[0] += 10
+        with self.assertRaises(TimeoutError):
+            cache.get('BTC', lambda: (_ for _ in ()).throw(TimeoutError()))
+        self.assertEqual(cache.get('BTC', fetch)[1], [[1800000310.0]])
+        self.assertEqual(len(calls), 3)
 
 
 class MarketMonitorTests(unittest.TestCase):
