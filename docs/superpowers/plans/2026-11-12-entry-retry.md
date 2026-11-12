@@ -20,7 +20,7 @@
 - [x] Reproduce rejection extending quiet window; test both directions, 60s boundary, repeated failures, new shock, continuity, unknown and terminal behavior.
 - [x] Add safe rejection/data reasons and query regressions; first observe failure, then minimal controller/formatter changes.
 - [x] Run hooks, full offline suite, independent review and resolve findings.
-- [ ] Commit/push, snapshot, deploy per prior authorization; verify actual source/image and fresh healthy loop. Do not send test trades.
+- [x] Commit/push, snapshot, deploy per prior authorization; verify actual source/image and fresh healthy loop. Do not send test trades.
 
 ## 用户追加纠正
 
@@ -37,3 +37,10 @@
 - 候选镜像 e0ca8a2c53a7695a13cf683d988f64ce474c072e463b017dda6811b166ea8273，RPC按实际策略装载顺序验证成功；STATUS与三个原生交易formatter均回到 _telegram_base。
 - 发布前只读核实：ARX原计划已于14:24:32北京时间自行恢复，订单212402555、限价0.201、497 ARX，最新本地回执open/filled0。不是由测试提交。
 - 已备份切换前源码和在线数据库/状态至忽略目录 .assistant-archive/entry-retry-20261112T063245Z。部署不迁移数据库，不修改现有计划计时。
+
+## 发布结果
+
+- 代码12dd823已提交并推送main，全部提交hooks通过。06:33:55 UTC切换候选镜像；06:34:06进入RUNNING，新进程交易心跳持续更新，重启次数0、启动错误0，独立守护故障0。
+- 实际容器三个入场模块与RPC Telegram四项哈希匹配候选源码；现有ARX订单212402555在切换后仍为open/filled0，本地回执与计划持续更新，新增完整检查诊断已落库。
+- 回滚镜像tag rollback-before-entry-retry-20261112T063245Z；切换时再保存在线数据库与计划快照。只回滚源码/镜像，不覆盖后续实盘数据库。未改写已有计划历史计时，未执行测试交易。
+- 审查非阻断文档措辞已改为“助手自定义文本经Markdown发送时整体转义”，原生通知沿用上游。
