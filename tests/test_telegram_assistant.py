@@ -87,8 +87,10 @@ class TelegramAssistantTests(unittest.TestCase):
                 examples = [
                     line for line in text.splitlines() if line.startswith(command + ' BTC ')
                 ]
-                self.assertEqual(len(examples), 1)
-                request = self.module.parse_entry(examples[0].split()[1:], direction.value)
+                self.assertEqual(len(examples), 3)
+                for example in examples:
+                    self.module.parse_entry(example.split()[1:], direction.value)
+                request = self.module.parse_entry(examples[-1].split()[1:], direction.value)
                 validate_rules(request)
                 self.assertEqual(request['soft_tf'], '4h')
                 self.assertEqual(request['extend_tf'], '4h')

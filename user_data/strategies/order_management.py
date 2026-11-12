@@ -18,6 +18,7 @@ from entry_lifecycle import (
 )
 from entry_risk import number, saved_plan, effective_stop, observed_quantities
 from entry_pause import ENDED as PAUSE_ENDS
+from entry_targets import clear_units
 
 
 PAUSE_PHASES = {'paused', 'canceling', 'resuming', 'submitting', 'unknown'}
@@ -329,6 +330,9 @@ def edit_plan(owner, ident, revision, changes):
         if any(p >= trade.open_rate if trade.is_short else p <= trade.open_rate for p in targets):
             raise ValueError('TP 必须位于开仓价的盈利方向。')
         validate_rules(plan)
+        clear_units(
+            plan, stop='stop_loss' in changes, tp=any(k in changes for k in ('tp1', 'tp2', 'tp3'))
+        )
         plan['trade_id'] = trade.id
         # Persist intent in the same JSON update. _plan observes this marker after a crash too.
         if targets != data['plan'].get('exit_points', []):

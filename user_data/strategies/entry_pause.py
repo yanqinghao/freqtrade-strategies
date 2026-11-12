@@ -9,6 +9,7 @@ from freqtrade.enums import State
 from freqtrade.persistence import Trade, Order
 from entry_lifecycle import _receipt, TERMINAL, install_entry_receipt_guard, entry_ttl
 from candle_exits import RULE_FIELDS
+from entry_targets import UNIT_FIELDS
 from entry_risk import EntryRiskError
 from entry_volume import (
     analyze_volume,
@@ -398,7 +399,7 @@ class EntryPause:
             meta['created'] = time.time()
             meta['checked_until'] = meta['created']
             meta['version'] = meta.get('version', 1) + 1
-            for key in ('stop_loss', 'exit_points', *RULE_FIELDS):
+            for key in ('stop_loss', 'exit_points', *RULE_FIELDS, *UNIT_FIELDS, 'target_basis'):
                 if key in plan:
                     meta['request'][key] = deepcopy(plan[key])
                 else:

@@ -12,6 +12,7 @@ from freqtrade.rpc._telegram_base import authorized_only
 from candle_exits import RULE_GROUPS, TIMEFRAMES, describe_rules
 from entry_volume import PAUSE_REASONS
 from notification_format import local_time
+from entry_targets import describe_targets
 from entry_risk import number
 from freqtrade.rpc import order_management as management
 
@@ -389,6 +390,7 @@ class OrderPanelMixin:
             )
             lines.append(f'TP{i + 1} {price:g} · {progress}')
         lines.append(describe_rules(plan, {'extension': data['extension']}))
+        lines.append(describe_targets(plan))
         if plan.get('soft_sl') is None:
             lines.append('软止损：未设置')
         if plan.get('extend_trigger') is None:
@@ -496,6 +498,7 @@ class OrderPanelMixin:
             describe_rules(request),
             '原到期时间：' + local_time(meta['deadline']),
             '计划编号：' + ref,
+            describe_targets(request),
         ]
         if meta.get('retry_after') and meta['phase'] == 'paused' and meta['decision'] not in ended:
             lines.append('重试时间门槛：' + local_time(meta['retry_after']))

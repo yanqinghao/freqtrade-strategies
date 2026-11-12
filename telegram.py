@@ -23,6 +23,8 @@ from freqtrade.rpc.order_panel import OrderPanelMixin
 from freqtrade.rpc.watch_panel import WatchPanelMixin
 from freqtrade.rpc.notification_format import notice, with_time, local_time
 from entry_volume import PAUSE_REASONS
+from entry_targets import UNIT_FIELDS, has_units, validate_units, clear_units
+from entry_risk import plan_for_entry
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +46,23 @@ def entry_command(request):
         numeric(request['leverage']),
     ]
     for field, name in (('stop_loss', 'sl'), ('entry_price', 'price')):
-        if field in request:
+        if field in request and not (
+            field == 'stop_loss' and any(k in request for k in ('loss', 'sl_pct'))
+        ):
             parts.append(f'{name}={numeric(request[field])}')
-    if request.get('exit_points'):
+    for name in UNIT_FIELDS:
+        if name in request:
+            value = request[name]
+            parts.append(
+                name
+                + '='
+                + (
+                    ','.join(numeric(v) for v in value)
+                    if isinstance(value, list)
+                    else numeric(value)
+                )
+            )
+    if request.get('exit_points') and not any(k in request for k in ('profit', 'tp_pct')):
         parts.append('tp=' + ','.join(numeric(value) for value in request['exit_points']))
     if 'ttl_seconds' in request:
         parts.append(f"ttl={request['ttl_seconds'] // 60}m")
@@ -113,9 +129,16 @@ def entry_usage(direction):
         f'{command} <币种> <保证金USDT> <杠杆> sl=<硬止损> '
         '[price=<限价>] [ttl=24h] [tp=<TP1,TP2,TP3>]\n'
         '不填price为市价；ttl仅用于限价单。已有同向持仓时为加仓。\n\n'
+        '新开仓SL任选：sl=价格 / loss=亏损USDT / sl_pct=币价逆向百分比。\n'
+        'TP任选：tp=价格列表 / profit=原始完整仓位净浮盈USDT列表 / tp_pct=币价顺向百分比列表。\n'
+        '每档口径不可混用；金额/幅度列表须递增，最多三档。SL与TP可用不同口径。\n'
+        '金额/幅度目标按实际初始成交校准并固定，SL只收紧；不含未来资金费和滑点。\n'
+        f'{command} BTC 10 5 loss=2 profit=2,4,6\n'
+        f'{command} BTC 10 5 sl_pct=1 tp_pct=1,2,3\n'
+        '新参数用于新开仓；已有仓位的加仓与修改继续使用价格参数。\n\n'
         '可选软止损：soft_sl=<价格> soft_tf=4h\n'
         f"{'空单收盘价 ≥' if short else '多单收盘价 ≤'} soft_sl 时全平，盘中越线不触发；"
-        'sl硬止损仍须保留。\n\n'
+        '即时硬SL仍须通过价格、金额或幅度设置。\n\n'
         '可选延伸止盈：extend_trigger=<触发价> extend_tp3=<延伸目标> extend_tf=4h\n'
         f"TP2完成后，{'收盘价 ≤' if short else '收盘价 ≥'} extend_trigger 才延伸TP3，"
         '同时把即时保护推进到TP2；原TP3先触发仍退出。\n'
@@ -150,11 +173,25 @@ def parse_entry(args, direction):
                 raise ValueError('请使用 key=value 参数')
             key, value = token.split('=', 1)
             if (
-                key not in ('sl', 'price', 'tp', 'tp1', 'tp2', 'tp3', 'ttl', *RULE_FIELDS)
+                key
+                not in ('sl', 'price', 'tp', 'tp1', 'tp2', 'tp3', 'ttl', *UNIT_FIELDS, *RULE_FIELDS)
                 or key in values
             ):
                 raise ValueError(f'不支持或重复的参数：{key}；不支持自动分段入场')
             values[key] = value
+    if sum(k in values for k in ('sl', 'loss', 'sl_pct')) > 1:
+        raise ValueError('SL只能选sl价格、loss金额、sl_pct幅度中的一种')
+    price_tp = any(k in values for k in ('tp', 'tp1', 'tp2', 'tp3'))
+    if int(price_tp) + sum(k in values for k in ('profit', 'tp_pct')) > 1:
+        raise ValueError('TP只能选价格、profit金额、tp_pct幅度中的一种')
+    for name in UNIT_FIELDS:
+        if name in values:
+            result[name] = (
+                [positive(v, name) for v in values[name].split(',')]
+                if name in ('profit', 'tp_pct')
+                else positive(values[name], name)
+            )
+    validate_units(result)
     if 'tp' in values and any(k in values for k in ('tp1', 'tp2', 'tp3')):
         raise ValueError('tp 和 tp1/tp2/tp3 不能混用')
     for key, field in (('sl', 'stop_loss'), ('price', 'entry_price')):
@@ -492,6 +529,13 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             f"挂单 {row['exposure']['pending_notional']:g}U；"
             f"新增后约 {row['projected_total_notional']:g}U\n"
         )
+        if row.get('target_description'):
+            text += (
+                row['target_description']
+                + '\n参考TP价格：'
+                + ', '.join(f'{v:g}' for v in row.get('resolved_targets', []))
+                + '\n'
+            )
         limits = row['limits']
         if limits:
             text += (
@@ -534,10 +578,12 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
                     '风险预览（只读，不下单）\n'
                     '/request 选择历史单的风险预览按钮，或 /preview <请求编号> 带入历史参数。\n'
                     '用法：/preview long|short <币种> <保证金USDT> <杠杆> '
-                    'sl=<止损> [price=<限价>] [tp=<TP1,TP2,TP3>] [ttl=24h]\n'
+                    'sl=<止损>或loss=<USDT>或sl_pct=<百分比> [price=<限价>]\n'
+                    '[tp=<TP1,TP2,TP3>或profit=金额列表或tp_pct=幅度列表] [ttl=24h]\n'
                     'long 做多，short 做空；不填price按市价估算。'
                     '限价单默认24h有效，ttl仅用于限价单。\n'
-                    '可选收盘软SL：soft_sl=... soft_tf=4h；sl硬止损仍必填。\n'
+                    'SL可选sl=价格、loss=USDT、sl_pct=币价百分比；TP可选tp=价格列表、profit=USDT列表、tp_pct=百分比列表。\n'
+                    '可选收盘软SL：soft_sl=... soft_tf=4h；仍须设置即时硬止损。\n'
                     '可选延伸：extend_trigger=... extend_tp3=... extend_tf=4h（需三档TP）。\n'
                     '示例（价格仅演示格式，请替换）：\n'
                     '/preview long BTC 10 20 sl=90000 price=95000\n'
@@ -556,7 +602,7 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
         draft = '/preview ' + request['direction'] + ' ' + command.split(' ', 1)[1]
         text = f'历史参数来自请求 {source}；按当前持仓和额度重新估算。\n' if source else ''
         text += '复制下面命令，修改金额、杠杆、price、sl、tp、ttl或收盘规则后发送，即可重新预览：\n' + draft
-        if 'stop_loss' not in request:
+        if 'stop_loss' not in request and not any(k in request for k in ('loss', 'sl_pct')):
             text += '\n未填写SL：有同向持仓时按当前计划估算；新开仓必须补 sl=...。'
         try:
             row = await self._await_command(self._preview_entry, request)
@@ -732,7 +778,7 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
         created = datetime.fromtimestamp(row['created'], timezone.utc)
         command = entry_command(request)
         reuse = f'\n参数还原（复制后修改）：\n{command}'
-        if 'stop_loss' not in request:
+        if 'stop_loss' not in request and not any(k in request for k in ('loss', 'sl_pct')):
             reuse += '\n原请求未填写SL：当时沿用已有计划；新开仓请补 sl=...。'
         if compact:
             return (
@@ -847,26 +893,15 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
         strategy.ensure_entry_position(pair, existing)
         strategy.ensure_entry_protection(existing)
         old = deepcopy(strategy.manual_open.get(pair))
-        plan = deepcopy(strategy._plan(existing) if existing else {})
-        if not existing:
-            plan.pop('trade_id', None)
-        plan.update(
-            {
-                k: v
-                for k, v in request.items()
-                if k not in ('pair', 'entry_price', 'ttl_seconds', 'entry_deadline')
-            }
-        )
-        plan.setdefault('exit_points', [])
-        validate_rules(plan)
-        if not plan.get('stop_loss'):
-            raise ValueError('开仓必须提供 sl=<止损价>；本助手不自动生成止损')
         try:
             rate = request.get('entry_price') or bot.exchange.get_rate(
                 pair, side='entry', is_short=request['direction'] == 'short', refresh=True
             )
         except Exception:
             raise ValueError('无法取得入场参考价格，本次未提交') from None
+        plan = plan_for_entry(strategy, request, existing, rate=rate)
+        if has_units(plan) and not plan.get('target_basis', {}).get('anchored'):
+            plan['target_basis']['request_ref'] = request_ref
         sl = float(plan['stop_loss'])
         if sl <= rate if request['direction'] == 'short' else sl >= rate:
             raise ValueError('止损必须位于当前入场价的亏损方向')
@@ -879,7 +914,21 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
         if request_ref:
             # Account queries can take time while a Telegram pause arrives.
             self._rpc._force_entry_validations(pair, SignalDirection(request['direction']))
-            if strategy.entry_pause and strategy.entry_pause.prepare(request, request_ref):
+            if strategy.entry_pause and strategy.entry_pause.prepare(
+                {
+                    **request,
+                    **(
+                        {
+                            k: deepcopy(plan[k])
+                            for k in ('stop_loss', 'exit_points', 'target_basis')
+                            if k in plan
+                        }
+                        if has_units(plan)
+                        else {}
+                    ),
+                },
+                request_ref,
+            ):
                 return {'pause_ref': request_ref}
             strategy.entry_requests.set_status(request_ref, 'submitting', {})
         strategy.set_manual_plan(pair, plan)
@@ -967,8 +1016,11 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             request = parse_entry(
                 [trade.pair, str(trade.stake_amount), str(trade.leverage)] + tokens, direction
             )
+            if has_units(request):
+                raise ValueError('金额/幅度参数用于新开仓；已有仓位请用价格修改SL/TP')
             strategy = self._rpc._freqtrade.strategy
             plan = deepcopy(strategy.manual_open.get(trade.pair) or strategy._plan(trade))
+            clear_units(plan, stop='stop_loss' in request, tp='exit_points' in request)
             changed_rules = any(
                 field in request and request[field] != plan.get(field) for field in RULE_FIELDS
             )

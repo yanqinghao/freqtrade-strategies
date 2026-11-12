@@ -10,6 +10,8 @@ from pathlib import Path
 
 from freqtrade.persistence import Order, Trade
 from candle_exits import validate_rules
+from entry_targets import has_units, convert_targets, clear_units, validate_units
+from freqtrade.exchange import ROUND_UP, ROUND_DOWN
 
 logger = logging.getLogger(__name__)
 LIMITS = ('max_margin_usdt', 'max_leverage', 'max_total_notional_usdt', 'max_stop_loss_usdt')
@@ -68,7 +70,7 @@ def saved_plan(strategy, trade):
     return deepcopy(plan)
 
 
-def plan_for_entry(strategy, request, trade):
+def plan_for_entry(strategy, request, trade, *, rate=None):
     if trade and strategy._execution(trade).get('extension'):
         raise EntryRiskError('该持仓延伸止盈已生效，不允许加仓重置保护阶段')
     if trade and trade.is_short != (request['direction'] == 'short'):
@@ -79,13 +81,55 @@ def plan_for_entry(strategy, request, trade):
         and number(trade.leverage, positive=True) != number(request['leverage'], positive=True)
     ):
         raise EntryRiskError('加仓必须沿用现有持仓杠杆')
+    if trade and has_units(request):
+        raise EntryRiskError('金额/幅度参数用于新开仓；已有仓位请使用价格参数')
     plan = saved_plan(strategy, trade) if trade else {}
+    if trade:
+        clear_units(plan, stop=True, tp=True)
     plan.update(
-        {k: v for k, v in request.items() if k not in ('pair', 'entry_price', 'ttl_seconds')}
+        {
+            k: v
+            for k, v in request.items()
+            if k not in ('pair', 'entry_price', 'ttl_seconds', 'entry_deadline')
+        }
     )
     plan.setdefault('exit_points', [])
+    if has_units(plan):
+        validate_units(plan)
+        if not plan.get('target_basis'):
+            exchange, pair = strategy.dp._exchange, request['pair']
+            rate = (
+                rate
+                if rate is not None
+                else request.get('entry_price')
+                or exchange.get_rate(
+                    pair, side='entry', is_short=request['direction'] == 'short', refresh=True
+                )
+            )
+            quantity = exchange.amount_to_contract_precision(
+                pair,
+                float(
+                    number(request['size'], positive=True)
+                    * number(request['leverage'], positive=True)
+                    / number(rate, positive=True)
+                ),
+            )
+
+            def rounded(price, short):
+                return exchange.price_to_precision(
+                    pair, float(price), rounding_mode=ROUND_DOWN if short else ROUND_UP
+                )
+
+            plan = convert_targets(
+                plan,
+                rate,
+                quantity,
+                _fee(strategy, pair, 'sell' if request['direction'] == 'short' else 'buy'),
+                _fee(strategy, pair, 'buy' if request['direction'] == 'short' else 'sell'),
+                rounded,
+            )
     if not plan.get('stop_loss'):
-        raise EntryRiskError('开仓必须提供 sl=<止损价>')
+        raise EntryRiskError('开仓必须提供 sl、loss 或 sl_pct 止损')
     number(plan['stop_loss'], positive=True)
     validate_rules(plan)
     return plan
@@ -281,7 +325,11 @@ def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, igno
         distance = stop - rate if request['direction'] == 'short' else rate - stop
         if distance <= 0:
             raise EntryRiskError('有效保护止损已越过本次入场价，请核对计划')
-        loss, fees = quantity * distance, notional * open_fee + quantity * stop * close_fee
+        loss, fees = (
+            quantity * distance,
+            (quantity * rate if has_units(plan) else notional) * open_fee
+            + quantity * stop * close_fee,
+        )
         if trade and trade.amount:
             existing = number(trade.amount, positive=True)
             original = number(trade.open_rate, positive=True)
@@ -294,6 +342,14 @@ def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, igno
         total = number(exposure['total_notional']) + notional
         limits = load_limits(strategy.risk_limits_file)
         reasons = []
+        if 'loss' in plan:
+            budget = number(plan['loss'], positive=True)
+            actual_loss = (
+                quantity * distance + quantity * rate * open_fee + quantity * stop * close_fee
+            )
+            tolerance = Decimal(str(8 * max(ulp(float(actual_loss)), ulp(float(budget)))))
+            if actual_loss > budget + tolerance:
+                reasons.append('最终数量/价格下估算亏损超过本次金额止损预算')
         complete = not trade or not incomplete_position(exchange, trade)
         if not complete:
             reasons.append('该币种存在待记账成交或现存入场挂单，整体止损风险不可用，请先核实或等待处理完成')
@@ -378,7 +434,9 @@ def install_risk_guard(strategy, bot):
         ).first()
         if trade and current._execution(trade).get('extension'):
             raise EntryRiskError('该持仓延伸止盈已生效，不允许加仓重置保护阶段')
-        if load_limits(current.risk_limits_file) is None:
+        if load_limits(current.risk_limits_file) is None and not has_units(
+            current.manual_open.get(kwargs.get('pair'), {}) or {}
+        ):
             check_entry_context(current)
             return original(**kwargs)
         try:

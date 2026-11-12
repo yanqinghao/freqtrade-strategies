@@ -25,6 +25,15 @@ from assistant_state import read_state, update_state
 from assistant_alerts import AlertQueue
 from entry_requests import EntryRequests
 from entry_pause import EntryPause
+from entry_targets import (
+    UNIT_FIELDS,
+    TargetError,
+    has_units,
+    convert_targets,
+    describe_targets,
+    reconcile_basis,
+)
+from freqtrade.exchange import ROUND_UP, ROUND_DOWN
 from entry_pause_monitor import EntryPauseMonitor
 from entry_risk import (
     EntryRiskError,
@@ -161,7 +170,20 @@ class KamaFama_Dynamic(IStrategy):
 
     def preview_entry(self, request, trade):
         plan = plan_for_entry(self, request, trade)
-        result = assess_entry(self, request, trade, plan)
+        basis = plan.get('target_basis')
+        result = assess_entry(
+            self,
+            request,
+            trade,
+            plan,
+            rate=basis['rate'] if basis else None,
+            amount=basis['quantity'] if basis else None,
+        )
+        if has_units(plan):
+            result.update(
+                target_description=describe_targets(plan),
+                resolved_targets=plan.get('exit_points', []),
+            )
         result['candle_rules'] = describe_rules(plan)
         if trade and trade.has_open_orders:
             result['reasons'].append('该币种有未完成订单，实际入场前须先核实或撤单')
@@ -178,7 +200,7 @@ class KamaFama_Dynamic(IStrategy):
             self._risk_request_ref = previous
 
     def enforce_entry_risk(self, request, trade, plan, rate):
-        if load_limits(self.risk_limits_file) is None:
+        if load_limits(self.risk_limits_file) is None and not has_units(plan):
             return None
         return enforce(
             assess_entry(
@@ -219,6 +241,7 @@ class KamaFama_Dynamic(IStrategy):
             for trade in Trade.get_open_trades():
                 process_entry_orders(self, self.execution_bot, trade, current_time)
             for trade in Trade.get_open_trades():
+                self._recover_entry_targets(trade)
                 self.check_full_exit(trade, current_time)
             for trade in Trade.get_open_trades():
                 check_protection(self, trade, current_time)
@@ -329,6 +352,56 @@ class KamaFama_Dynamic(IStrategy):
         # One custom-data commit for all fill accounting and replay markers.
         trade.set_custom_data('assistant_execution', state)
 
+    def _target_owner(self, trade):
+        current = self.manual_open.get(trade.pair)
+        return trade.is_open and (
+            not current
+            or (
+                current.get('trade_id') in (None, trade.id)
+                and current.get('direction') == ('short' if trade.is_short else 'long')
+            )
+        )
+
+    def _store_target_plan(self, trade, plan):
+        if not self._target_owner(trade):
+            return False
+        accepted = False
+
+        def change(state):
+            nonlocal accepted
+            plans = state.setdefault('manual_open', {})
+            current = plans.get(trade.pair)
+            if current and (
+                current.get('trade_id') not in (None, trade.id)
+                or current.get('direction') != plan['direction']
+                or {k: current[k] for k in UNIT_FIELDS if k in current}
+                != {k: plan[k] for k in UNIT_FIELDS if k in plan}
+            ):
+                return
+            plans[trade.pair] = deepcopy(plan)
+            accepted = True
+
+        with self._state_lock:
+            state = update_state(self.state_file, change)
+            self.manual_open = state.get('manual_open', {})
+        return accepted
+
+    def _record_target_entry(self, trade, basis):
+        if not basis.get('order_id'):
+            return
+        state = self._execution(trade)
+        seen = state.setdefault('seen', {})
+        ident = basis['order_id']
+        if seen.get(ident, 0) >= basis['filled']:
+            return
+        seen[ident] = max(seen.get(ident, 0), basis['filled'])
+        state.setdefault('initial_amount', basis['quantity'])
+        state.setdefault('stage', 0)
+        state.setdefault('stage2_amount', None)
+        state.setdefault('tp_filled', {})
+        state.setdefault('tp_targets', {})
+        self._save_execution(trade, state)
+
     def _plan(self, trade):
         direction = 'short' if trade.is_short else 'long'
         saved = trade.get_custom_data('assistant_plan', default={}) or {}
@@ -341,6 +414,26 @@ class KamaFama_Dynamic(IStrategy):
         if not plan:
             return {}
         plan['trade_id'] = trade.id
+        if has_units(plan):
+            if not self._target_owner(trade):
+                return plan
+            try:
+                repaired = reconcile_basis(plan, saved)
+                if repaired != plan:
+                    if not self._store_target_plan(trade, repaired):
+                        return plan
+                    plan = repaired
+            except TargetError as error:
+                if not self._execution(trade).get('full_exit'):
+                    self.request_full_exit(
+                        trade, str(error), exit_tag='manual_target_conversion_failed'
+                    )
+                # Keep the tighter protection if frozen peers disagree.
+                if plan.get('stop_loss') and saved.get('stop_loss'):
+                    plan['stop_loss'] = (min if trade.is_short else max)(
+                        plan['stop_loss'], saved['stop_loss']
+                    )
+                return plan
         if self.manual_open.get(trade.pair, {}).get('trade_id') is None:
             self.set_manual_plan(trade.pair, plan, reset_rules=False)
         if (
@@ -362,6 +455,104 @@ class KamaFama_Dynamic(IStrategy):
         if saved != plan:
             trade.set_custom_data('assistant_plan', plan)
         return plan
+
+    def _anchor_entry_targets(self, trade, order):
+        if not self._target_owner(trade):
+            return
+        plan = self._plan(trade)
+        basis = plan.get('target_basis', {})
+        if (
+            not has_units(plan)
+            or basis.get('anchored')
+            or basis.get('failed')
+            or self._execution(trade).get('full_exit')
+            or trade.amount <= 0
+            or order.ft_order_side != trade.entry_side
+            or order.ft_is_open
+            or order.safe_filled <= 0
+        ):
+            return
+        ref = basis.get('request_ref')
+        if ref and not (order.ft_order_tag or '').endswith('|req=' + ref):
+            return
+        try:
+            from entry_risk import observed_quantities
+
+            if float(observed_quantities(trade)[0]) > trade.amount * (1 + 1e-10):
+                return  # Wait for native quantity accounting before freezing a basis.
+            exchange = self.dp._exchange
+            opened = trade.fee_open if trade.fee_open is not None else basis['fee_open']
+            closed = trade.fee_close if trade.fee_close is not None else basis['fee_close']
+
+            def rounded(price, short):
+                return exchange.price_to_precision(
+                    trade.pair, float(price), rounding_mode=ROUND_DOWN if short else ROUND_UP
+                )
+
+            resolved = convert_targets(plan, trade.open_rate, trade.amount, opened, closed, rounded)
+            old_stop = self._stop_price(trade, plan)
+            if old_stop is not None:
+                resolved['stop_loss'] = (min if trade.is_short else max)(
+                    old_stop, resolved['stop_loss']
+                )
+            validate_rules(resolved)
+            resolved['target_basis'].update(
+                anchored=True,
+                request_ref=ref,
+                order_id=str(order.order_id),
+                filled=float(order.safe_filled),
+                fee_source='记录的入场费率/预检估算及平仓费率估算，后续不重算',
+            )
+            # JSON first: a crash before custom-data sync is repaired by _plan.
+            if not self._store_target_plan(trade, resolved):
+                return
+            trade.set_custom_data('assistant_plan', resolved)
+            self._record_target_entry(trade, resolved['target_basis'])
+        except Exception as error:
+            reason = str(error) if isinstance(error, TargetError) else type(error).__name__
+            plan.setdefault('target_basis', {}).update(failed=True, error=reason)
+            try:
+                if not self._store_target_plan(trade, plan):
+                    return
+                trade.set_custom_data('assistant_plan', plan)
+            except Exception as save_error:
+                logger.warning(
+                    'Unable to save target calibration failure (%s)', type(save_error).__name__
+                )
+            if self._target_owner(trade):
+                self.request_full_exit(
+                    trade, '金额/幅度目标校准失败：' + reason, exit_tag='manual_target_conversion_failed'
+                )
+
+    def _recover_entry_targets(self, trade):
+        if not self._target_owner(trade):
+            return
+        raw = (
+            self.manual_open.get(trade.pair)
+            or trade.get_custom_data('assistant_plan', default={})
+            or {}
+        )
+        if not has_units(raw) or self._execution(trade).get('full_exit'):
+            return
+        plan = self._plan(trade)
+        basis = plan.get('target_basis', {})
+        if basis.get('anchored'):
+            self._record_target_entry(trade, basis)
+            return
+        if basis.get('failed'):
+            self.request_full_exit(
+                trade, '金额/幅度目标校准失败，需要核对', exit_tag='manual_target_conversion_failed'
+            )
+            return
+        for order in trade.orders:
+            if (
+                order.ft_order_side == trade.entry_side
+                and not order.ft_is_open
+                and order.safe_filled > 0
+            ):
+                self._anchor_entry_targets(trade, order)
+                if self._plan(trade).get('target_basis', {}).get('anchored'):
+                    break
 
     @staticmethod
     def _targets(plan, trade):
@@ -602,7 +793,11 @@ class KamaFama_Dynamic(IStrategy):
                 if blocked
                 else f'{trade.pair}：分批退出受限（{reason}），已切换为全平计划，实际成交前不会清理记录。'
             )
-            if exit_tag in ('manual_soft_sl', 'manual_panel_close') and not blocked:
+            if (
+                exit_tag
+                in ('manual_soft_sl', 'manual_panel_close', 'manual_target_conversion_failed')
+                and not blocked
+            ):
                 full['notice_pending'] = f'{trade.pair}：{reason}，已记录全平意图，等待成交确认。'
         state['full_exit'] = full
         self._save_execution(trade, state)
@@ -742,6 +937,8 @@ class KamaFama_Dynamic(IStrategy):
         if exit_reason:
             return -trade.stake_amount, 'manual_protective_exit'
         plan = self._plan(trade)
+        if has_units(plan) and not plan.get('target_basis', {}).get('anchored'):
+            return None
         targets = self._targets(plan, trade)
         state = self._execution(trade)
         stage = int(state.get('stage', 0))
@@ -792,6 +989,8 @@ class KamaFama_Dynamic(IStrategy):
 
     def order_filled(self, pair, trade, order, current_time, **kwargs):
         filled = float(order.filled or 0)
+        if order.ft_order_side == trade.entry_side and not trade.is_open:
+            return
         if filled <= 0:
             return
         if order.ft_order_side in (trade.exit_side, 'stoploss') and (
@@ -806,7 +1005,20 @@ class KamaFama_Dynamic(IStrategy):
         if delta == 0:
             return
         if order.ft_order_side == trade.entry_side:
-            self._plan(trade)
+            plan = self._plan(trade)
+            basis = plan.get('target_basis', {})
+            if (
+                has_units(plan)
+                and basis.get('anchored')
+                and basis.get('order_id') == str(order.order_id)
+            ):
+                self._record_target_entry(trade, basis)
+                if filled > basis['filled'] + 1e-10:
+                    self.request_full_exit(
+                        trade, '目标冻结后初始成交量发生变化，需要核对', exit_tag='manual_target_conversion_failed'
+                    )
+                return
+            self._anchor_entry_targets(trade, order)
             state = self._execution(trade)
             filled_at = getattr(trade, 'date_entry_fill_utc', None) or current_time
             state.setdefault('position_opened_at', filled_at.timestamp())
