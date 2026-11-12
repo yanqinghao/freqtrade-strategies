@@ -73,49 +73,36 @@ class NativeNotificationTests(unittest.TestCase):
             **extra
         )
 
-    def test_submit_and_fill_have_different_states(self):
-        submitted = self.bot.compose_message(self.message(self.types.ENTRY))
-        filled = self.bot.compose_message(self.message(self.types.ENTRY_FILL))
-        self.assertIn('已提交', submitted)
-        self.assertNotIn('已成交', submitted)
-        self.assertIn('成交回执', filled)
-        self.assertIn('0.0361', filled)
-        self.assertIn(r'A\_B/USDT', filled)
+    def native_context(self):
+        from types import SimpleNamespace
 
-    def test_exit_estimate_actual_and_final_totals_keep_different_basis(self):
-        pending = self.bot.compose_message(self.message(self.types.EXIT))
-        final = self.bot.compose_message(self.message(self.types.EXIT_FILL, is_final_exit=True))
-        self.assertIn('预估盈亏（待成交回执）', pending)
-        self.assertNotIn('本次已实现', pending)
-        self.assertIn('本次已实现', final)
-        self.assertIn('+2.4000 USDT', final)
-        self.assertIn('整笔累计', final)
-        self.assertIn('+7.4000 USDT', final)
-        self.assertIn('+7.40%', final)
+        self.bot._config = {'dry_run': False, 'telegram': {'notification_settings': {}}}
+        self.bot._rpc = SimpleNamespace(_fiat_converter=None)
 
-    def test_cancel_does_not_claim_zero_fill_or_full_exit(self):
-        text = self.bot.compose_message(self.message(self.types.ENTRY_CANCEL, reason='timeout'))
-        self.assertIn('撤单状态', text)
-        self.assertIn('timeout', text)
-        self.assertNotIn('零成交', text)
-        self.assertNotIn('已全平', text)
+    def test_running_and_trade_notifications_keep_upstream_format(self):
+        self.native_context()
+        status = self.bot.compose_message(dict(type=self.types.STATUS, status='running'))
+        self.assertEqual(status, '*Status:* `running`')
+        for kind, wording in (
+            (self.types.ENTRY, 'New Trade'),
+            (self.types.ENTRY_FILL, 'New Trade filled'),
+            (self.types.EXIT, 'Exiting'),
+            (self.types.EXIT_FILL, 'Exited'),
+        ):
+            with self.subTest(kind=kind):
+                msg = self.message(kind)
+                msg.update(exchange='Binance', gain='profit', pair='BTC/USDT:USDT')
+                text = self.bot.compose_message(msg)
+                self.assertIn(wording, text)
+                self.assertIn('*Direction:* `Long', text)
+                self.assertNotIn('【', text)
+        msg = self.message(self.types.ENTRY_CANCEL, reason='timeout')
+        msg['exchange'] = 'Binance'
+        self.assertIn('Cancelling enter Order', self.bot.compose_message(msg))
 
-    def test_increase_reports_total_margin_and_strategy_text_is_escaped(self):
-        msg = self.message(self.types.ENTRY_FILL)
-        msg.update(sub_trade=True, stake_amount=100)
-        text = self.bot.compose_message(msg)
-        self.assertIn('加仓成交回执', text)
-        self.assertIn('保证金总额：100 USDT', text)
-        self.assertNotIn('新增保证金', text)
+    def test_market_text_is_escaped_and_exception_uses_custom_notice(self):
         text = self.bot.compose_message(dict(type=self.types.STRATEGY_MSG, msg='A_B [待确认]'))
         self.assertEqual(text, r'A\_B \[待确认]')
-
-    def test_exit_cancel_kept_open_is_not_presented_as_cancelled(self):
-        from freqtrade.constants import CANCEL_REASON
-
-        text = self.bot.compose_message(
-            self.message(self.types.EXIT_CANCEL, reason=CANCEL_REASON['PARTIALLY_FILLED_KEEP_OPEN'])
-        )
-        self.assertIn('尚未撤销', text)
-        self.assertIn('订单仍开放', text)
-        self.assertNotIn('已撤单', text)
+        text = self.bot.compose_message(dict(type=self.types.EXCEPTION, status='worker_failed'))
+        self.assertIn('【运行异常】', text)
+        self.assertIn(r'worker\_failed', text)

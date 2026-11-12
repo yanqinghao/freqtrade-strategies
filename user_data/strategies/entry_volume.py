@@ -7,16 +7,45 @@ COOLDOWN = 900
 MAX_AGE = 30
 
 
+class EntryDataError(ValueError):
+    """A controlled validation reason, safe to display without network payloads."""
+
+
+PAUSE_REASONS = {
+    'paused': '等待安静观察满15分钟（从最近逆势放量或初始暂缓起算）',
+    'waiting_data': '等待新鲜、完整的行情',
+    'waiting_history': '历史不足，继续等待',
+    'waiting_range': '当前价越过原价超过¼R，等待回到允许恢复区域',
+    'waiting_reclaim': '等待完整1m收回：挂回等待侧需收回原价，可能立即成交侧需收回¼R区域',
+    'waiting_trend': '15m趋势与入场方向相反，暂不恢复可能立即成交的限价单',
+    'waiting_trend_data': '等待新鲜、完整的已收盘15m趋势数据',
+    'waiting_continuity': '等待连续有效观察满15分钟',
+    'invalidated': '触及原硬SL，永久失效',
+    'expired': '原有效期到期',
+    'cancelled': '用户已取消',
+    'replaced': '已被新计划替换',
+    'ready': '行情恢复条件已满足，仍需通过重试时间和最终风控检查',
+}
+
+
+def data_error_reason(error):
+    if isinstance(error, EntryDataError):
+        return str(error)
+    if isinstance(error, KeyError):
+        return '行情字段缺失，等待完整采样'
+    return f'行情读取或校验失败（{type(error).__name__}）'
+
+
 def checked_rows(rows, width, observed_at, now, minimum=1):
     if not 0 <= now - observed_at <= MAX_AGE or len(rows) < minimum:
-        raise ValueError('入场行情过期或不足')
+        raise EntryDataError('入场行情过期或不足')
     last = int(observed_at) // width * width
     if int(now) // width != int(observed_at) // width:
-        raise ValueError('等待新周期行情')
+        raise EntryDataError('等待新周期行情')
     previous = None
     for row in rows:
         if len(row) < 6 or not all(isfinite(float(v)) for v in row[:6]):
-            raise ValueError('入场行情数值无效')
+            raise EntryDataError('入场行情数值无效')
         stamp, op, high, low, close, volume = row[:6]
         if (
             stamp % (width * 1000)
@@ -27,10 +56,10 @@ def checked_rows(rows, width, observed_at, now, minimum=1):
             or low > high
             or (previous is not None and stamp - previous != width * 1000)
         ):
-            raise ValueError('入场行情缺口或价格无效')
+            raise EntryDataError('入场行情缺口或价格无效')
         previous = stamp
     if previous != last * 1000:
-        raise ValueError('缺少当前行情')
+        raise EntryDataError('缺少当前行情')
     return rows
 
 
@@ -42,7 +71,7 @@ def analyze_volume(rows, observed_at, now, direction):
         stamp, op, _, _, close, volume = rows[i][:6]
         baseline = sum(r[5] for r in rows[i - 24 : i]) / 24
         if baseline <= 0:
-            raise ValueError('入场均量不可用')
+            raise EntryDataError('入场均量不可用')
         adverse = close < op if direction == 'long' else close > op
         at = observed_at if i == len(rows) - 1 else stamp / 1000 + 300
         if adverse and volume / baseline >= 4 and now - at < COOLDOWN:
@@ -74,7 +103,7 @@ def advance_pause(meta, rows, signal, observed_at, now, *, quote=None, trend=Non
     checked_rows(rows, 60, observed_at, now)
     start = result.get('checked_until', result['created'])
     if rows[0][0] / 1000 > int(start) // 60 * 60:
-        raise ValueError('缺少等待期间价格历史，继续暂停')
+        raise EntryDataError('缺少等待期间价格历史，继续暂停')
     request = result['request']
     short = request['direction'] == 'short'
     entry, stop = request['entry_price'], request['stop_loss']
@@ -100,7 +129,7 @@ def advance_pause(meta, rows, signal, observed_at, now, *, quote=None, trend=Non
             result['range_crossed_at'] = max(result.get('range_crossed_at', 0), stamp)
     quote = rows[-1][4] if quote is None else quote
     if not isfinite(quote) or quote <= 0:
-        raise ValueError('当前报价无效')
+        raise EntryDataError('当前报价无效')
     if quote >= stop if short else quote <= stop:
         result['decision'] = 'invalidated'
     if quote > entry if short else quote < entry:

@@ -14,7 +14,6 @@ from telegram import InlineKeyboardButton
 from telegram.helpers import escape_markdown
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from freqtrade.enums import SignalDirection, RPCMessageType
-from freqtrade.constants import CANCEL_REASON
 from freqtrade.persistence import Trade, Order
 from freqtrade.rpc import RPCException
 from freqtrade.rpc._telegram_base import Telegram as UpstreamTelegram, authorized_only
@@ -22,7 +21,8 @@ from candle_exits import RULE_GROUPS, RULE_FIELDS, TIMEFRAMES, validate_rules, d
 
 from freqtrade.rpc.order_panel import OrderPanelMixin
 from freqtrade.rpc.watch_panel import WatchPanelMixin
-from freqtrade.rpc.notification_format import notice, with_time
+from freqtrade.rpc.notification_format import notice, with_time, local_time
+from entry_volume import PAUSE_REASONS
 
 logger = logging.getLogger(__name__)
 
@@ -193,122 +193,14 @@ def parse_entry(args, direction):
 class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
     def compose_message(self, msg):
         kind = msg['type']
-        if kind in (RPCMessageType.ENTRY_CANCEL, RPCMessageType.EXIT_CANCEL):
-            side = '入场' if kind == RPCMessageType.ENTRY_CANCEL else '退出'
-            message = notice(
-                side + '撤单状态',
-                f"{msg['pair']} #{msg['trade_id']}",
-                summary=[
-                    '尚未撤销：部分成交后的余仓低于最小限制，订单仍开放。'
-                    if msg['reason'] == CANCEL_REASON['PARTIALLY_FILLED_KEEP_OPEN']
-                    else '收到撤单状态通知，请核对成交与订单状态。'
-                ],
-                sections=[('原因', [msg['reason']])],
-                action='用 /order 核对已成交部分与剩余仓位。',
-                at=datetime.now(timezone.utc),
-            )
-            return escape_markdown(message)
-        if kind in (RPCMessageType.STATUS, RPCMessageType.WARNING, RPCMessageType.EXCEPTION):
-            title = {
-                RPCMessageType.STATUS: '运行状态',
-                RPCMessageType.WARNING: '运行警告',
-                RPCMessageType.EXCEPTION: '运行异常',
-            }[kind]
+        if kind in (RPCMessageType.WARNING, RPCMessageType.EXCEPTION):
+            title = '运行警告' if kind == RPCMessageType.WARNING else '运行异常'
             return escape_markdown(
                 notice(title, summary=[msg['status']], at=datetime.now(timezone.utc))
             )
         if kind == RPCMessageType.STRATEGY_MSG:
             return escape_markdown(msg['msg'])
         return super().compose_message(msg)
-
-    def _trade_notice(self, title, msg, summary, details, action):
-        direction = {'long': '多', 'short': '空'}.get(str(msg['direction']).lower(), msg['direction'])
-        context = [f"方向：{direction} / 杠杆 {msg.get('leverage', 1):g}倍"]
-        if msg.get('exchange'):
-            context.append('交易所：' + self._exchange_from_msg(msg))
-        if msg.get('enter_tag'):
-            context.append('入场标签：' + msg['enter_tag'])
-        return escape_markdown(
-            notice(
-                title,
-                f"{msg['pair']} #{msg['trade_id']}",
-                summary=summary,
-                sections=[('订单', details), ('交易信息', context)],
-                action=action,
-                at=datetime.now(timezone.utc),
-            )
-        )
-
-    def _format_entry_msg(self, msg):
-        filled = msg['type'] == RPCMessageType.ENTRY_FILL
-        side = '加仓' if msg.get('sub_trade') else '入场'
-        details = [f"数量：{msg['amount']:.12g}", f"入场参考价：{msg['open_rate']:.12g}"]
-        if not filled and msg.get('current_rate'):
-            details.append(f"当前参考价：{msg['current_rate']:.12g}")
-        details.append(f"保证金总额：{msg['stake_amount']:.12g} {msg['quote_currency']}")
-        return self._trade_notice(
-            side + ('成交回执' if filled else '已提交'),
-            msg,
-            ['已收到成交回执。' if filled else '订单已提交，等待成交回执。'],
-            details,
-            '用 /order 核对实际数量与止损保护。',
-        )
-
-    def _format_exit_msg(self, msg):
-        filled = msg['type'] == RPCMessageType.EXIT_FILL
-        partial = msg.get('sub_trade')
-        title = ('分批退出' if partial else '退出') + ('成交回执' if filled else '已提交')
-        currency = msg['quote_currency']
-        label = '本次已实现' if filled else '本次预估盈亏（待成交回执）'
-        summary = [f"{label}：{msg['profit_amount']:+.4f} {currency} / {msg['profit_ratio']:+.2%}"]
-        if partial or msg.get('is_final_exit'):
-            if msg.get('cumulative_profit') is not None:
-                summary.append(
-                    f"{'整笔累计' if msg.get('is_final_exit') else '累计已实现'}："
-                    f"{msg['cumulative_profit']:+.4f} {msg['stake_currency']}"
-                )
-            if msg.get('is_final_exit') and msg.get('final_profit_ratio') is not None:
-                summary.append(f"整笔收益率：{msg['final_profit_ratio']:+.2%}")
-        details = [
-            f"原因：{msg['exit_reason']}",
-            f"数量：{msg['amount']:.12g}",
-            f"入场均价：{msg['open_rate']:.12g}",
-        ]
-        if filled:
-            details.append(f"成交价：{msg['close_rate']:.12g}")
-        else:
-            if msg.get('current_rate'):
-                details.append(f"当前参考价：{msg['current_rate']:.12g}")
-            if msg.get('order_rate'):
-                details.append(f"委托价：{msg['order_rate']:.12g}")
-        if partial:
-            details.append(f"剩余保证金：{msg['stake_amount']:.12g} {currency}")
-        else:
-            duration = msg['close_date'].replace(microsecond=0) - msg['open_date'].replace(
-                microsecond=0
-            )
-            details.append(f'持仓时长：{duration}')
-        return self._trade_notice(title, msg, summary, details, '用 /order 核对成交与余仓；提交不代表已全平。')
-
-    def _format_liquidation_warning_msg(self, msg):
-        cross = msg['margin_mode'] == 'cross'
-        summary = ['接近框架保护平仓位，请及时核查。']
-        if cross:
-            summary.append(
-                f"全仓共 {msg['open_positions']} 笔，其中 {msg['positions_at_risk']} 笔接近保护位；下列为最近的一笔。"
-            )
-        details = [
-            f"当前参考价：{msg['current_rate']:.12g} {msg['quote_currency']}",
-            f"框架保护平仓位：{msg['liquidation_price']:.12g}",
-            f"剩余保证金覆盖价差：{msg['remaining_ratio']:.2%}",
-            '此为框架按 liquidation_buffer 提前设置的保护位，并非交易所强平价。',
-        ]
-        action = (
-            '全仓共享保证金，补充保证金会影响所有仓位的保护位置；未补充时框架仍按各自保护位退出。'
-            if cross
-            else '逐仓仅向账户充值不会移动该仓保护位。可减仓、平仓，或在交易所直接为该仓追加保证金；框架在该笔交易下一次订单成交后更新强平价。'
-        )
-        return self._trade_notice('强平风险', msg, summary, details, action)
 
     def __init__(self, rpc, config):
         self._manual_order_lock = asyncio.Lock()
@@ -795,18 +687,6 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
                 'filled': '已有成交，原持仓管理',
                 'done': '计划结束',
             }
-            reasons = {
-                'invalidated': '触及原硬SL，永久失效',
-                'expired': '原有效期到期',
-                'cancelled': '用户已取消',
-                'replaced': '已被新计划替换',
-                'waiting_history': '历史不足，继续等待',
-                'waiting_range': '当前价越过原价超过¼R，等待回到允许恢复区域',
-                'waiting_reclaim': '等待完整1m收回：挂回等待侧需收回原价，可能立即成交侧需收回¼R区域',
-                'waiting_trend': '15m趋势与入场方向相反，暂不恢复可能立即成交的限价单',
-                'waiting_trend_data': '等待新鲜、完整的已收盘15m趋势数据',
-                'waiting_continuity': '重新确认安静15分钟',
-            }
             from datetime import timedelta
 
             deadline = datetime.fromtimestamp(pause['deadline'], timezone(timedelta(hours=8)))
@@ -816,11 +696,34 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
                 if pause['request']['direction'] == 'short'
                 else '现价高于原价可不限距离挂回；现价≤原价需在下方¼R内、完整1m收回允许区域，且15m非偏空'
             )
-            reason = reasons.get(pause['decision'], '安静及连续观察15分钟；' + recovery)
+            reason = PAUSE_REASONS.get(pause['decision'], '安静及连续观察15分钟；' + recovery)
+            diagnostics = []
+            error = pause.get('check_error')
+            if error:
+                diagnostics.append(
+                    f"最近检查：{error['stage']} · {error['reason']}（{local_time(error['at'])}）"
+                )
+            check = pause.get('last_check')
+            if check:
+                diagnostics.append(
+                    f"最近完整采样：{check['quote']:.8g}（{local_time(check['observed_at'])}）"
+                )
+                for key, label in (('quiet_until', '安静期门槛'), ('continuity_until', '连续观察门槛')):
+                    if check.get(key) is not None:
+                        diagnostics.append(label + '：' + local_time(check[key]))
+            rejection = pause.get('last_rejection')
+            if rejection:
+                diagnostics.append(f"最近提交前拒绝：{rejection['message']}（{local_time(rejection['at'])}）")
+            if pause['phase'] == 'paused' and pause.get('retry_after'):
+                diagnostics.append('重试时间门槛：' + local_time(pause['retry_after']) + '；仍须重新通过行情与风控检查')
+            details = '\n'.join(diagnostics)
+            if details:
+                details += '\n'
             return (
                 f"计划 {row['ref']}：{labels.get(pause['phase'], pause['phase'])}\n"
                 f"{request['pair']} {request['direction']}，原限价 {entry:g}\n"
                 f"{reason}\n"
+                f"{details}"
                 f"原截止时间：{deadline:%Y-%m-%d %H:%M:%S} 北京时间\n"
                 f"/request {row['ref']} cancel 取消计划；已成交部分仍由原保护流程管理。"
             )

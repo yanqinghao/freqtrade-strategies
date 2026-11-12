@@ -4,7 +4,13 @@ import time
 from math import isfinite
 from queue import SimpleQueue, Empty
 from market_monitor import HourlyMarketMonitor, MONITOR_PAIRS
-from entry_volume import checked_rows, analyze_volume, analyze_recovery_trend
+from entry_volume import (
+    checked_rows,
+    analyze_volume,
+    analyze_recovery_trend,
+    EntryDataError,
+    data_error_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +63,7 @@ class EntryPauseMonitor(HourlyMarketMonitor):
                 results[pair] = snapshot
             except Exception as error:
                 logger.warning(
-                    'Public entry volume unavailable for %s (%s)', pair, type(error).__name__
+                    'Public entry volume unavailable for %s (%s)', pair, data_error_reason(error)
                 )
         for pair, snapshot in volumes.items():
             if needs[pair] is None:
@@ -70,19 +76,21 @@ class EntryPauseMonitor(HourlyMarketMonitor):
                 while cursor <= int(observed) // 60 * 60000:
                     batch = client.fetch_ohlcv(pair, timeframe='1m', since=cursor, limit=1000)
                     if not batch or batch[-1][0] < cursor:
-                        raise ValueError('历史行情不可用')
+                        raise EntryDataError('历史行情不可用')
                     minute.extend(r for r in batch if r[0] >= cursor)
                     cursor = batch[-1][0] + 60000
                 book = client.fetch_order_book(pair, limit=5)
                 bid, ask = book['bids'][0][0], book['asks'][0][0]
                 checked_rows(minute, 60, observed, self.clock(), 2)
                 if not all(isfinite(v) and v > 0 for v in (bid, ask)) or bid > ask:
-                    raise ValueError('盘口无效')
+                    raise EntryDataError('盘口无效')
                 results[pair] = {**snapshot, 'minute': minute, 'bid': bid, 'ask': ask}
                 self._updates.put((pair, results[pair]))
             except Exception as error:
                 logger.warning(
-                    'Public entry history/book unavailable for %s (%s)', pair, type(error).__name__
+                    'Public entry history/book unavailable for %s (%s)',
+                    pair,
+                    data_error_reason(error),
                 )
                 continue
             try:
@@ -93,7 +101,7 @@ class EntryPauseMonitor(HourlyMarketMonitor):
                 self._updates.put((pair, results[pair]))
             except Exception as error:
                 logger.warning(
-                    'Public entry trend unavailable for %s (%s)', pair, type(error).__name__
+                    'Public entry trend unavailable for %s (%s)', pair, data_error_reason(error)
                 )
         return results
 

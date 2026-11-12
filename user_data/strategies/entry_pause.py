@@ -10,7 +10,13 @@ from freqtrade.persistence import Trade, Order
 from entry_lifecycle import _receipt, TERMINAL, install_entry_receipt_guard, entry_ttl
 from candle_exits import RULE_FIELDS
 from entry_risk import EntryRiskError
-from entry_volume import analyze_volume, advance_pause
+from entry_volume import (
+    analyze_volume,
+    advance_pause,
+    EntryDataError,
+    data_error_reason,
+    PAUSE_REASONS,
+)
 from notification_format import notice
 
 logger = logging.getLogger(__name__)
@@ -54,10 +60,25 @@ class EntryPause:
             if meta.get('trade_id') == trade_id and meta['phase'] not in ('filled', 'done'):
                 self.cancel(meta['ref'], reason)
 
+    def _check_failed(self, meta, stage, error, now):
+        # Reload: a valid shock can have been saved before incomplete price data failed.
+        current = self.store.get_pause(meta['ref'])
+        reason = data_error_reason(error)
+        previous = current.get('check_error', {})
+        current['check_error'] = dict(at=now, stage=stage, reason=reason)
+        if current.get('decision') in ('normal', 'ready', 'waiting_data'):
+            current['decision'] = 'waiting_data'
+        self.store.put_pause(current)
+        if previous.get('stage') != stage or previous.get('reason') != reason:
+            logger.warning(
+                'Entry check deferred for %s [%s]: %s', current['request']['pair'], stage, reason
+            )
+        return reason
+
     def evaluate(self, meta, now, *, quote=None):
         snapshot = self.snapshots.get(meta['request']['pair'])
         if not snapshot:
-            raise ValueError('等待新鲜行情')
+            raise EntryDataError('等待新鲜行情')
         observed = snapshot['observed_at']
         signal = snapshot.get('signals', {}).get(meta['request']['direction'])
         if signal and 0 <= now - signal['at'] < 900:
@@ -91,6 +112,20 @@ class EntryPause:
                 updated['decision'] = 'waiting_continuity'
             elif not updated.get('ever_paused') and not updated.get('history_uncertain'):
                 updated['decision'] = 'ready'
+        updated.pop('check_error', None)
+        updated['last_check'] = dict(
+            at=now,
+            observed_at=observed,
+            quote=quote,
+            quiet_until=(
+                updated.get('last_adverse', updated.get('quiet_after', updated['created'])) + 900
+            )
+            if updated.get('ever_paused')
+            else None,
+            continuity_until=snapshot['continuous_since'] + 900
+            if updated.get('ever_paused')
+            else None,
+        )
         self.store.put_pause(updated)
         return updated
 
@@ -170,6 +205,7 @@ class EntryPause:
             or meta['phase'] not in ('submitting', 'resuming')
         ):
             raise EntryRiskError('入场计划已暂停、结束或到期，本次未提交')
+        stage = '入场放量' if meta['phase'] == 'submitting' else '恢复盘口'
         try:
             if meta['phase'] == 'submitting':
                 snap = self.snapshots[meta['request']['pair']]
@@ -180,7 +216,7 @@ class EntryPause:
                 if signal and 0 <= now - signal['at'] < 900:
                     meta.update(last_adverse=signal['at'], ever_paused=True, decision='paused')
                     self.store.put_pause(meta)
-                    raise ValueError('新增逆向放量')
+                    raise EntryDataError('新增逆向放量')
             else:
                 # Actual executable best price determines whether the original
                 # LIMIT may fill immediately; configured target pricing does not.
@@ -188,18 +224,20 @@ class EntryPause:
                 book = self.bot.exchange.fetch_l2_order_book(request['pair'], 1)
                 bid, ask = float(book['bids'][0][0]), float(book['asks'][0][0])
                 if not all(isfinite(v) and v > 0 for v in (bid, ask)) or bid > ask:
-                    raise ValueError('恢复前盘口无效')
+                    raise EntryDataError('恢复前盘口无效')
                 if self.bot.state != State.RUNNING:
-                    raise ValueError('机器人已停止新入场')
+                    raise EntryDataError('机器人已停止新入场')
                 quote = bid if request['direction'] == 'short' else ask
                 # I/O can cross freshness, candle boundaries or the original TTL.
+                stage = '恢复条件'
                 meta = self.evaluate(meta, time.time(), quote=quote)
                 if meta['decision'] != 'ready':
-                    raise ValueError('原价恢复条件已变化')
+                    raise EntryDataError(PAUSE_REASONS.get(meta['decision'], '原价恢复条件已变化'))
         except Exception as error:
             if isinstance(error, EntryRiskError):
                 raise
-            raise EntryRiskError('入场行情或恢复条件未通过，本次未向交易所提交') from None
+            reason = self._check_failed(meta, stage, error, time.time())
+            raise EntryRiskError(f'入场检查未通过（{stage}：{reason}），本次未向交易所提交') from None
 
     def withdraw(self, meta):
         """Commit receipt evidence before native zero-fill deletion can remove the trade."""
@@ -277,11 +315,17 @@ class EntryPause:
             meta['phase'] = 'done'
             self.store.put_pause(meta)
         elif row and row['state'] == 'rejected':
+            # A definite local rejection is not a new adverse-volume observation.
+            meta.setdefault('quiet_after', meta['created'])
+            previous = meta.get('last_rejection', {})
+            if previous.get('ref') != ref:
+                meta['retry_after'] = time.time() + 60
             meta.update(
                 phase='paused',
                 ever_paused=True,
-                quiet_after=time.time(),
-                retry_after=time.time() + 60,
+                last_rejection=dict(
+                    ref=ref, at=row['updated'], message=row['result'].get('message', '提交前检查未通过')
+                ),
             )
             self.store.put_pause(meta)
         else:
@@ -397,7 +441,8 @@ class EntryPause:
                 if meta['decision'] not in ENDED:
                     try:
                         meta = self.evaluate(meta, stamp)
-                    except (ValueError, KeyError):
+                    except (ValueError, KeyError) as error:
+                        self._check_failed(meta, '恢复条件', error, stamp)
                         meta = self.store.get_pause(meta['ref'])
                         # A volume shock can be known even while 1m history is unavailable.
                         if meta['phase'] != 'canceling' and (
