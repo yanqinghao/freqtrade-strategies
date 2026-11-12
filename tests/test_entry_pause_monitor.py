@@ -30,7 +30,7 @@ class PauseMonitorTests(unittest.TestCase):
         self.addCleanup(monitor.close)
         monitor._client = Client()
         snapshot = monitor.collect({'BTC/USDT:USDT': now - 120})['BTC/USDT:USDT']
-        self.assertEqual(calls, ['5m', '1m', 'book'])
+        self.assertEqual(calls, ['5m', '1m', 'book', '15m'])
         self.assertEqual(snapshot['signals']['long']['ratio'], 4.0)
         self.assertEqual(snapshot['ask'], 101.0)
         self.assertEqual(
@@ -102,12 +102,17 @@ class PauseMonitorTests(unittest.TestCase):
                 dict(phase='done', created=1799999000, request={'pair': 'ETH/USDT:USDT'}),
             ],
         )
-        self.assertEqual(executor.needs, {'BTC/USDT:USDT': 1799999700, 'ETH/USDT:USDT': None})
+        self.assertEqual(
+            executor.needs,
+            {'BTC/USDT:USDT': 1799999700, 'ETH/USDT:USDT': None, 'SOL/USDT:USDT': None},
+        )
 
         # After becoming idle, a newly created ETH plan must re-enable history/book I/O.
         monitor._future.set_result({})
         monitor.tick(datetime.fromtimestamp(1800000040, timezone.utc), [])
-        self.assertEqual(executor.needs, {'BTC/USDT:USDT': None, 'ETH/USDT:USDT': None})
+        self.assertEqual(
+            executor.needs, {'BTC/USDT:USDT': None, 'ETH/USDT:USDT': None, 'SOL/USDT:USDT': None}
+        )
         monitor._future.set_result({})
         monitor.tick(
             datetime.fromtimestamp(1800000050, timezone.utc),
@@ -115,7 +120,50 @@ class PauseMonitorTests(unittest.TestCase):
                 dict(phase='watching', created=1800000045, request={'pair': 'ETH/USDT:USDT'}),
             ],
         )
-        self.assertEqual(executor.needs, {'BTC/USDT:USDT': None, 'ETH/USDT:USDT': 1799999930})
+        self.assertEqual(
+            executor.needs,
+            {'BTC/USDT:USDT': None, 'ETH/USDT:USDT': 1799999930, 'SOL/USDT:USDT': None},
+        )
+
+    def test_scheduler_adds_all_active_symbols_and_drops_inactive_extra_symbols(self):
+        from entry_pause_monitor import EntryPauseMonitor
+
+        class Executor:
+            def submit(self, fn, needs):
+                self.needs = needs
+                return Future()
+
+            def shutdown(self, **kwargs):
+                pass
+
+        executor = Executor()
+        monitor = EntryPauseMonitor(executor=executor)
+        self.addCleanup(monitor.close)
+        now = datetime.fromtimestamp(1800000030, timezone.utc)
+        monitor.tick(
+            now,
+            [
+                dict(phase='paused', created=1800000000, request={'pair': 'XRP/USDT:USDT'}),
+                dict(
+                    phase='watching',
+                    created=1799999400,
+                    checked_until=1799999700,
+                    request={'pair': 'XRP/USDT:USDT'},
+                ),
+                dict(phase='canceling', created=1800000000, request={'pair': 'DOGE/USDT:USDT'}),
+                dict(phase='done', created=1799999000, request={'pair': 'ADA/USDT:USDT'}),
+                dict(phase='filled', created=1799999000, request={'pair': 'BNB/USDT:USDT'}),
+            ],
+        )
+        self.assertEqual(executor.needs.get('XRP/USDT:USDT'), 1799999700)
+        self.assertEqual(executor.needs.get('DOGE/USDT:USDT'), 1799999910)
+        self.assertNotIn('ADA/USDT:USDT', executor.needs)
+        self.assertNotIn('BNB/USDT:USDT', executor.needs)
+        executor_future = monitor._future
+        executor_future.set_result({})
+        monitor.tick(datetime.fromtimestamp(1800000040, timezone.utc), [])
+        self.assertNotIn('XRP/USDT:USDT', executor.needs)
+        self.assertNotIn('DOGE/USDT:USDT', executor.needs)
 
     def test_collection_retains_gaps_and_uses_only_public_data(self):
         self.assertIsNotNone(
@@ -206,3 +254,39 @@ class PauseMonitorTests(unittest.TestCase):
         signal = snapshots['BTC/USDT:USDT']['signals']['long']
         self.assertIsNotNone(signal)
         self.assertEqual(signal['at'], 1800000030.0)
+
+    def test_trend_snapshot_uses_fresh_closed_public_candles_and_preserves_volume_on_failure(self):
+        from entry_pause_monitor import EntryPauseMonitor
+
+        now = 1800000030.0
+        fail_trend = False
+
+        class Client:
+            def fetch_ohlcv(self, pair, timeframe, **kwargs):
+                if timeframe == '15m':
+                    if fail_trend:
+                        raise TimeoutError('trend unavailable')
+                    return rows(now, 900, 121, 200)
+                data = rows(now, 300 if timeframe == '5m' else 60, 28 if timeframe == '5m' else 10)
+                if timeframe == '5m':
+                    data[-1][4:] = [99.0, 40.0]
+                return data
+
+            def fetch_order_book(self, pair, **kwargs):
+                return dict(bids=[[99, 1]], asks=[[100, 1]])
+
+        monitor = EntryPauseMonitor(clock=lambda: now)
+        self.addCleanup(monitor.close)
+        monitor._client = Client()
+        first = monitor.collect({'BTC/USDT:USDT': now - 120})['BTC/USDT:USDT']
+        self.assertEqual(
+            first['trend'], dict(direction='震荡', observed_at=now, closed_at=1800000000.0)
+        )
+        fail_trend = True
+        now += 10
+        second = monitor.collect({'BTC/USDT:USDT': now - 120})['BTC/USDT:USDT']
+        self.assertNotIn('trend', second)
+        drained = monitor.drain()['BTC/USDT:USDT']
+        self.assertNotIn('trend', drained)
+        self.assertEqual(drained['signals']['long']['ratio'], 4)
+        self.assertEqual(drained['ask'], 100)

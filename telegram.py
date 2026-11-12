@@ -680,8 +680,10 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
                 'cancelled': '用户已取消',
                 'replaced': '已被新计划替换',
                 'waiting_history': '历史不足，继续等待',
-                'waiting_range': '等待进入¼R范围',
-                'waiting_reclaim': '等待完整1m收回原价',
+                'waiting_range': '当前价越过原价超过¼R，等待回到允许恢复区域',
+                'waiting_reclaim': '等待完整1m收回：挂回等待侧需收回原价，可能立即成交侧需收回¼R区域',
+                'waiting_trend': '15m趋势与入场方向相反，暂不恢复可能立即成交的限价单',
+                'waiting_trend_data': '等待新鲜、完整的已收盘15m趋势数据',
                 'waiting_continuity': '重新确认安静15分钟',
             }
             from datetime import timedelta
@@ -689,11 +691,11 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             deadline = datetime.fromtimestamp(pause['deadline'], timezone(timedelta(hours=8)))
             entry = pause['request']['entry_price']
             recovery = (
-                '安静15分钟；涨过原价需完整1m收回，空单无需接近原价即可恢复原价限价'
+                '现价低于原价可不限距离挂回；现价≥原价需在上方¼R内、完整1m收回允许区域，且15m非偏多'
                 if pause['request']['direction'] == 'short'
-                else '安静15分钟、¼R及收回条件通过后恢复原价限价'
+                else '现价高于原价可不限距离挂回；现价≤原价需在下方¼R内、完整1m收回允许区域，且15m非偏空'
             )
-            reason = reasons.get(pause['decision'], '4倍逆向放量暂停；' + recovery)
+            reason = reasons.get(pause['decision'], '安静及连续观察15分钟；' + recovery)
             return (
                 f"计划 {row['ref']}：{labels.get(pause['phase'], pause['phase'])}\n"
                 f"{request['pair']} {request['direction']}，原限价 {entry:g}\n"

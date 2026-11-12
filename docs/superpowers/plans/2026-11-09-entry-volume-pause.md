@@ -1,5 +1,30 @@
 # Entry Volume Pause Implementation Plan
 
+## Follow-up: symmetric long original-limit restoration (2026-11-12)
+
+- Reproduced BTC buy-limit restoration stuck in `waiting_range` while market
+  remained above the original entry. The prior short exemption left the long
+  absolute-distance gate active.
+- Removed the remaining proximity gate; longs above their buy limit now follow
+  the same restoration policy as shorts below their sell limit. Quiet/continuous
+  900-second observation, completed post-cross reclaim, fresh complete history,
+  hard SL, original TTL, receipt checks and SDK checks remain in place.
+- Policy regressions first failed with `waiting_range`; the execution regression
+  first failed because no original-limit submission occurred after 900 seconds.
+  Strengthened cancellation coverage to recreate the controller and prove a
+  cancelled intent stays ended despite fresh recovery conditions.
+- Existing `/request <original request reference> cancel` already permanently
+  cancels paused intent; no additional cancellation mechanism was needed.
+- Candidate `freqtrade-strategies-freqtrade:long-resume-20261112`
+  (`sha256:1bcf05b16503203b2a7380352f7a82d46d3e04cb25c018105cc3e3e68eefb5d4`)
+  passed all 409 offline tests in 71.365 seconds under pinned Freqtrade 2026.10.
+  Independent diff review found no issues; `git diff --check` clean. The obsolete
+  local venv cannot run execution tests (`Trade.has_open_position` missing);
+  the pinned-image full suite is the verification result.
+- No commit, push, production restart, or user-plan cancellation performed.
+  Runtime activation remains pending; restarting may restore an eligible plan
+  automatically at its original limit.
+
 ## Follow-up: short original-limit restoration (2026-11-09)
 
 User approved removing the short proximity gate: after 900 quiet seconds, restore

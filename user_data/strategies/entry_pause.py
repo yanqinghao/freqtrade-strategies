@@ -1,6 +1,7 @@
 """Durable original-limit withdrawal and recovery, on the trading thread only."""
 import logging
 import time
+from math import isfinite
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 
@@ -12,7 +13,6 @@ from entry_risk import EntryRiskError
 from entry_volume import analyze_volume, advance_pause
 
 logger = logging.getLogger(__name__)
-PAIRS = ('BTC/USDT:USDT', 'ETH/USDT:USDT')
 ENDED = ('invalidated', 'expired', 'cancelled', 'replaced')
 
 
@@ -71,7 +71,15 @@ class EntryPause:
             self.store.put_pause(meta)
         short = meta['request']['direction'] == 'short'
         quote = snapshot['bid' if short else 'ask'] if quote is None else quote
-        updated = advance_pause(meta, snapshot['minute'], signal, observed, now, quote=quote)
+        updated = advance_pause(
+            meta,
+            snapshot['minute'],
+            signal,
+            observed,
+            now,
+            quote=quote,
+            trend=snapshot.get('trend'),
+        )
         if updated['decision'] not in ENDED:
             # A missed intrabar reversal cannot be reconstructed from final 5m candles.
             if updated.get('ever_paused') and now - snapshot['continuous_since'] < 900:
@@ -83,7 +91,7 @@ class EntryPause:
 
     def prepare(self, request, ref, *, now=None):
         """Return True when the initial request was retained without placing an order."""
-        if request.get('entry_price') is None or request['pair'] not in PAIRS or not ref:
+        if request.get('entry_price') is None or not ref:
             return False
         now = time.time() if now is None else now
         meta = self.find(ref)
@@ -169,15 +177,18 @@ class EntryPause:
                     self.store.put_pause(meta)
                     raise ValueError('新增逆向放量')
             else:
-                # Quote is refreshed after account/risk preflight; original LIMIT stays unchanged.
+                # Actual executable best price determines whether the original
+                # LIMIT may fill immediately; configured target pricing does not.
                 request = meta['request']
-                quote = self.bot.exchange.get_rate(
-                    request['pair'],
-                    side='entry',
-                    is_short=request['direction'] == 'short',
-                    refresh=True,
-                )
-                meta = self.evaluate(meta, now, quote=quote)
+                book = self.bot.exchange.fetch_l2_order_book(request['pair'], 1)
+                bid, ask = float(book['bids'][0][0]), float(book['asks'][0][0])
+                if not all(isfinite(v) and v > 0 for v in (bid, ask)) or bid > ask:
+                    raise ValueError('恢复前盘口无效')
+                if self.bot.state != State.RUNNING:
+                    raise ValueError('机器人已停止新入场')
+                quote = bid if request['direction'] == 'short' else ask
+                # I/O can cross freshness, candle boundaries or the original TTL.
+                meta = self.evaluate(meta, time.time(), quote=quote)
                 if meta['decision'] != 'ready':
                     raise ValueError('原价恢复条件已变化')
         except Exception as error:
@@ -275,7 +286,7 @@ class EntryPause:
     def adopt(self):
         # Only durable, identifiable original initial limits can be recovered.
         for trade in Trade.get_open_trades():
-            if trade.pair not in PAIRS or trade.nr_of_successful_entries or trade.has_open_position:
+            if trade.nr_of_successful_entries or trade.has_open_position:
                 continue
             entries = [
                 o for o in trade.orders if o.ft_order_side == trade.entry_side and o.ft_is_open
@@ -343,7 +354,14 @@ class EntryPause:
                     meta['request'][key] = deepcopy(plan[key])
                 else:
                     meta['request'].pop(key, None)
-            for key in ('crossed', 'crossed_at', 'history_uncertain', 'low_water', 'high_water'):
+            for key in (
+                'crossed',
+                'crossed_at',
+                'range_crossed_at',
+                'history_uncertain',
+                'low_water',
+                'high_water',
+            ):
                 meta.pop(key, None)
             self.store.put_pause(meta)
 

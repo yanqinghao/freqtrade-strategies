@@ -109,7 +109,24 @@ class PauseExecutionTests(unittest.TestCase):
         self.prepare()
         self.run_tick()
         self.controller.cancel(self.ref)
-        self.assertEqual(self.run_tick()['decision'], 'cancelled')
+        from entry_pause import EntryPause
+
+        self.controller = EntryPause(
+            self.strategy, self.bot, lambda request, ref: self.submissions.append((request, ref))
+        )
+        self.now += timedelta(seconds=960)
+        stamp = self.now.timestamp()
+        self.snapshot.update(
+            observed_at=stamp,
+            minute=rows(stamp, 60, 30, 115),
+            volume=rows(stamp, 300, 28, 115),
+            bid=115,
+            ask=115,
+        )
+        self.controller.snapshots[self.trade.pair] = self.snapshot
+        meta = self.run_tick()
+        self.assertEqual(meta['decision'], 'cancelled')
+        self.assertEqual(meta['phase'], 'done')
         self.assertEqual(self.submissions, [])
 
     def test_safe_restore_uses_original_limit_and_deadline_only_once(self):
@@ -179,6 +196,12 @@ class PauseExecutionTests(unittest.TestCase):
         self.prepare()
         from entry_requests import EntryRequests
 
+        # Coverage follows identifiable assistant orders, including other symbols.
+        plan = self.strategy._plan(self.trade)
+        self.trade.pair = 'XRP/USDT:USDT'
+        self.order.ft_pair = self.order.symbol = self.trade.pair
+        self.meta['request']['pair'] = self.trade.pair
+        self.strategy.set_manual_plan(self.trade.pair, plan)
         # Simulate an existing request ledger from before this feature.
         self.controller.store = EntryRequests(
             self.strategy.entry_requests.path.with_name('old.sqlite')
@@ -195,6 +218,8 @@ class PauseExecutionTests(unittest.TestCase):
         )
         self.controller.adopt()
         meta = self.controller.store.get_pause(self.ref)
+        self.assertIsNotNone(meta, 'existing non-BTC/ETH initial limit must be adopted')
+        self.assertEqual(meta['request']['pair'], 'XRP/USDT:USDT')
         self.assertEqual(meta['order_id'], 'entry-1')
         self.assertEqual(meta['request']['entry_price'], 100.0)
         self.assertEqual(meta['deadline'], self.order.order_date_utc.timestamp() + 14400)
@@ -204,6 +229,9 @@ class PauseExecutionTests(unittest.TestCase):
         self.assertTrue(
             hasattr(self.controller, 'revise_trade'), 'explicit plan version update missing'
         )
+        meta = self.strategy.entry_requests.get_pause(self.ref)
+        meta['range_crossed_at'] = self.now.timestamp()
+        self.strategy.entry_requests.put_pause(meta)
         self.controller.revise_trade(
             self.trade.id, dict(direction='long', stop_loss=95.0, exit_points=[115.0, 120.0, 130.0])
         )
@@ -213,6 +241,7 @@ class PauseExecutionTests(unittest.TestCase):
         self.assertEqual(meta['deadline'], self.meta['deadline'])
         self.assertEqual(meta['version'], 2)
         self.assertEqual(meta['request']['entry_price'], 100.0)
+        self.assertNotIn('range_crossed_at', meta)
 
     def test_real_restoration_tag_keeps_parseable_original_deadline(self):
         self.prepare()
@@ -268,7 +297,7 @@ class PauseExecutionTests(unittest.TestCase):
         self.controller.prepare(self.meta['request'], new, now=self.now.timestamp() + 1)
         self.assertIsNotNone(self.strategy.entry_requests.get_pause(new))
 
-    def test_initial_data_wait_must_not_later_bypass_recovery_range(self):
+    def test_initial_data_wait_restores_far_above_entry_only_after_quiet_period(self):
         self.prepare()
         self.Trade.session.delete(self.trade)
         self.Trade.commit()
@@ -279,7 +308,7 @@ class PauseExecutionTests(unittest.TestCase):
         self.controller.snapshots.clear()
         new = 'c' * 24
         self.controller.prepare(self.meta['request'], new, now=self.now.timestamp())
-        self.now += timedelta(seconds=960)
+        self.now += timedelta(seconds=899)
         stamp = self.now.timestamp()
         self.controller.snapshots[self.trade.pair] = dict(
             observed_at=stamp,
@@ -291,4 +320,56 @@ class PauseExecutionTests(unittest.TestCase):
         )
         self.run_tick()
         self.assertEqual(self.submissions, [])
-        self.assertEqual(self.strategy.entry_requests.get_pause(new)['decision'], 'waiting_range')
+        self.assertEqual(self.strategy.entry_requests.get_pause(new)['decision'], 'paused')
+        self.now += timedelta(seconds=1)
+        stamp = self.now.timestamp()
+        self.controller.snapshots[self.trade.pair].update(
+            observed_at=stamp,
+            minute=rows(stamp, 60, 30, 115),
+            volume=rows(stamp, 300, 28, 115),
+        )
+        self.run_tick()
+        self.assertEqual(len(self.submissions), 1)
+        request, _ = self.submissions[0]
+        self.assertEqual(request['entry_price'], 100.0)
+        self.assertEqual(request['entry_deadline'], int(self.now.timestamp() - 900 + 7200))
+        self.assertEqual(request['exit_points'], [110.0, 120.0, 130.0])
+
+    def test_bounded_immediate_recovery_waits_for_trend_then_submits_original_plan(self):
+        from test_entry_recovery_trend import flat_rows
+
+        self.prepare()
+        self.run_tick()
+        self.now += timedelta(seconds=960)
+        stamp = self.now.timestamp()
+        self.snapshot.update(
+            observed_at=stamp,
+            minute=flat_rows(stamp, 60, 30, 99),
+            volume=rows(stamp, 300, 28, 99),
+            bid=98.9,
+            ask=99,
+        )
+        self.snapshot['trend'] = dict(
+            direction='偏空',
+            observed_at=stamp,
+            closed_at=int(stamp) // 900 * 900,
+        )
+        self.assertEqual(self.run_tick()['decision'], 'waiting_trend')
+        self.assertEqual(self.submissions, [])
+        self.snapshot['trend']['direction'] = '震荡'
+
+        def submit(request, ref):
+            self.submissions.append((deepcopy(request), ref))
+            self.strategy.entry_requests.reserve(ref, request)
+            return self.strategy.entry_requests.set_status(ref, 'unknown', {})
+
+        self.controller.submit = submit
+        self.run_tick()
+        self.assertEqual(len(self.submissions), 1)
+        request, _ = self.submissions[0]
+        self.assertEqual(request['entry_price'], 100)
+        self.assertEqual(request['entry_deadline'], self.meta['deadline'])
+        self.assertEqual(request['stop_loss'], 90)
+        self.assertEqual(request['exit_points'], [110, 120, 130])
+        self.run_tick()
+        self.assertEqual(len(self.submissions), 1)

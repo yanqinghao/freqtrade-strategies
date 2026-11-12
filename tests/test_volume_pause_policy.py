@@ -61,11 +61,11 @@ class VolumePausePolicyTests(unittest.TestCase):
         self.assertFalse(result['crossed'])
         self.assertEqual(result['deadline'], self.meta['deadline'])
 
-    def test_cross_requires_completed_reclaim_not_a_previous_close(self):
+    def test_resting_recovery_after_cross_requires_a_completed_reclaim(self):
         data = rows(self.now, 60, 10)
         data[-1][1:5] = [100, 101, 94, 94.5]
         result = self.module.advance_pause(self.meta, data, None, self.now, self.now)
-        self.assertEqual(result['decision'], 'waiting_reclaim')
+        self.assertEqual(result['decision'], 'waiting_trend_data')
         later = self.now + 60
         data[-1][4] = 96
         data.append([int(later) // 60 * 60000, 96, 97, 95.5, 96, 10])
@@ -98,21 +98,47 @@ class VolumePausePolicyTests(unittest.TestCase):
         result = self.module.advance_pause(self.meta, [], {'at': self.now}, self.now, self.now)
         self.assertEqual(result['decision'], 'expired')
 
-    def test_far_close_or_current_quote_cannot_restore(self):
+    def test_long_far_close_or_current_quote_can_restore_original_buy_limit(self):
         data = rows(self.now, 60, 10, price=96)
         result = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=96.26)
-        self.assertEqual(result['decision'], 'waiting_range')
+        self.assertEqual(result['decision'], 'ready')
         result = self.module.advance_pause(
             self.meta, rows(self.now, 60, 10), None, self.now, self.now, quote=95.5
         )
-        self.assertEqual(result['decision'], 'waiting_range')
+        self.assertEqual(result['decision'], 'ready')
 
-    def test_current_quote_cross_cannot_reuse_previous_candle(self):
+    def test_long_far_above_entry_resumes_only_after_quiet_period(self):
+        self.meta['request'] = dict(direction='long', entry_price=73100.0, stop_loss=71400.0)
+        data = rows(self.now, 60, 10, price=74100)
+        for elapsed, expected in [(899, 'paused'), (900, 'ready')]:
+            with self.subTest(elapsed=elapsed):
+                self.meta['last_adverse'] = self.now - elapsed
+                result = self.module.advance_pause(
+                    self.meta, data, None, self.now, self.now, quote=74120
+                )
+                self.assertEqual(result['decision'], expected)
+                self.assertFalse(result['crossed'])
+                self.assertEqual(result['request'], self.meta['request'])
+                self.assertEqual(result['deadline'], self.meta['deadline'])
+
+    def test_long_far_above_entry_still_requires_post_cross_reclaim(self):
+        self.meta['request'] = dict(direction='long', entry_price=73100.0, stop_loss=71400.0)
+        data = rows(self.now, 60, 10, price=74100)
+        crossed = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=73099)
+        self.assertEqual(crossed['decision'], 'waiting_trend_data')
+        result = self.module.advance_pause(crossed, data, None, self.now, self.now, quote=74100)
+        self.assertEqual(result['decision'], 'waiting_reclaim')
+        later = self.now + 60
+        data.append([int(later) // 60 * 60000, 74100, 74101, 74099, 74100, 10])
+        result = self.module.advance_pause(result, data, None, later, later, quote=74100)
+        self.assertEqual(result['decision'], 'ready')
+
+    def test_current_quote_cross_needs_a_new_close_for_resting_recovery(self):
         data = rows(self.now, 60, 10, price=96)
         for row in data:
             row[3] = 95.5
         result = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=94.9)
-        self.assertEqual(result['decision'], 'waiting_reclaim')
+        self.assertEqual(result['decision'], 'waiting_trend_data')
         result = self.module.advance_pause(result, data, None, self.now, self.now, quote=95.5)
         self.assertEqual(result['decision'], 'waiting_reclaim')
 
@@ -126,13 +152,13 @@ class VolumePausePolicyTests(unittest.TestCase):
         )
         self.assertEqual(result['decision'], 'invalidated')
 
-    def test_short_quote_above_entry_requires_reclaim(self):
+    def test_short_quote_above_entry_requires_trend_data(self):
         self.meta['request'] = dict(direction='short', entry_price=105.0, stop_loss=110.0)
         data = rows(self.now, 60, 10, price=104)
         result = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=104)
         self.assertEqual(result['decision'], 'ready')
         result = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=105.1)
-        self.assertEqual(result['decision'], 'waiting_reclaim')
+        self.assertEqual(result['decision'], 'waiting_trend_data')
 
     def test_short_far_below_entry_resumes_only_after_quiet_period(self):
         self.meta['request'] = dict(direction='short', entry_price=2200.0, stop_loss=2290.0)
@@ -152,7 +178,7 @@ class VolumePausePolicyTests(unittest.TestCase):
         self.meta['request'] = dict(direction='short', entry_price=2200.0, stop_loss=2290.0)
         data = rows(self.now, 60, 10, price=2130)
         crossed = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=2201)
-        self.assertEqual(crossed['decision'], 'waiting_reclaim')
+        self.assertEqual(crossed['decision'], 'waiting_trend_data')
         result = self.module.advance_pause(crossed, data, None, self.now, self.now, quote=2130)
         self.assertEqual(result['decision'], 'waiting_reclaim')
         later = self.now + 60
@@ -166,7 +192,7 @@ class VolumePausePolicyTests(unittest.TestCase):
         for row in data:
             row[3] = 95.5
         result = self.module.advance_pause(self.meta, data, None, self.now, self.now, quote=94.9)
-        self.assertEqual(result['decision'], 'waiting_reclaim')
+        self.assertEqual(result['decision'], 'waiting_trend_data')
         result = self.module.advance_pause(result, data, None, self.now, self.now, quote=96)
         self.assertEqual(result['decision'], 'waiting_reclaim')
 

@@ -3,9 +3,8 @@ import logging
 import time
 from math import isfinite
 from queue import SimpleQueue, Empty
-from market_monitor import HourlyMarketMonitor
-from entry_volume import checked_rows, analyze_volume
-from entry_pause import PAIRS
+from market_monitor import HourlyMarketMonitor, MONITOR_PAIRS
+from entry_volume import checked_rows, analyze_volume, analyze_recovery_trend
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +84,17 @@ class EntryPauseMonitor(HourlyMarketMonitor):
                 logger.warning(
                     'Public entry history/book unavailable for %s (%s)', pair, type(error).__name__
                 )
+                continue
+            try:
+                trend_observed = self.clock()
+                trend_rows = self._fetch_public(pair, '15m')
+                trend = analyze_recovery_trend(trend_rows, trend_observed, self.clock())
+                results[pair] = {**results[pair], 'trend': trend}
+                self._updates.put((pair, results[pair]))
+            except Exception as error:
+                logger.warning(
+                    'Public entry trend unavailable for %s (%s)', pair, type(error).__name__
+                )
         return results
 
     def drain(self):
@@ -108,12 +118,14 @@ class EntryPauseMonitor(HourlyMarketMonitor):
         results = self.drain()
         stamp = now.timestamp()
         if stamp - self._scheduled >= 10:
-            needs = dict.fromkeys(PAIRS)
+            # Advisory symbols are prewarmed; protection follows every live plan.
+            needs = dict.fromkeys(MONITOR_PAIRS)
             for meta in plans:
-                if meta['phase'] not in ('filled', 'done') and meta['request']['pair'] in needs:
+                if meta['phase'] not in ('filled', 'done'):
                     pair = meta['request']['pair']
                     since = meta.get('checked_until', meta['created'])
-                    needs[pair] = min(stamp - 120 if needs[pair] is None else needs[pair], since)
+                    previous = needs.get(pair)
+                    needs[pair] = min(stamp - 120 if previous is None else previous, since)
             self._scheduled = stamp
             self._future = self._executor.submit(self.collect, needs)
         return results

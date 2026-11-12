@@ -1,5 +1,6 @@
 """Causal volume and price checks for temporarily withdrawn initial limit entries."""
 from copy import deepcopy
+from datetime import datetime, timezone
 from math import isfinite
 
 COOLDOWN = 900
@@ -49,7 +50,20 @@ def analyze_volume(rows, observed_at, now, direction):
     return latest
 
 
-def advance_pause(meta, rows, signal, observed_at, now, *, quote=None):
+def analyze_recovery_trend(rows, observed_at, now):
+    """Validate current public data, then reuse the advisory closed-candle EMA rule."""
+    from market_monitor import analyze_trend
+
+    checked_rows(rows, 900, observed_at, now, 51)
+    result = analyze_trend(rows, '15m', datetime.fromtimestamp(observed_at, timezone.utc))
+    return dict(
+        direction=result['trend'],
+        observed_at=observed_at,
+        closed_at=result['closed_at'].timestamp(),
+    )
+
+
+def advance_pause(meta, rows, signal, observed_at, now, *, quote=None, trend=None):
     """Update only from observations already available; preserve the original deadline."""
     result = deepcopy(meta)
     if result.get('decision') in ('invalidated', 'expired'):
@@ -64,6 +78,7 @@ def advance_pause(meta, rows, signal, observed_at, now, *, quote=None):
     request = result['request']
     short = request['direction'] == 'short'
     entry, stop = request['entry_price'], request['stop_loss']
+    bound = entry + (0.25 if short else -0.25) * abs(entry - stop)
     result.setdefault('crossed', False)
     for stamp_ms, op, high, low, close, *_ in rows:
         stamp = stamp_ms / 1000
@@ -81,6 +96,8 @@ def advance_pause(meta, rows, signal, observed_at, now, *, quote=None):
         if high > entry if short else low < entry:
             result['crossed'] = True
             result['crossed_at'] = max(result.get('crossed_at', 0), stamp)
+        if high > bound if short else low < bound:
+            result['range_crossed_at'] = max(result.get('range_crossed_at', 0), stamp)
     quote = rows[-1][4] if quote is None else quote
     if not isfinite(quote) or quote <= 0:
         raise ValueError('当前报价无效')
@@ -89,6 +106,8 @@ def advance_pause(meta, rows, signal, observed_at, now, *, quote=None):
     if quote > entry if short else quote < entry:
         result['crossed'] = True
         result['crossed_at'] = observed_at
+    if quote > bound if short else quote < bound:
+        result['range_crossed_at'] = observed_at
     result['checked_until'] = observed_at
     if result.get('decision') == 'invalidated':
         return result
@@ -98,6 +117,34 @@ def advance_pause(meta, rows, signal, observed_at, now, *, quote=None):
         result['decision'] = 'waiting_history'
     elif now - result.get('last_adverse', result.get('quiet_after', now)) < COOLDOWN:
         result['decision'] = 'paused'
+    elif quote >= entry if short else quote <= entry:
+        # A marketable original limit needs bounded price/close and a trend veto.
+        closed = [r for r in rows if r[0] / 1000 + 60 <= observed_at]
+        if quote > bound if short else quote < bound:
+            result['decision'] = 'waiting_range'
+        elif (
+            not closed
+            or (closed[-1][4] > bound if short else closed[-1][4] < bound)
+            or closed[-1][0] / 1000 + 60 <= result.get('range_crossed_at', 0)
+        ):
+            result['decision'] = 'waiting_reclaim'
+        else:
+            try:
+                valid_trend = (
+                    trend['direction'] in ('偏多', '偏空', '震荡')
+                    and isfinite(trend['observed_at'])
+                    and 0 <= now - trend['observed_at'] <= MAX_AGE
+                    and trend['closed_at'] == int(now) // 900 * 900
+                    and trend['closed_at'] <= trend['observed_at']
+                )
+            except (KeyError, TypeError, ValueError):
+                valid_trend = False
+            if not valid_trend:
+                result['decision'] = 'waiting_trend_data'
+            elif trend['direction'] == ('偏多' if short else '偏空'):
+                result['decision'] = 'waiting_trend'
+            else:
+                result['decision'] = 'ready'
     elif result['crossed']:
         closed = [r for r in rows if r[0] / 1000 + 60 <= observed_at]
         reclaimed = bool(closed and closed[-1][0] / 1000 + 60 > result['crossed_at'])
@@ -107,12 +154,4 @@ def advance_pause(meta, rows, signal, observed_at, now, *, quote=None):
         result['decision'] = 'ready' if reclaimed else 'waiting_reclaim'
     else:
         result['decision'] = 'ready'
-    # Shorts can rest at the original sell limit while price remains below it.
-    # A crossed entry still needs the completed reclaim checked above.
-    if result['decision'] == 'ready' and not short:
-        closed = [r for r in rows if r[0] / 1000 + 60 <= observed_at]
-        if not closed or max(abs(closed[-1][4] - entry), abs(quote - entry)) > 0.25 * abs(
-            entry - stop
-        ):
-            result['decision'] = 'waiting_range'
     return result
