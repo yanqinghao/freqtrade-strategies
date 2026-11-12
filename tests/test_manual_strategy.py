@@ -98,6 +98,10 @@ class ManualStrategyTests(unittest.TestCase):
         self.addCleanup(self.strategy.market_monitor.close)
         self.addCleanup(self.strategy.extreme_volume_monitor.close)
         self.addCleanup(self.strategy.condition_monitor.close)
+        self.assertIsNotNone(
+            getattr(self.strategy, 'position_monitor', None), 'hourly position worker missing'
+        )
+        self.addCleanup(self.strategy.position_monitor.close)
         alerts = getattr(self.strategy.market_monitor, '_alerts', None)
         self.assertIsNotNone(alerts, 'production monitoring must enable closed-candle alerts')
         self.assertEqual(alerts.state_file.name, 'market_alert_state.json')
@@ -131,11 +135,13 @@ with tempfile.TemporaryDirectory() as directory:
     assert strategy.market_monitor._alerts is not None
     assert strategy.extreme_volume_monitor._alerts is not None
     assert strategy.condition_monitor.store is strategy.watches
+    assert strategy.position_monitor is not None
     assert strategy._health_publisher is not None
     strategy._health_publisher.close()
     strategy.market_monitor.close()
     strategy.extreme_volume_monitor.close()
     strategy.condition_monitor.close()
+    strategy.position_monitor.close()
 '''
         result = subprocess.run(
             [sys.executable, '-c', script, str(ROOT / 'user_data' / 'strategies')],

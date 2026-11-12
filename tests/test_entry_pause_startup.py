@@ -57,12 +57,14 @@ class EntryPauseStartupTests(unittest.TestCase):
             try:
                 assert strategy.entry_pause is not None
                 assert strategy.entry_pause.monitor is not None
+                assert strategy.position_monitor is not None
                 assert exchange._assistant_risk_guard
                 assert exchange._assistant_entry_receipts
             finally:
                 strategy._health_publisher.close()
                 for monitor in (strategy.market_monitor, strategy.extreme_volume_monitor,
-                                strategy.condition_monitor, strategy.entry_pause.monitor):
+                                strategy.condition_monitor, strategy.entry_pause.monitor,
+                                strategy.position_monitor):
                     monitor.close()
         '''
         )

@@ -52,7 +52,8 @@ class AlertQueue:
                 dict(row)
                 for row in db.execute(
                     'SELECT * FROM alerts WHERE due<=? '
-                    "ORDER BY (key LIKE 'market-volume:%' OR key LIKE 'market-watch:%'),"
+                    "ORDER BY (key LIKE 'market-volume:%' OR key LIKE 'market-watch:%' "
+                    "OR key LIKE 'market-position:%'),"
                     'due,created,key LIMIT ?',
                     (stamp, limit),
                 )

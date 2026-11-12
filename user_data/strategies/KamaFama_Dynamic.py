@@ -34,6 +34,7 @@ from entry_risk import (
     install_risk_guard,
 )
 from market_monitor import HourlyMarketMonitor, SharedVolumeCandles
+from position_monitor import PositionMonitor
 from market_alerts import MarketAlerts
 from extreme_volume_alerts import ExtremeVolumeMonitor
 from condition_watch import WatchStore, ConditionMonitor
@@ -94,6 +95,7 @@ class KamaFama_Dynamic(IStrategy):
         self._risk_request_ref = None
         self._state_lock = RLock()
         self.market_monitor = None
+        self.position_monitor = None
         self.extreme_volume_monitor = None
         self.entry_pause = None
         self.condition_monitor = None
@@ -117,6 +119,10 @@ class KamaFama_Dynamic(IStrategy):
                 exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
                 futures=self.config.get('trading_mode', 'futures') == 'futures',
                 alerts=MarketAlerts(Path(self.state_file).with_name('market_alert_state.json')),
+            )
+            self.position_monitor = PositionMonitor(
+                exchange_name=self.config.get('exchange', {}).get('name', 'binance'),
+                futures=self.config.get('trading_mode', 'futures') == 'futures',
             )
             volume_candles = SharedVolumeCandles()
             self.extreme_volume_monitor = ExtremeVolumeMonitor(
@@ -224,6 +230,11 @@ class KamaFama_Dynamic(IStrategy):
             self.extreme_volume_monitor.tick(current_time)
         if self.condition_monitor:
             self.condition_monitor.tick(current_time)
+        if self.position_monitor:
+            try:
+                self.position_monitor.tick(current_time, self, Trade.get_open_trades())
+            except Exception as error:
+                logger.warning('Position reports unavailable (%s)', type(error).__name__)
         if self.market_monitor:
             for message in self.market_monitor.tick(current_time):
                 self.dp.send_msg(message, always_send=True)
@@ -241,6 +252,8 @@ class KamaFama_Dynamic(IStrategy):
             future.cancel()
         if self.market_monitor:
             self.market_monitor.close()
+        if self.position_monitor:
+            self.position_monitor.close()
         if self.entry_pause and self.entry_pause.monitor:
             self.entry_pause.monitor.close()
         if self.extreme_volume_monitor:

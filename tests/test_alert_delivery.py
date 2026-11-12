@@ -32,6 +32,13 @@ class AlertDeliveryTests(unittest.TestCase):
         restored.acknowledge(restored.pending(now=101)[0])
         self.assertEqual(restored.pending(now=102), [])
 
+    def test_hourly_position_advisory_cannot_outrank_critical_trade_alert(self):
+        self.queue.put_market_once(
+            'market-position:1:1', 'position report', group='position:1:1', now=100
+        )
+        self.queue.put('stop:1', 'stop needs attention', now=101)
+        self.assertEqual(self.queue.pending(limit=1, now=101)[0]['message'], 'stop needs attention')
+
     def test_actual_send_failure_survives_restart_and_retries_after_delay(self):
         module = load_telegram()
         bot = object.__new__(module.Telegram)
