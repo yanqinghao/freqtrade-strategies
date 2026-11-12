@@ -17,6 +17,110 @@ from entry_lifecycle import (
     _reconcile_intent,
 )
 from entry_risk import number, saved_plan, effective_stop, observed_quantities
+from entry_pause import ENDED as PAUSE_ENDS
+
+
+PAUSE_PHASES = {'paused', 'canceling', 'resuming', 'submitting', 'unknown'}
+PAUSE_LABELS = {
+    'paused': '暂停',
+    'canceling': '撤单核对中',
+    'resuming': '恢复提交中',
+    'submitting': '提交核对中',
+    'unknown': '回执待核实',
+}
+
+
+def pause_plans(owner):
+    store = getattr(owner._rpc._freqtrade.strategy, 'entry_requests', None)
+    if store is None:
+        return []
+    return sorted(
+        (
+            meta
+            for meta in store.pauses()
+            if meta['phase'] in PAUSE_PHASES
+            and (meta['decision'] not in PAUSE_ENDS or meta['phase'] != 'paused')
+        ),
+        key=lambda m: (m['created'], m['ref']),
+        reverse=True,
+    )
+
+
+def pause_trade(meta, trades):
+    """Match only durable order/trade identities, never another position in the same coin."""
+    for trade in trades:
+        if trade.pair != meta['request']['pair'] or trade.is_short != (
+            meta['request']['direction'] == 'short'
+        ):
+            continue
+        # Zero-fill trades are deleted and SQLite may reuse their numeric id.
+        # A real entry order id or request tag is the durable association proof.
+        if any(
+            (meta.get('order_id') is not None and str(order.order_id) == str(meta['order_id']))
+            or (order.ft_order_tag or '').endswith('|req=' + meta['attempt_ref'])
+            for order in trade.orders
+            if order.ft_order_side == trade.entry_side
+        ):
+            return trade
+    return None
+
+
+def pause_snapshot(owner, ref):
+    strategy = owner._rpc._freqtrade.strategy
+    meta = strategy.entry_requests.get_pause(ref)
+    if meta is None:
+        raise ValueError('暂停计划不存在，请返回订单列表。')
+    trade = pause_trade(meta, Trade.get_open_trades())
+    row = strategy.entry_requests.get(meta['attempt_ref'])
+    uncertain = meta['phase'] in ('unknown', 'resuming', 'submitting') or (
+        row is not None and row['state'] in ('submitting', 'unknown')
+    )
+    state = dict(
+        ref=ref,
+        phase=meta['phase'],
+        attempt_ref=meta['attempt_ref'],
+        ended=meta['decision'] if meta['decision'] in PAUSE_ENDS else None,
+        request=meta['request'],
+        deadline=meta['deadline'],
+        created=meta['created'],
+        version=meta.get('version', 1),
+        trade_id=trade.id if trade else None,
+        amount=float(trade.amount) if trade else None,
+        observed_amount=float(observed_quantities(trade)[0]) if trade else None,
+        orders=[
+            (str(o.order_id), o.status, o.ft_is_open, float(o.safe_filled)) for o in trade.orders
+        ]
+        if trade
+        else [],
+        receipt_state=row['state'] if row else None,
+    )
+    revision = hashlib.sha256(
+        json.dumps(state, sort_keys=True, allow_nan=False).encode()
+    ).hexdigest()
+    return dict(
+        meta=deepcopy(meta),
+        revision=revision,
+        uncertain=uncertain,
+        trade_id=trade.id if trade else None,
+        can_cancel=meta['phase'] in PAUSE_PHASES
+        and meta['decision'] not in PAUSE_ENDS
+        and datetime.now(timezone.utc).timestamp() < meta['deadline'],
+    )
+
+
+def cancel_pause(owner, ref, revision):
+    data = pause_snapshot(owner, ref)
+    if data['revision'] != revision:
+        raise ValueError('计划阶段、订单或成交已变化，请刷新详情后重试。')
+    if not data['can_cancel']:
+        raise ValueError('该计划已结束、已恢复挂单或已有成交，请刷新并在订单详情核对。')
+    controller = owner._rpc._freqtrade.strategy.entry_pause
+    if controller is None:
+        raise ValueError('暂停计划控制尚未启动，请稍后重试。')
+    controller.cancel(ref)
+    if data['uncertain'] or data['meta']['phase'] == 'canceling' or data['trade_id'] is not None:
+        return '已取消后续自动恢复；已有订单或提交回执仍需核对，已有成交继续按原计划保护。'
+    return '已取消暂停计划，不再自动恢复挂单。'
 
 
 def get_trade(ident):
@@ -146,6 +250,9 @@ def snapshot(owner, ident):
         checked=datetime.now(timezone.utc).strftime('%m-%d %H:%M:%S UTC'),
     )
     data.update(position_profit(trade, rate))
+    data['pause_ref'] = next(
+        (m['ref'] for m in pause_plans(owner) if pause_trade(m, [trade]) is not None), None
+    )
     data['deadline'] = None
     if len(entries) == 1:
         order = trade.select_order_by_order_id(entries[0]['id'])

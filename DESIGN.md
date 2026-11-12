@@ -51,3 +51,9 @@ omitted:
 | Capability | Canonical owner | Source of truth | Allowed variants | Verification |
 |---|---|---|---|---|
 | 自动推送卡片 | notification_format.py | DESIGN.md | 原生Markdown转义、队列/守护纯文本 | test_notification_format.py、各通知语义回归、test_alert_delivery.py |
+
+## 暂停入场计划
+
+`/orders`、`/status table` 的全部/挂单包含暂停入场计划，并提供暂停筛选。纯计划使用独立计划编号，标明暂停未挂单或回执待核实；不计入持仓/浮盈亏。有本地真实交易关联时只显示一行，在订单详情提供暂停计划入口。列表6条分页、返回和刷新、身份/topic/消息绑定沿用订单面板。
+
+计划详情显示原挂价、保证金与杠杆、SL/TP和收盘规则、暂停原因及到期时间。取消经过确认并重读稳定版本，阶段、尝试身份、参数或实际订单/成交变化时拒绝旧确认；行情诊断更新不影响取消。取消只持久停止未来自动恢复，已有成交沿原保护管理；未知回执或撤单中不能声称交易所已撤单，仍保留可见核对入口。不得借此自动全平、改价或重新挂单，也不新增快捷键恢复提示。

@@ -10,6 +10,8 @@ from telegram.error import TelegramError
 from freqtrade.persistence import Trade
 from freqtrade.rpc._telegram_base import authorized_only
 from candle_exits import RULE_GROUPS, TIMEFRAMES, describe_rules
+from entry_volume import PAUSE_REASONS
+from notification_format import local_time
 from entry_risk import number
 from freqtrade.rpc import order_management as management
 
@@ -30,7 +32,14 @@ KINDS = {'pending': '挂单未成交', 'partial': '部分成交 / 入场余量',
 def order_list(owner, scope, page):
     rows, profits = [], []
     missing, positions = 0, 0
-    for trade in Trade.get_open_trades():
+    trades = Trade.get_open_trades()
+    pauses = management.pause_plans(owner)
+    linked = {}
+    for meta in pauses:
+        trade = management.pause_trade(meta, trades)
+        if trade is not None:
+            linked[trade.id] = meta
+    for trade in trades:
         pending = any(o.ft_order_side == trade.entry_side for o in trade.open_orders)
         rate = None
         if trade.amount > 0:
@@ -47,7 +56,11 @@ def order_list(owner, scope, page):
                 missing += 1
             else:
                 profits.append(pnl['profit_abs'])
-        if scope == 'pending' and not pending or scope == 'position' and pnl['pnl_status'] == '未成交':
+        if (
+            (scope == 'pending' and not pending and trade.id not in linked)
+            or (scope == 'position' and pnl['pnl_status'] == '未成交')
+            or (scope == 'paused' and trade.id not in linked)
+        ):
             continue
         kind = '部分成交' if pending and trade.amount > 0 else ('挂单' if pending else '持仓')
         if pnl['pnl_status'] == '成交待记账':
@@ -58,11 +71,35 @@ def order_list(owner, scope, page):
                 label=(
                     f"#{trade.id} {trade.pair.split('/')[0]} "
                     f"{'空' if trade.is_short else '多'} · {kind}"
+                    + (
+                        ' · ' + management.PAUSE_LABELS[linked[trade.id]['phase']]
+                        if trade.id in linked
+                        else ''
+                    )
                 ),
                 **pnl,
             )
         )
     rows.sort(key=lambda row: row['id'], reverse=True)
+    if scope != 'position':
+        plans = []
+        for meta in pauses:
+            if management.pause_trade(meta, trades) is not None:
+                continue
+            request = meta['request']
+            plans.append(
+                dict(
+                    id='pause:' + meta['ref'],
+                    pause_ref=meta['ref'],
+                    label=f"暂停#{meta['ref'][:8]} {request['pair'].split('/')[0]} "
+                    f"{'空' if request['direction'] == 'short' else '多'} · "
+                    + management.PAUSE_LABELS[meta['phase']],
+                    profit=None,
+                    profit_abs=None,
+                    pnl_status='入场计划 · 不计浮盈亏',
+                )
+            )
+        rows = plans + rows
     pages = max(1, (len(rows) + 5) // 6)
     page = min(max(0, page), pages - 1)
     return dict(
@@ -227,14 +264,38 @@ class OrderPanelMixin:
         def button(label, **data):
             return self._panel_button(update, label, **data)
 
-        labels = {'all': '全部', 'pending': '挂单', 'position': '持仓'}
+        labels = {'all': '全部', 'pending': '挂单', 'position': '持仓', 'paused': '暂停'}
         buttons = [
             [
                 button(('· ' if scope == key else '') + label, action='list', scope=key, page=0)
                 for key, label in labels.items()
+                if key != 'paused'
             ]
         ]
-        buttons += [[button(row['label'], action='detail', id=row['id'])] for row in rows]
+        buttons.append(
+            [
+                button(
+                    ('· ' if scope == 'paused' else '') + '暂停',
+                    action='list',
+                    scope='paused',
+                    page=0,
+                )
+            ]
+        )
+        buttons += [
+            [
+                button(
+                    row['label'],
+                    action='detail',
+                    **(
+                        {'pause_ref': row['pause_ref']}
+                        if row.get('pause_ref')
+                        else {'id': row['id']}
+                    ),
+                )
+            ]
+            for row in rows
+        ]
         navigation = []
         if page:
             navigation.append(button('上一页', action='list', scope=scope, page=page - 1))
@@ -388,7 +449,75 @@ class OrderPanelMixin:
             lines.append('\n' + data['error'] + '\n交易按钮暂不可用。')
         elif data['full_exit']:
             lines.append('已有全平意图，请核对 /order 与 /request，等待实际结果。')
+        if data.get('pause_ref'):
+            buttons.append([button('暂停计划详情', action='detail', pause_ref=data['pause_ref'])])
         buttons.append([button('刷新', action='detail', id=ident), button('返回列表', action='list')])
+        await self._panel_send(
+            update, (notice + '\n\n' if notice else '') + '\n'.join(filter(None, lines)), buttons
+        )
+
+    async def _panel_pause_detail(self, update, ref, notice=''):
+        data = await self._await_command(management.pause_snapshot, self, ref)
+        meta, request = data['meta'], data['meta']['request']
+        ended = management.PAUSE_ENDS
+        status = (
+            PAUSE_REASONS[meta['decision']]
+            if meta['decision'] in ended
+            else management.PAUSE_LABELS.get(meta['phase'], '状态已变化')
+        )
+        lines = [
+            f"暂停计划 {ref[:8]} · {request['pair']} · "
+            f"{'空' if request['direction'] == 'short' else '多'} · {status}"
+        ]
+        if data['uncertain'] or meta['phase'] == 'canceling':
+            lines.append('订单/提交回执仍需核对，不能视为未挂单或零成交。')
+        elif meta['phase'] == 'paused' and data['trade_id'] is None:
+            lines.append('暂停，未挂到交易所；不计持仓盈亏。')
+        elif meta['phase'] == 'watching':
+            lines.append('已恢复挂单，请在订单详情管理或撤单。')
+        reason = PAUSE_REASONS.get(meta['decision'])
+        if reason and meta['decision'] not in ended:
+            lines.append('原因：' + reason)
+        if meta.get('check_error'):
+            lines.append('最近检查：' + meta['check_error']['reason'])
+        if meta.get('last_rejection'):
+            lines.append('最近提交前拒绝：' + meta['last_rejection']['message'])
+        if data['uncertain']:
+            lines.append('回执核对：/request ' + meta['attempt_ref'])
+        for key, label in (('quiet_until', '安静期门槛'), ('continuity_until', '连续观察门槛')):
+            value = meta.get('last_check', {}).get(key)
+            if value is not None:
+                lines.append(label + '：' + local_time(value))
+        lines += [
+            f"原挂价：{request['entry_price']:g}",
+            f"保证金：{request['size']:g} USDT · 杠杆 {request['leverage']:g}倍",
+            f"硬SL：{request['stop_loss']:g}",
+            'TP：' + ' / '.join(f'{value:g}' for value in request.get('exit_points', [])),
+            describe_rules(request),
+            '原到期时间：' + local_time(meta['deadline']),
+            '计划编号：' + ref,
+        ]
+        if meta.get('retry_after') and meta['phase'] == 'paused' and meta['decision'] not in ended:
+            lines.append('重试时间门槛：' + local_time(meta['retry_after']))
+        buttons = []
+        if data['can_cancel']:
+            buttons.append(
+                [
+                    self._panel_button(
+                        update, '取消计划', action='pause_confirm', ref=ref, revision=data['revision']
+                    )
+                ]
+            )
+        if data['trade_id'] is not None:
+            buttons.append(
+                [self._panel_button(update, '查看关联订单', action='detail', id=data['trade_id'])]
+            )
+        buttons.append(
+            [
+                self._panel_button(update, '刷新', action='detail', pause_ref=ref),
+                self._panel_button(update, '返回列表', action='list'),
+            ]
+        )
         await self._panel_send(
             update, (notice + '\n\n' if notice else '') + '\n'.join(filter(None, lines)), buttons
         )
@@ -446,7 +575,42 @@ class OrderPanelMixin:
                 await self._panel_list(update, payload.get('scope', 'all'), payload.get('page', 0))
             elif action == 'detail':
                 getattr(self, '_panel_edits', {}).pop(self._panel_identity(update), None)
-                await self._panel_detail(update, payload['id'])
+                if payload.get('pause_ref'):
+                    await self._panel_pause_detail(update, payload['pause_ref'])
+                else:
+                    await self._panel_detail(update, payload['id'])
+            elif action == 'pause_confirm':
+                data = await self._await_command(management.pause_snapshot, self, payload['ref'])
+                if not data['can_cancel'] or data['revision'] != payload['revision']:
+                    raise ValueError('暂停计划状态已变化，请刷新详情后重试。')
+                request = data['meta']['request']
+                await self._panel_send(
+                    update,
+                    f"确认取消暂停计划 · {request['pair']} · 原挂价 {request['entry_price']:g}\n"
+                    '取消后不再自动恢复。已有订单或未知回执仍须核对；已有成交继续按原计划保护。',
+                    [
+                        [
+                            self._panel_button(
+                                update,
+                                '确认取消',
+                                action='pause_cancel',
+                                ref=payload['ref'],
+                                revision=data['revision'],
+                            )
+                        ],
+                        [
+                            self._panel_button(
+                                update, '返回详情', action='detail', pause_ref=payload['ref']
+                            )
+                        ],
+                    ],
+                )
+            elif action == 'pause_cancel':
+                async with self._manual_order_lock:
+                    result = await self._await_command(
+                        management.cancel_pause, self, payload['ref'], payload['revision']
+                    )
+                await self._panel_pause_detail(update, payload['ref'], result)
             elif action == 'edit':
                 if payload['field'].endswith('_tf'):
                     await self._panel_choose_tf(update, payload)
