@@ -135,3 +135,20 @@ clone carrying the reviewed 425-test version; no new production action authorize
 - Project pre-commit Black reformatted six Python files. AST equivalence with
   the reviewed version was verified for all six, then all 428 release tests
   passed again in 61.847s. No hooks were skipped.
+- Implementation commit `706cf1d` was pushed to origin/main before cutover.
+  Candidate image `sha256:55078fc1b69dae203a366216d4804d02d43a21feb9cff912b4be4c207c4348da`
+  started at 2026-11-12 03:38:44 UTC (11:38:44 Beijing), restart count 0.
+- RUNNING heartbeats and advancing native trading-loop timestamps verified;
+  no ERROR/CRITICAL startup messages. Risk guard installed, five runtime source
+  hashes match the pushed release. Watchdog was not recreated.
+- BTC original intent `41299c66f0abfda4bc95d8f9` moved from `waiting_range` to
+  `waiting_continuity`; original E=73100 and original deadline remain intact,
+  attempts=0. No successful restoration claimed before the fresh observation
+  period completes.
+- Existing SKYAI entry order `2796285157` was adopted as plan
+  `77cb8aaf9ddb3ed06b9df1c1`. Recent adverse volume triggered withdrawal; exchange
+  receipt is canceled with filled=0, original amount=2770. Native zero-fill
+  cleanup completed, preserving E=0.0361 and original deadline in the pause
+  ledger. Plan now waits for continuity, attempts=0. No duplicate entry submitted.
+- No trading database was restored; rollback source/image and private state
+  snapshots remain available in the recorded ignored archive.
