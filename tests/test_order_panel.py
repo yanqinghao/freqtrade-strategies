@@ -20,7 +20,10 @@ def update(user=7, message=10, query=False, reply=None):
         effective_message=msg,
         message=None if query else msg,
         callback_query=SimpleNamespace(
-            message=msg, answer=AsyncMock(), edit_message_text=AsyncMock()
+            message=msg,
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
         )
         if query
         else None,
@@ -146,8 +149,9 @@ class OrderPanelTests(unittest.TestCase):
 
         u = update()
         button = self.bot._panel_button(u, '返回列表', action='list')
-        asyncio.run(self.bot._panel_send(u, '订单管理', [[button]]))
+        asyncio.run(self.bot._panel_send(u, '订单管理\n#1 BTC · 挂单', [[button]]))
         calls = self.bot._app.bot.send_message.call_args_list
+        self.assertEqual([c.kwargs['text'] for c in calls], ['订单管理', '#1 BTC · 挂单'])
         keyboard = calls[0].kwargs['reply_markup']
         self.assertIsInstance(keyboard, ReplyKeyboardMarkup)
         self.assertTrue(keyboard.is_persistent)
@@ -171,15 +175,16 @@ class OrderPanelTests(unittest.TestCase):
         asyncio.run(
             self.bot._panel_send(u, '已取消', [[self.bot._panel_button(u, '返回', action='list')]])
         )
-        self.assertEqual(self.bot._app.bot.send_message.call_count, before + 1)
-        sent = self.bot._app.bot.send_message.call_args.kwargs
+        self.assertEqual(self.bot._app.bot.send_message.call_count, before + 2)
+        sent = self.bot._app.bot.send_message.call_args_list[-2].kwargs
+        self.assertEqual(sent['text'], '已取消')
         self.assertIsInstance(sent['reply_markup'], ReplyKeyboardMarkup)
         self.assertEqual(sent['message_thread_id'], 42)
         self.assertTrue(sent['disable_notification'])
         asyncio.run(
             self.bot._panel_send(u, '再次刷新', [[self.bot._panel_button(u, '返回', action='list')]])
         )
-        self.assertEqual(self.bot._app.bot.send_message.call_count, before + 1)
+        self.assertEqual(self.bot._app.bot.send_message.call_count, before + 2)
 
     def test_reply_saves_single_existing_rule_value_and_duplicate_reply_is_ignored(self):
         self.bot._panel_edits = {
@@ -239,3 +244,42 @@ class OrderPanelTests(unittest.TestCase):
             self.bot._await_command.call_args.args[-1],
             {'extend_trigger': 125, 'extend_tp3': 150, 'extend_tf': '4h'},
         )
+
+
+class QuietKeyboardErrors(unittest.TestCase):
+    setUp = OrderPanelTests.setUp
+
+    def test_plain_error_restores_keyboard_in_the_error_message_itself(self):
+        from telegram import ReplyKeyboardMarkup
+
+        u = update(query=True)
+        self.bot._panel_reply_active = {self.bot._panel_identity(u)}
+        asyncio.run(self.bot._panel_send(u, '输入已过期，未修改。'))
+        calls = self.bot._app.bot.send_message.call_args_list
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].kwargs['text'], '输入已过期，未修改。')
+        self.assertFalse(calls[0].kwargs['disable_notification'])
+        self.assertIsInstance(calls[0].kwargs['reply_markup'], ReplyKeyboardMarkup)
+        self.assertNotIn(self.bot._panel_identity(u), self.bot._panel_reply_active)
+
+    def test_failed_old_button_cleanup_keeps_new_result_and_message_binding(self):
+        from telegram.error import TelegramError
+
+        u = update(query=True)
+        self.bot._panel_reply_active = {self.bot._panel_identity(u)}
+        old = self.bot._panel_button(u, '确认', action='do')
+        button = self.bot._panel_button(u, '返回', action='list')
+        self.bot._app.bot.send_message.side_effect = [
+            SimpleNamespace(message_id=101),
+            SimpleNamespace(message_id=102),
+        ]
+        u.callback_query.edit_message_reply_markup.side_effect = TelegramError('old message gone')
+        with self.assertLogs('freqtrade.rpc.order_panel', level='WARNING'):
+            asyncio.run(self.bot._panel_send(u, '已取消\n订单详情', [[button]]))
+        u.callback_query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+        self.assertEqual(
+            self.bot._panel_take(update(message=102), button.callback_data[3:]), {'action': 'list'}
+        )
+        for ident, token in ((10, button.callback_data[3:]), (10, old.callback_data[3:])):
+            with self.assertRaises(ValueError):
+                self.bot._panel_take(update(message=ident), token)

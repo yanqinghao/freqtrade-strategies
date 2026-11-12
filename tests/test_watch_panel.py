@@ -140,8 +140,10 @@ class WatchPanelTests(unittest.TestCase):
         self.finish('反弹受阻')
         self.click('修改收盘确认价')
         self.reply('98')
-        self.assertIn('确认创建', self.sent[-1]['text'])
-        self.assertIn('98', self.sent[-1]['text'])
+        # The real heading carries the reply keyboard; controls stay on the body.
+        review = '\n'.join(item['text'] for item in self.sent[-2:])
+        self.assertEqual(review.count('确认创建'), 1)
+        self.assertIn('98', review)
         self.click('确认创建')
         w = self.store.list([123, 7, None])[0]
         self.assertEqual(w['spec']['confirm'], 98)

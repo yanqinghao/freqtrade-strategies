@@ -6,6 +6,7 @@ from math import fsum
 from datetime import datetime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, ReplyKeyboardMarkup
+from telegram.error import TelegramError
 from freqtrade.persistence import Trade
 from freqtrade.rpc._telegram_base import authorized_only
 from candle_exits import RULE_GROUPS, TIMEFRAMES, describe_rules
@@ -138,20 +139,21 @@ class OrderPanelMixin:
             parse_mode=None,
         )
 
-    async def _panel_restore_keyboard(self, update):
+    async def _panel_restore_keyboard(self, update, text, *, silent=True):
         if not hasattr(self, '_keyboard'):
             self._init_keyboard()
-        await self._app.bot.send_message(
+        result = await self._app.bot.send_message(
             chat_id=update.effective_chat.id,
-            text='底部快捷命令已恢复。',
+            text=text,
             message_thread_id=update.effective_message.message_thread_id,
             reply_markup=ReplyKeyboardMarkup(
                 self._keyboard, resize_keyboard=True, one_time_keyboard=False, is_persistent=True
             ),
-            disable_notification=True,
+            disable_notification=silent,
             parse_mode=None,
         )
         getattr(self, '_panel_reply_active', set()).discard(self._panel_identity(update))
+        return result
 
     async def _panel_send(self, update, text, buttons=None, *, prompt=False, keep_reply=False):
         markup = InlineKeyboardMarkup(buttons or [])
@@ -181,9 +183,23 @@ class OrderPanelMixin:
                 or (not query and not update.effective_message.reply_to_message)
             )
         ):
-            # Inline controls and the bottom reply keyboard need separate messages.
-            # Restore only on entry/after input, never after every button click.
-            await self._panel_restore_keyboard(update)
+            # Carry the persistent keyboard on real content, never a housekeeping notice.
+            # Telegram permits one markup per message: title + body carry the two keyboards.
+            if buttons:
+                heading, _, body = text.partition('\n')
+                text = body.strip() or ('可选操作：' + '、'.join(b.text for row in buttons for b in row))
+                await self._panel_restore_keyboard(update, heading)
+            else:
+                result = await self._panel_restore_keyboard(update, text, silent=False)
+            if query:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except TelegramError as error:
+                    # Old mutation tokens are already invalidated; don't hide the new result.
+                    logger.warning('Unable to clear old panel controls (%s)', type(error).__name__)
+            if not buttons:
+                return result
+            query = None
         if prompt:
             result = await self._panel_input(update, text)
             message_id = result.message_id
