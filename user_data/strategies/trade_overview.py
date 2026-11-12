@@ -7,7 +7,7 @@ from entry_risk import effective_stop, estimate_exposure, load_limits, number, s
 from candle_exits import describe_rules
 
 
-def _protection(trade, state, quantity, goal, now):
+def _protection(trade, state, quantity, goal, now, *, compact=False):
     if not quantity:
         return '交易所SL：未成交，暂无已观察仓位的保护确认。'
     row = state.get('protection') or {}
@@ -35,6 +35,8 @@ def _protection(trade, state, quantity, goal, now):
             label = '核验价落后当前目标'
         else:
             label = '最近核验快照'
+        if compact:
+            return f'交易所SL：{label}，触发 {price:g}，覆盖 {covered:g}'
         return f'交易所SL：{label}，触发 {price:g}，覆盖 {covered:g}；' f'{checked_at:%Y-%m-%d %H:%M:%S} UTC。'
     except Exception:
         return '交易所SL：核验数据不可用，请核对交易所。'

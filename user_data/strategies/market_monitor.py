@@ -8,6 +8,7 @@ from math import isfinite
 from threading import Lock
 
 import pandas as pd
+from notification_format import notice, local_time
 
 logger = logging.getLogger(__name__)
 MONITOR_PAIRS = ('BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT')
@@ -112,7 +113,7 @@ def build_reports(fetch, now, *, compact=False):
     reports = []
     summaries = []
     for pair in MONITOR_PAIRS:
-        lines = [f"{pair.split('/')[0]} 日线 / 4小时监控", f"生成时间：{now:%Y-%m-%d %H:%M} UTC"]
+        lines = []
         trends = {}
         results = {}
         volume_note = ''
@@ -138,7 +139,7 @@ def build_reports(fetch, now, *, compact=False):
                             volume_note = f'；15m放量 {volumes[-1] / mean:.2f}倍（单独放量不确认方向）'
                 lines.extend(
                     [
-                        f"\n{label}：{result['trend']}（收盘 {result['closed_at']:%m-%d %H:%M} UTC）",
+                        f"\n{label}：{result['trend']}（收盘 {local_time(result['closed_at'])}）",
                         f"收盘参考价 {result['close']:.8g} | "
                         f"EMA20 {result['ema20']:.8g} | EMA50 {result['ema50']:.8g}",
                     ]
@@ -158,22 +159,26 @@ def build_reports(fetch, now, *, compact=False):
                     'Market report unavailable for %s %s', pair, timeframe, exc_info=True
                 )
                 lines.append(f'\n{label}：行情暂不可用。')
-        lines.append('\n走势分区：' + classify_regime(trends))
-        lines.append('下一步观察：' + observation(trends))
-        lines.append('\n点位仅来自已收盘日线与4小时K线；1小时、15分钟仅判断当前走势。不触发下单。')
-        reports.append('\n'.join(lines))
+        reports.append(
+            notice(
+                '行情详情',
+                pair.split('/')[0],
+                summary=[classify_regime(trends)],
+                sections=[('周期与点位', lines)],
+                action=observation(trends) + ' 参考已收盘K线，不触发下单。',
+                at=now,
+            )
+        )
         summary = [
-            pair.split('/')[0],
-            '｜'.join(
-                label + trends.get(timeframe, '不可用')
-                for timeframe, label in (('1d', '日线'), ('4h', '4h'), ('1h', '1h'), ('15m', '15m'))
-            ),
+            pair.split('/')[0] + ' · ' + classify_regime(trends),
+            '日线 ' + trends.get('1d', '不可用') + ' / 4h ' + trends.get('4h', '不可用'),
+            '1h ' + trends.get('1h', '不可用') + ' / 15m ' + trends.get('15m', '不可用'),
         ]
         reference = results.get('15m')
         if '15m' in results:
             summary.append(
                 f"15m收盘 {reference['close']:.8g}"
-                f"（{reference['closed_at']:%m-%d %H:%M} UTC）{volume_note}"
+                f"（{local_time(reference['closed_at'])}）{volume_note}"
             )
         else:
             summary.append('15m收盘价不可用，暂不计算距离')
@@ -182,16 +187,20 @@ def build_reports(fetch, now, *, compact=False):
             close = reference['close'] if reference else None
             support = level_distance(result['support'], close, support=True)
             resistance = level_distance(result['resistance'], close, support=False)
-            summary.append(f'4h支撑 {support} / 阻力 {resistance}')
+            summary.extend([f'4h支撑：{support}', f'4h阻力：{resistance}'])
         else:
             summary.append('4h行情暂不可用')
         summary.append('观察：' + observation(trends))
         summaries.append('\n'.join(summary))
     if compact:
         return [
-            f'【行情简报】{now:%m-%d %H:%M} UTC\n\n'
-            + '\n\n'.join(summaries)
-            + '\n\n/monitor 查看周期详情；仅为观察条件，不是开仓信号。'
+            notice(
+                '行情简报',
+                'BTC / ETH / SOL',
+                sections=[('', [part]) for part in summaries],
+                action='/monitor 查看周期详情；仅为观察条件，不是开仓信号。',
+                at=now,
+            )
         ]
     return reports
 
@@ -302,7 +311,7 @@ class HourlyMarketMonitor:
                 try:
                     alerts = self._alerts.check(fetch, now)
                     if alerts:
-                        messages.append('【关键异动】\n' + '\n\n'.join(alerts))
+                        messages.append('\n\n'.join(alerts))
                 except Exception:
                     logger.exception('Closed-candle monitoring failed; hourly reports retained')
             return messages

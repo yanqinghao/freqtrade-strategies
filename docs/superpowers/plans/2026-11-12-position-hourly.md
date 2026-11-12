@@ -47,7 +47,7 @@ alert tests, README, startup regression tests.
   and lower advisory priority without changing critical notification behavior.
 - [x] Run cached project hooks before final pinned offline full suite; obtain
   fresh review and resolve material findings with failing regressions.
-- [ ] Prepare candidate source/image and return verified code; record release state.
+- [x] Prepare candidate source/image and return verified code; record release state.
 
 ## Ledger
 
@@ -92,3 +92,10 @@ alert tests, README, startup regression tests.
   `.assistant-archive/hourly-positions-20261112T045420Z`.
 - Pre-release records include actual SKYAI position and an unfilled BTC entry;
   only SKYAI is eligible for a held-position report at that snapshot.
+
+- Released source f2a86ab at 2026-11-12 04:58:30 UTC on existing image
+  sha256:55078fc1b69dae203a366216d4804d02d43a21feb9cff912b4be4c207c4348da.
+  Source hashes matched, native RUNNING/heartbeat healthy, restart count zero.
+- Startup public metadata cold-load timed out twice; worker recovered.
+  SKYAI #18 reports for slots 498460 and 498461 entered persistent queue and
+  were acknowledged before expiry. Unfilled BTC entry was excluded.

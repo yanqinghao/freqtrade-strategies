@@ -163,10 +163,10 @@ class MarketMonitorTests(unittest.TestCase):
         message = self.module.build_reports(
             lambda p, t: self.candles(t, descending=t == '1d'), self.now, compact=True
         )[0]
-        self.assertIn('日线偏空｜4h偏多｜1h偏多｜15m偏多', message)
+        self.assertIn('日线 偏空 / 4h 偏多\n1h 偏多 / 15m 偏多', message)
         self.assertIn('距支撑 34.08%', message)  # (179 - 118) / 179
         self.assertIn('距阻力 1.12%', message)  # (181 - 179) / 179
-        self.assertIn('11-03 12:00', message)
+        self.assertIn('11-03 20:00:00 北京时间', message)
         self.assertNotIn('日线支撑', message)
         self.assertNotIn('观察：观察', message)
 
@@ -189,7 +189,7 @@ class MarketMonitorTests(unittest.TestCase):
 
         with self.assertLogs('market_monitor', level='WARNING'):
             message = self.module.build_reports(fetch, self.now, compact=True)[0]
-        self.assertIn('15m不可用', message)
+        self.assertIn('15m 不可用', message)
         self.assertIn('距离不可用', message)
         self.assertNotIn('距支撑', message)
 

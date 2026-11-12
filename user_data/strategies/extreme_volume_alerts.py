@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from math import isfinite
 
 from market_monitor import MONITOR_PAIRS, HourlyMarketMonitor
+from notification_format import notice, local_time
 
 logger = logging.getLogger(__name__)
 WIDTH = 300000
@@ -75,16 +76,23 @@ class ExtremeVolumeAlerts:
                     )
                     phase = '盘中·未收盘' if event['forming'] else '刚收盘'
                     opened = datetime.fromtimestamp(event['candle'] / 1000, timezone.utc)
-                    message = '\n'.join(
-                        [
-                            f"【极端放量】{coin} · {direction} · 5m{phase}",
-                            f'检测时间：{now:%m-%d %H:%M:%S} UTC',
-                            f'本根开始：{opened:%m-%d %H:%M} UTC',
-                            f"最新价 {event['close']:.8g} | 本根涨跌 {event['change']:+.2f}%",
-                            f"量比 {event['ratio']:.2f}倍（此前24根已收盘5m均量）",
-                            f"本根累计 {event['volume']:.8g} {coin} / 均量 {event['average']:.8g} {coin}",
-                            '请留意持仓与挂单；量能提示不代表趋势确认。',
-                        ]
+                    message = notice(
+                        '极端放量',
+                        f'{coin} · {direction} · 5m{phase}',
+                        summary=[f"量比：{event['ratio']:.2f}倍 / 本根涨跌 {event['change']:+.2f}%"],
+                        sections=[
+                            (
+                                '行情',
+                                [
+                                    f"最新价：{event['close']:.8g}",
+                                    f"本根累计：{event['volume']:.8g} {coin}",
+                                    f"此前24根5m均量：{event['average']:.8g} {coin}",
+                                    '本根开始：' + local_time(opened),
+                                ],
+                            )
+                        ],
+                        action='留意持仓与挂单；量能提示不代表趋势确认。',
+                        at=now,
                     )
                     self.queue.put_market_once(
                         f"market-volume:{coin}:{event['candle']}",

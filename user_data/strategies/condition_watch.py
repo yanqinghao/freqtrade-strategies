@@ -6,9 +6,9 @@ import time
 import uuid
 from contextlib import closing
 from copy import deepcopy
-from datetime import datetime, timezone
 
 from market_monitor import HourlyMarketMonitor, MONITOR_PAIRS, TIMEFRAMES
+from notification_format import notice, local_time
 
 logger = logging.getLogger(__name__)
 MODES = {
@@ -85,7 +85,7 @@ def validate(spec):
 
 
 def stamp(t):
-    return datetime.fromtimestamp(t, timezone.utc).strftime('%m-%d %H:%M:%S UTC')
+    return local_time(t)
 
 
 def describe(s):
@@ -249,13 +249,13 @@ def evaluate(watch, rows, quote, now):
             observe_quote()
     message = None
     if events:
-        message = (
-            f"【条件监控 #{w['id']}】{s['pair'].split('/')[0]} · {MODES[mode]}\n"
-            f"状态：{STATES[w['state']]} · {'关注做空' if short else '关注做多'}\n"
-            + '\n'.join(events)
-            + '\n'
-            + describe(s)
-            + f'\n记录时间：{stamp(now)}\n仅提醒；条件满足不代表趋势成立，也不会自动下单。'
+        message = notice(
+            f"条件监控 #{w['id']}",
+            f"{s['pair'].split('/')[0]} · {STATES[w['state']]}",
+            summary=[f"{MODES[mode]} · {'关注做空' if short else '关注做多'}"],
+            sections=[('本次变化', events), ('监控条件', describe(s).splitlines())],
+            action='用 /watch 查看；仅提醒，条件满足不代表趋势成立，也不会自动下单。',
+            at=now,
         )
     return w, message
 

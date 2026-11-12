@@ -6,6 +6,7 @@ There are deliberately no signal entries or unattended position increases.
 
 import logging
 import os
+from notification_format import notice
 from datetime import datetime, timezone
 from copy import deepcopy
 from contextlib import contextmanager
@@ -573,7 +574,12 @@ class KamaFama_Dynamic(IStrategy):
         logger.warning(message)
         key = key or message
         try:
-            self.alert_queue.put(key, message)
+            self.alert_queue.put(
+                key,
+                message
+                if message.startswith('【')
+                else notice('交易提醒', summary=message.split('。'), action='用 /order 核对当前状态。'),
+            )
             self._unsaved_alerts.pop(key, None)
             return True
         except Exception as error:
@@ -606,7 +612,15 @@ class KamaFama_Dynamic(IStrategy):
         state = self._execution(trade)
         full = state.get('full_exit') or {}
         message = full.get('notice_pending')
-        if message and self._exit_notice(message, key=f'exit:{trade.id}'):
+        if message and self._exit_notice(
+            notice(
+                '退出计划',
+                f'{trade.pair} #{trade.id}',
+                summary=message.removeprefix(trade.pair + '：').split('。'),
+                action='用 /order 核对余仓、退出订单与止损保护。',
+            ),
+            key=f'exit:{trade.id}',
+        ):
             full.pop('notice_pending', None)
             self._save_execution(trade, state)
 

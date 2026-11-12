@@ -39,3 +39,15 @@ omitted:
 | Date | UTC时间文本、明确行情健康与确认窗口 | README.md | 只读时间、有效期按钮 | tests/test_condition_watch.py |
 | Toast | AlertQueue，条件状态和提醒同事务；5分钟过期 | README.md | Telegram消息 | tests/test_condition_watch.py、tests/test_alert_delivery.py |
 | CRUD | WatchStore，取消、复制、重启恢复与去重 | README.md | 确认创建、取消、复制 | tests/test_condition_watch.py、tests/test_watch_panel.py |
+
+## 自动通知
+
+所有自动推送共用 `user_data/strategies/notification_format.py` 的纯文本卡片，不引入表格、HTML、装饰分隔线或 emoji 状态编码。先显示事件、对象和状态，其后是结论/建议，再按短段列关键数字，最后给下一步与一个明确标注的北京时间。历史触发时刻、K线收盘/确认时刻属于证据，可单独保留并标明含义；不追加重复的 UTC 状态时间。一个数字一项，同类短字段可并列。
+
+覆盖持仓、行情、异动及后续、极端放量、条件监控、入场计划/回执、止损保护、退出和独立守护。原生开平仓也采用中文相同结构；提交与成交回执、分批退出与整笔退出、待确认与已核验分别表述。原生 Markdown 发送时整体转义，队列与守护直接发送纯文本，币种下划线及错误文本不能破坏版式。
+
+持仓先列剩余仓位的浮盈亏和建议；走势分周期、支撑阻力分行，原保护与下一有效TP单列。延伸目标沿用实际执行目标。未知报价、待记账、过期核验和保护不足显式展示，不以零替代。详细原计划仍可在 /overview、/order 查看。通知不改变执行、阈值、队列优先级、去重或重试规则。
+
+| Capability | Canonical owner | Source of truth | Allowed variants | Verification |
+|---|---|---|---|---|
+| 自动推送卡片 | notification_format.py | DESIGN.md | 原生Markdown转义、队列/守护纯文本 | test_notification_format.py、各通知语义回归、test_alert_delivery.py |

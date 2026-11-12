@@ -1,6 +1,7 @@
 """Settle tracked limit entries using real cancellation receipts and native accounting."""
 import logging
 import re
+from notification_format import notice
 from math import isfinite
 from freqtrade.exceptions import ExchangeError
 from freqtrade.persistence import Trade
@@ -31,7 +32,16 @@ def _notice(strategy, trade, order_id, code, message):
     events = state.setdefault('entry_events', {})
     if events.get(str(order_id)) == code:
         return
-    if strategy._exit_notice(f'{trade.pair}：{message}', key=f'entry:{trade.id}:{order_id}'):
+    if strategy._exit_notice(
+        notice(
+            '入场回执',
+            f'{trade.pair} #{trade.id}',
+            summary=[message],
+            sections=[('订单编号', [str(order_id)])],
+            action='用 /order 核对成交与剩余数量。',
+        ),
+        key=f'entry:{trade.id}:{order_id}',
+    ):
         events[str(order_id)] = code
         strategy._save_execution(trade, state)
 

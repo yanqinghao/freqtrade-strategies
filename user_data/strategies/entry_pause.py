@@ -3,7 +3,7 @@ import logging
 import time
 from math import isfinite
 from copy import deepcopy
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from freqtrade.enums import State
 from freqtrade.persistence import Trade, Order
@@ -11,6 +11,7 @@ from entry_lifecycle import _receipt, TERMINAL, install_entry_receipt_guard, ent
 from candle_exits import RULE_FIELDS
 from entry_risk import EntryRiskError
 from entry_volume import analyze_volume, advance_pause
+from notification_format import notice
 
 logger = logging.getLogger(__name__)
 ENDED = ('invalidated', 'expired', 'cancelled', 'replaced')
@@ -28,10 +29,14 @@ class EntryPause:
         return next((m for m in self.store.pauses() if m.get('attempt_ref') == ref), None)
 
     def notice(self, meta, message):
-        stamp = datetime.now(timezone(timedelta(hours=8)))
         self.strategy._exit_notice(
-            f"{meta['request']['pair']}：{message}\n"
-            f"北京时间 {stamp:%Y-%m-%d %H:%M:%S}\n计划 {meta['ref']}",
+            notice(
+                '入场计划',
+                meta['request']['pair'],
+                summary=[message],
+                sections=[('计划编号', [meta['ref']])],
+                action=f"查询 /request {meta['ref']}；取消后续恢复 /request {meta['ref']} cancel。",
+            ),
             key='entry-pause:' + meta['ref'],
         )
 

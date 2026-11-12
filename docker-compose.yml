@@ -48,6 +48,12 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: ./user_data/strategies/notification_format.py
+        target: /app/notification_format.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./deploy/watchdog.json
         target: /secrets/watchdog.json
         read_only: true

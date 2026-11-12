@@ -134,7 +134,7 @@ class ExtremeVolumeTests(unittest.TestCase):
         self.detector.check(fetch)
         message = self.queue.pending(now=self.now.timestamp())[0]
         self.assertIn('刚收盘', message['message'])
-        self.assertIn('12:05:10', message['message'])
+        self.assertIn('20:05:10 北京时间', message['message'])
         self.assertEqual(message['updated'], self.now.timestamp())
 
     def test_urgent_worker_runs_while_hourly_future_is_still_pending(self):

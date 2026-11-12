@@ -258,8 +258,8 @@ class MarketAlertTests(unittest.TestCase):
         with self.assertLogs('market_alerts', level='WARNING'):
             messages = self.check(fetch)
         self.assertEqual(len(messages), 2)
-        self.assertTrue(messages[0].startswith('BTC'))
-        self.assertTrue(messages[1].startswith('SOL'))
+        self.assertTrue(messages[0].startswith('【收盘异动】BTC'))
+        self.assertTrue(messages[1].startswith('【收盘异动】SOL'))
 
     def test_persistence_failure_does_not_consume_event_or_emit_untracked_alert(self):
         self.advance(close=110.0, volume=30.0)
@@ -273,7 +273,7 @@ class MarketAlertTests(unittest.TestCase):
         message = self.check()[0]
         self.assertIn('高于 0.20%', message)
         self.assertIn('未达2倍放量阈值', message)
-        self.assertIn('12:30', message)
+        self.assertIn('20:30:00 北京时间', message)
 
     def test_followup_freezes_original_levels_and_emits_only_once(self):
         self.advance(close=110)

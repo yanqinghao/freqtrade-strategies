@@ -6,7 +6,6 @@ import signal
 import sys
 import time
 from copy import deepcopy
-from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
 from threading import Event
@@ -14,6 +13,7 @@ from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'user_data' / 'strategies'))
 from assistant_state import read_state, update_state
+from notification_format import notice, local_time
 
 logger = logging.getLogger(__name__)
 PROBE_FAILURE_GRACE = 180
@@ -198,13 +198,19 @@ class Watchdog:
         if state['pending']:
             current_faults = state['faults']
             conditions = current_faults or state['incident']
-            message = '开单助手异常提醒' if current_faults else '开单助手监控恢复；此前异常已解除'
-            message += '\n' + '\n'.join(conditions.values())
             since = state['incident_since']
-            if since is not None:
-                stamp = datetime.fromtimestamp(since, timezone.utc)
-                message += f'\n首次异常：{stamp:%Y-%m-%d %H:%M:%S} UTC'
-            message += '\n独立守护仅通知，不会重启、撤单或修改仓位。'
+            history = ['首次异常：' + local_time(since)] if since is not None else []
+            message = notice(
+                '运行监控',
+                '开单助手 · ' + ('异常提醒' if current_faults else '监控恢复'),
+                summary=['检测到异常，请核查。' if current_faults else '此前异常已解除。'],
+                sections=[
+                    ('异常项目' if current_faults else '已恢复项目', list(conditions.values())),
+                    ('事件记录', history),
+                ],
+                action='检查 /health 与运行日志；独立守护仅通知，不会重启、撤单或修改仓位。',
+                at=now,
+            )
             try:
                 delivered = send(message) is True
             except Exception as error:

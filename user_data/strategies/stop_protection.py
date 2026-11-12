@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 from math import isfinite, ulp
 
 from freqtrade.exchange import ROUND_DOWN, ROUND_UP
+from notification_format import notice
 
 logger = logging.getLogger(__name__)
 
@@ -220,13 +221,26 @@ def check_protection(strategy, trade, now, *, force=False):
     state['protection'] = result
     strategy._save_execution(trade, state)
     if notify:
+        confirmed = result['status'] == 'confirmed'
         queued = strategy._exit_notice(
-            f"【保护正常】{trade.pair}：止损已确认，触发价 {result['stop_price']:g}，"
-            f"覆盖 {result['covered_amount']:g}；"
-            f"核验时间 {now:%Y-%m-%d %H:%M:%S} UTC。"
-            if result['status'] == 'confirmed'
-            else f"【需要处理】{trade.pair}：止损尚未确认（{result['reason']}）。\n"
-            '下一步：用 /order 与交易所核对止损单及覆盖数量；已暂停加仓，平仓照常。',
+            notice(
+                '止损保护',
+                f'{trade.pair} #{trade.id}',
+                summary=['止损已确认' if confirmed else '需要处理：止损尚未确认'],
+                sections=[
+                    (
+                        '核验结果',
+                        [
+                            f"触发价：{result['stop_price']:g}",
+                            f"覆盖数量：{result['covered_amount']:g}",
+                        ]
+                        if confirmed
+                        else [result['reason'], '已暂停加仓，平仓照常'],
+                    )
+                ],
+                action='用 /order 与交易所核对止损单及覆盖数量。',
+                at=now,
+            ),
             key=f'protection:{trade.id}',
         )
         if queued:

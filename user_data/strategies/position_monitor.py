@@ -2,7 +2,7 @@
 import logging
 import time
 from math import isfinite
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from entry_risk import number, observed_quantities, saved_plan, effective_stop
 from entry_volume import checked_rows
@@ -16,9 +16,9 @@ from market_monitor import (
 from order_management import position_profit
 from trade_overview import _protection
 from candle_exits import describe_rules
+from notification_format import notice
 
 logger = logging.getLogger(__name__)
-BEIJING = timezone(timedelta(hours=8))
 
 
 def _positions(trades):
@@ -100,7 +100,7 @@ def _advice(trade, pnl, rate, frames, plan, state, stop, targets, stage, pending
         return f'4h与1h均逆向，可考虑减仓或退出以{purpose}；核对原失效条件，不放宽SL。'
     if trends['1d'] == trends['4h'] == favorable and trends['1h'] == trends['15m'] == opposite:
         move = '反弹' if trade.is_short else '回调'
-        return f'大周期同向、短线{move}；观察上述4h{level_name}能否守住，失守后再评估减仓。'
+        return f'大周期同向、短线{move}；观察4h{level_name}能否守住，失守后再评估减仓。'
     if trends['4h'] == trends['1h'] == favorable:
         return '顺势持有观察（4h/1h同向），沿用原SL/TP；接近原目标时按计划处理，不追价加仓。'
     return '走势震荡或周期分歧，等待收盘方向更清楚，继续遵守原保护计划。'
@@ -118,14 +118,10 @@ def build_position_report(strategy, trade, market, now):
     state = strategy._execution(trade)
     if not isinstance(state, dict):
         state = {}
-    plan, stop, targets, active_targets, stage, pending = {}, None, [], [], 0, False
+    plan, stop, active_targets, stage, pending = {}, None, [], 0, False
     try:
         plan = saved_plan(strategy, trade)
         stop = float(effective_stop(strategy, trade, plan))
-        targets = sorted(
-            {float(number(p, positive=True)) for p in plan.get('exit_points', [])},
-            reverse=trade.is_short,
-        )
         stage = state.get('stage', 0)
         if not isinstance(stage, int) or isinstance(stage, bool) or not 0 <= stage <= 3:
             raise ValueError('Invalid TP stage')
@@ -137,7 +133,7 @@ def build_position_report(strategy, trade, market, now):
             and plan.get('tp_keep_progress_from') != applied.get('exit_points')
         )
     except (ValueError, TypeError, ArithmeticError):
-        plan, stop, targets, active_targets, stage = {}, None, [], [], 0
+        plan, stop, active_targets, stage = {}, None, [], 0
     protected = False
     try:
         proof = state['protection']
@@ -153,61 +149,57 @@ def build_position_report(strategy, trade, market, now):
         )
     except (KeyError, ValueError, TypeError):
         pass
-    lines = [
-        f"【持仓简报】{trade.pair} #{trade.id} {'空' if trade.is_short else '多'}",
-        f"快照：{now.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间",
-        f'均价 {trade.open_rate:.8g}｜账面数量 {trade.amount:g}｜杠杆 {trade.leverage:g}倍',
-    ]
-    lines.append(
-        f'盘口退出参考价 {rate:.8g}（取样 '
-        f"{datetime.fromtimestamp(float(market['quote']['observed_at']), BEIJING):%H:%M:%S} 北京时间）"
-        if rate is not None
-        else '盘口退出参考价不可用。'
+    advice = _advice(
+        trade, pnl, rate, frames, plan, state, stop, active_targets, stage, pending, protected
     )
-    lines.append(
-        f"浮盈亏：{pnl['profit_abs']:+.4f} USDT｜收益率 {pnl['profit']:+.2f}%"
+    profit = (
+        f"浮盈亏：{pnl['profit_abs']:+.4f} USDT / 收益率 {pnl['profit']:+.2f}%"
         if pnl['pnl_status'] == '可用'
-        else f"浮盈亏不可用：{pnl['pnl_status']}。"
+        else f"浮盈亏不可用：{pnl['pnl_status']}"
     )
+    prices = [
+        f'均价：{trade.open_rate:.8g}',
+        f'退出参考价：{rate:.8g}' if rate is not None else '退出参考价：不可用',
+        f'账面数量：{trade.amount:g} / 杠杆 {trade.leverage:g}倍',
+    ]
     if pnl['pnl_status'] == '成交待记账' and quantity is not None:
-        lines.append(f'已观察数量 {quantity:g}，账面尚未完成记账，不能把账面零数量视为没有成交。')
-    lines.append(
-        '走势：'
-        + '｜'.join(
-            f"{tf} {frames[tf]['trend']}" if tf in frames else f'{tf} 不可用' for tf in TIMEFRAMES
-        )
-    )
+        prices.append(f'已观察数量 {quantity:g}，成交待记账')
+    trends = [f"{tf}：{frames[tf]['trend']}" if tf in frames else f'{tf}：不可用' for tf in TIMEFRAMES]
+    levels = []
     for tf in ('1d', '4h'):
         if tf in frames:
             frame = frames[tf]
-            support = level_distance(frame.get('support'), rate, support=True)
-            resistance = level_distance(frame.get('resistance'), rate, support=False)
-            lines.append(
-                f'{tf}参考：{support}；{resistance}；来源收盘 '
-                f"{frame['closed_at'].astimezone(BEIJING):%m-%d %H:%M} 北京时间。"
+            levels.extend(
+                [
+                    f"{tf}支撑：{level_distance(frame.get('support'), rate, support=True)}",
+                    f"{tf}阻力：{level_distance(frame.get('resistance'), rate, support=False)}",
+                ]
             )
+    protection = []
     if plan and stop is not None:
-        lines.append(f"原硬SL {plan['stop_loss']:g}｜目标保护SL {stop:g}｜原TP {targets}｜已记录阶段 {stage}。")
+        protection.append(f"硬止损：{plan['stop_loss']:g} / 当前保护：{stop:g}")
         if pending:
-            lines.append('TP计划待应用，当前阶段不能视为新计划进度。')
-        rules = describe_rules(plan, state)
-        if rules:
-            lines.append(rules)
+            protection.append('TP计划待应用，请核对执行进度')
+        elif stage < len(active_targets):
+            protection.append(f'下一目标：TP{stage + 1} {active_targets[stage]:g}')
+        else:
+            protection.append('TP阶段已记录完成，请核对剩余仓位')
+        protection.extend(describe_rules(plan, state).splitlines())
     else:
-        lines.append('原SL/TP计划不可用，请核对 /overview。')
-    lines.append(
-        _protection(trade, state, quantity, stop, now)
+        protection.append('原SL/TP计划不可用')
+    protection.append(
+        _protection(trade, state, quantity, stop, now, compact=True)
         if quantity is not None
-        else '交易所SL：当前数量不可核实，请核对持仓及止损覆盖。'
+        else '交易所SL：数量不可核实，请核对覆盖'
     )
-    lines.append(
-        '建议：'
-        + _advice(
-            trade, pnl, rate, frames, plan, state, stop, active_targets, stage, pending, protected
-        )
+    return notice(
+        '持仓简报',
+        f"{trade.pair} #{trade.id} · {'空' if trade.is_short else '多'}",
+        summary=[profit, '建议：' + advice],
+        sections=[('价格与仓位', prices), ('走势（已收盘）', trends), ('关键点位', levels), ('原计划与保护', protection)],
+        action='用 /overview 核对；浮盈亏按余仓及记录费用估算，收益率含杠杆，已实现盈亏另计。',
+        at=now,
     )
-    lines.append('盈亏按剩余仓位及已记录费用估算，收益率含杠杆，已实现盈亏另计；操作前核对 /overview。')
-    return '\n'.join(lines)
 
 
 class PositionMonitor(HourlyMarketMonitor):

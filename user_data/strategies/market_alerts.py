@@ -6,6 +6,7 @@ from math import isfinite
 from pathlib import Path
 
 from assistant_state import read_state, update_state
+from notification_format import notice, local_time
 from market_monitor import MONITOR_PAIRS, TIMEFRAMES, _closed_frame, analyze_candles
 
 logger = logging.getLogger(__name__)
@@ -63,8 +64,8 @@ def _followup(record, pair, candle, close):
     stamp = datetime.fromtimestamp((candle + TIMEFRAMES['15m']) / 1000, timezone.utc)
     origin = datetime.fromtimestamp((pending['candle'] + TIMEFRAMES['15m']) / 1000, timezone.utc)
     lines = [
-        f"{pair.split('/')[0]} 异动后续 · 原事件 {origin:%m-%d %H:%M} UTC",
-        f'下一根15m收盘 {close:.8g}（{stamp:%m-%d %H:%M} UTC）',
+        '原事件收盘：' + local_time(origin),
+        f'下一根15m收盘：{close:.8g}',
     ]
     for reference in pending['levels']:
         price, kind = reference['price'], reference['kind']
@@ -75,8 +76,13 @@ def _followup(record, pair, candle, close):
             label = '支撑'
             outcome = '仍在位下' if close < price else '已收回' if close > price else '回到原位，未继续位下'
         lines.append(f"原{reference['label']}{label} {price:.8g}：{outcome}")
-    lines.append('仅核对这一根收盘，不代表趋势确认；本次跟踪结束。')
-    return '\n'.join(lines)
+    return notice(
+        '异动后续',
+        pair.split('/')[0] + ' · 本次跟踪结束',
+        sections=[('收盘核对', lines)],
+        action='仅核对这一根收盘，不代表趋势确认；本次跟踪结束。',
+        at=stamp,
+    )
 
 
 class MarketAlerts:
@@ -156,15 +162,24 @@ class MarketAlerts:
                         if ratio is not None
                         else '量比不可用，无法判断量能'
                     )
-                    message = '\n'.join(
-                        [
-                            f"{pair.split('/')[0]} 15分钟收盘异动 · 越线待观察",
-                            f'收盘时间：{stamp:%Y-%m-%d %H:%M} UTC',
-                            f'收盘价 {close:.8g} | 本根涨跌幅 {change:+.2f}% | {volume}',
-                            *lines,
-                            f'下一步：核对 {next_check:%m-%d %H:%M} UTC 的15m收盘' '与上述原位的关系，仅反馈一次；错过则不补发。',
-                            '参考位来自本根开始前已收盘的4小时/日线，仅提醒，不触发下单。',
-                        ]
+                    message = notice(
+                        '收盘异动',
+                        pair.split('/')[0] + ' · 越线待观察',
+                        summary=lines,
+                        sections=[
+                            (
+                                '15分钟已收盘',
+                                [
+                                    f'收盘价：{close:.8g} / 本根涨跌幅 {change:+.2f}%',
+                                    volume,
+                                    '参考位：本根开始前已收盘的4小时/日线',
+                                ],
+                            )
+                        ],
+                        action='核对 '
+                        + local_time(next_check)
+                        + ' 的15m收盘与原位关系，仅反馈一次；错过不补发，仅提醒，不触发下单。',
+                        at=stamp,
                     )
                     if followup:
                         messages[-1] += '\n\n' + message

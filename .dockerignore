@@ -9,6 +9,7 @@ user_data/strategies/*
 !user_data/strategies/order_panel.py
 !user_data/strategies/order_management.py
 !user_data/strategies/watch_panel.py
+!user_data/strategies/notification_format.py
 logs
 tests
 docs

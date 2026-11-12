@@ -33,7 +33,7 @@ class EntryPauseStartupTests(unittest.TestCase):
             except ModuleNotFoundError:
                 import freqtrade.rpc.telegram as upstream
                 sys.modules['freqtrade.rpc._telegram_base'] = upstream
-            for name in ('order_management', 'order_panel', 'watch_panel'):
+            for name in ('order_management', 'order_panel', 'watch_panel', 'notification_format'):
                 qualified = 'freqtrade.rpc.' + name
                 spec = importlib.util.spec_from_file_location(
                     qualified, root / 'user_data/strategies' / (name + '.py'))
