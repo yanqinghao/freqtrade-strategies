@@ -17,7 +17,7 @@ Execute inline with TDD; existing pinned runtime and isolated source clone /tmp/
 - [x] RED pure math, precision, validation, parser/history/preview contracts; implement minimum converter and normalization.
 - [x] RED integration tests for preflight guards, actual-fill anchoring, partial fills/TP, restart, pause/restore and manual override; implement persisted lifecycle.
 - [x] Update help/README/DESIGN, run project hooks and full pinned offline suite, fresh branch review and repair findings.
-- [ ] Back up state, commit/push/deploy and verify running hashes/heartbeats without live test orders.
+- [x] Back up state, commit/push/deploy and verify running hashes/heartbeats without live test orders.
 
 ## Ledger
 
@@ -30,3 +30,5 @@ Execute inline with TDD; existing pinned runtime and isolated source clone /tmp/
 
 - Final full candidate482 offline tests passed (89.513s); project hooks, Black/flake8 and diff checks pass. Packaged RPC imports new unit converter via the resolver's loaded strategy cache; parse/serialize smoke succeeded and native STATUS / paused-order panel remain available.
 - Candidate image be264b1f320dc527d3c36470a1effda66a88a64a24c574270bc38362db712b81 (entry-target-units-20261112). Strategy/helper logic is also in the user_data source bind: rollback must restore source and image, never roll live databases back over subsequent fills.
+
+- Released commit `0003a31` to main and deployed candidate image at2026-11-12T08:46:25.889435828Z. Nine live strategy/RPC file hashes match. New post-start RUNNING heartbeat verified, restart count0, watchdog faults0. One startup Telegram ConnectError recovered; read-only getMe succeeded and subsequent45s had no errors. Private snapshots, startup log, hashes and release evidence are in `.assistant-archive/entry-target-units-20261112T084305Z/`. No live test orders or messages were sent.
