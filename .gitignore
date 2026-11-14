@@ -93,6 +93,7 @@ pagination*
 *.json
 *.sqlite
 *.md
+!AGENTS.md
 !docs/superpowers/specs/*.md
 !docs/superpowers/plans/*.md
 
