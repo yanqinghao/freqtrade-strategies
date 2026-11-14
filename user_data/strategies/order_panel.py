@@ -28,6 +28,7 @@ LABELS = {
     'extend_tp3': '延伸 TP3',
 }
 KINDS = {'pending': '挂单未成交', 'partial': '部分成交 / 入场余量', 'position': '持仓'}
+READ_ACTIONS = {'list', 'detail', 'confirm', 'pause_confirm'}
 
 
 def order_list(owner, scope, page):
@@ -204,12 +205,13 @@ class OrderPanelMixin:
         tokens = getattr(self, '_panel_tokens', {})
         identity = self._panel_identity(update)
         # A newly rendered view or prompt supersedes older mutation buttons, even if
-        # the old callback was already queued. Read-only navigation remains usable.
+        # the old callback was already queued. Read-only navigation and confirmation
+        # previews remain retryable; previews revalidate state before issuing controls.
         for token, row in list(tokens.items()):
             if (
                 row['owner'] == identity
                 and token not in current
-                and row['payload']['action'] not in ('list', 'detail')
+                and row['payload']['action'] not in READ_ACTIONS
             ):
                 tokens.pop(token)
         query = update.callback_query
@@ -568,11 +570,20 @@ class OrderPanelMixin:
 
     @authorized_only
     async def _panel_callback(self, update, context):
-        await update.callback_query.answer()
+        try:
+            await update.callback_query.answer()
+        except TelegramError as exc:
+            logger.warning(
+                'Order panel callback acknowledgement unavailable (%s)', type(exc).__name__
+            )
+        payload, result, retry = None, None, None
+        mutation_started = False
         try:
             token = update.callback_query.data.removeprefix('om:')
-            payload = self._panel_take(update, token, consume=True)
+            payload = self._panel_take(update, token)
             action = payload['action']
+            if action not in READ_ACTIONS:
+                self._panel_take(update, token, consume=True)
             if action == 'list':
                 getattr(self, '_panel_edits', {}).pop(self._panel_identity(update), None)
                 await self._panel_list(update, payload.get('scope', 'all'), payload.get('page', 0))
@@ -610,6 +621,7 @@ class OrderPanelMixin:
                 )
             elif action == 'pause_cancel':
                 async with self._manual_order_lock:
+                    mutation_started = True
                     result = await self._await_command(
                         management.cancel_pause, self, payload['ref'], payload['revision']
                     )
@@ -624,6 +636,7 @@ class OrderPanelMixin:
                 changes = dict(draft['values'])
                 changes['soft_tf' if 'soft_sl' in changes else 'extend_tf'] = payload['value']
                 async with self._manual_order_lock:
+                    mutation_started = True
                     result = await self._await_command(
                         management.edit_plan, self, draft['id'], draft['revision'], changes
                     )
@@ -652,6 +665,7 @@ class OrderPanelMixin:
                 )
             elif action == 'do':
                 async with self._manual_order_lock:
+                    mutation_started = True
                     if payload['operation'] == 'price':
                         row = await self._await_command(
                             management.replace_entry,
@@ -674,16 +688,35 @@ class OrderPanelMixin:
                         ident = payload['id']
                 await self._panel_detail(update, ident, result)
         except ValueError as exc:
-            await self._panel_send(
-                update, str(exc), [[self._panel_button(update, '返回列表', action='list')]]
-            )
+            error = str(exc)
         except Exception as exc:
-            logger.warning('Order panel operation unavailable (%s)', type(exc).__name__)
+            logger.warning(
+                'Order panel operation unavailable '
+                '(action=%s, mutation_started=%s, result_known=%s, %s)',
+                payload.get('action') if payload else None,
+                mutation_started,
+                result is not None,
+                type(exc).__name__,
+            )
+            if result is not None:
+                error = str(result) + '\n\n页面刷新失败，请 /orders 核对最新状态，勿重复提交。'
+            elif mutation_started:
+                error = '操作结果暂未确认，请 /orders 刷新并核对 /order、/request；不要重复提交。'
+            else:
+                error = '页面加载失败，尚未提交交易操作；请重试或重新发送 /orders。'
+                if payload and payload['action'] in READ_ACTIONS:
+                    retry = self._panel_button(update, '重试', **payload)
+        else:
+            return
+        try:
             await self._panel_send(
                 update,
-                '操作结果暂未确认，请 /orders 刷新并核对 /order、/request；不要重复提交。',
-                [[self._panel_button(update, '返回列表', action='list')]],
+                error,
+                ([[retry]] if retry else [])
+                + [[self._panel_button(update, '返回列表', action='list')]],
             )
+        except TelegramError as exc:
+            logger.warning('Order panel error message unavailable (%s)', type(exc).__name__)
 
     @authorized_only
     async def _panel_reply(self, update, context):

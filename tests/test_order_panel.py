@@ -66,6 +66,87 @@ class OrderPanelTests(unittest.TestCase):
             asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
         self.assertEqual(self.bot._await_command.call_count, 1)
 
+    def test_cancel_confirmation_can_retry_after_telegram_outage(self):
+        from telegram.error import TimedOut
+
+        u = update(query=True)
+        token = self.bot._panel_token(
+            u, dict(action='confirm', id=26, revision='r', operation='cancel')
+        )
+        u.callback_query.data = 'om:' + token
+        self.bot._await_command.return_value = dict(
+            fresh=True,
+            revision='r',
+            id=26,
+            pair='BTC/USDT:USDT',
+            short=False,
+            amount=0,
+            orders=[{}],
+        )
+        u.callback_query.edit_message_text.side_effect = TimedOut()
+        asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
+        self.assertEqual(self.bot._panel_take(u, token)['action'], 'confirm')
+        self.assertIn('尚未提交', u.callback_query.edit_message_text.call_args.kwargs['text'])
+        u.callback_query.edit_message_text.side_effect = None
+        asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
+        buttons = u.callback_query.edit_message_text.call_args.kwargs[
+            'reply_markup'
+        ].inline_keyboard
+        self.assertEqual(buttons[0][0].text, '确认撤单')
+        self.assertTrue(
+            all(
+                call.args[0].__name__ == 'snapshot'
+                for call in self.bot._await_command.call_args_list
+            )
+        )
+        self.bot._await_command.return_value['revision'] = 'changed'
+        asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
+        self.assertIn('状态已变化', u.callback_query.edit_message_text.call_args.kwargs['text'])
+        buttons = u.callback_query.edit_message_text.call_args.kwargs[
+            'reply_markup'
+        ].inline_keyboard
+        self.assertNotIn('确认撤单', [button.text for row in buttons for button in row])
+
+    def test_callback_ack_timeout_does_not_block_confirmation(self):
+        from telegram.error import TimedOut
+
+        u = update(query=True)
+        token = self.bot._panel_token(u, dict(action='list'))
+        u.callback_query.data = 'om:' + token
+        u.callback_query.answer.side_effect = TimedOut()
+        self.bot._panel_list = AsyncMock()
+        asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
+        self.bot._panel_list.assert_awaited_once()
+
+    def test_cancel_result_survives_refresh_timeout_without_resubmitting(self):
+        from telegram.error import TimedOut
+
+        u = update(query=True)
+        token = self.bot._panel_token(u, dict(action='do', id=26, revision='r', operation='cancel'))
+        u.callback_query.data = 'om:' + token
+        self.bot._await_command.return_value = '撤单回执已确认'
+        self.bot._panel_detail = AsyncMock(side_effect=TimedOut())
+        asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
+        text = u.callback_query.edit_message_text.call_args.kwargs['text']
+        self.assertIn('撤单回执已确认', text)
+        self.assertNotIn('尚未提交', text)
+        asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
+        self.assertEqual(self.bot._await_command.call_count, 1)
+
+    def test_uncertain_cancel_cannot_retry_when_error_message_also_times_out(self):
+        from telegram.error import TimedOut
+
+        u = update(query=True)
+        token = self.bot._panel_token(u, dict(action='do', id=26, revision='r', operation='cancel'))
+        u.callback_query.data = 'om:' + token
+        self.bot._await_command.side_effect = RuntimeError('unknown receipt')
+        u.callback_query.edit_message_text.side_effect = TimedOut()
+        asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
+        self.assertNotIn(token, self.bot._panel_tokens)
+        self.assertIn('结果暂未确认', u.callback_query.edit_message_text.call_args.kwargs['text'])
+        asyncio.run(self.bot._panel_callback.__wrapped__(self.bot, u, None))
+        self.assertEqual(self.bot._await_command.call_count, 1)
+
     def test_unrelated_and_wrong_user_replies_do_not_edit(self):
         self.bot._panel_prompt = AsyncMock()
         self.bot._panel_edits = {
