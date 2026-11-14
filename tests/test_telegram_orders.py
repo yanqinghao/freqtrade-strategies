@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from threading import Lock
+from unittest.mock import patch
 
 from test_telegram_assistant import load_telegram
 from test_exit_policy import RuleExchange
@@ -48,6 +49,10 @@ class TelegramOrderTests(unittest.TestCase):
                 exchange=SimpleNamespace(get_rate=lambda *a, **k: 100.0),
                 _exit_lock=Lock(),
                 state=State.RUNNING,
+                wallets=SimpleNamespace(
+                    update=lambda **kw: None,
+                    get_available_stake_amount=lambda: 10000.0,
+                ),
             )
         )
         self.rpc._force_entry_validations = lambda *a, **kw: None
@@ -92,6 +97,66 @@ class TelegramOrderTests(unittest.TestCase):
         with self.assertRaises(RPCException):
             self.bot._submit_entry(self.request)
         self.assertEqual(self.strategy.manual_open[self.request['pair']], prior)
+
+    def test_balance_command_refreshes_before_display_and_hides_stale_balance_on_failure(self):
+        import asyncio
+
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                balance = {'available': 2.01}
+                sent = []
+
+                def refresh(require_update=True):
+                    if failure:
+                        raise TimeoutError('SECRET_SIGNED_URL')
+                    if require_update:
+                        balance['available'] = 22.48
+
+                async def execute(function, *args):
+                    return function(*args)
+
+                async def send(text, **kwargs):
+                    sent.append(text)
+
+                async def display(bot, update, context):
+                    await bot._send_msg(str(balance['available']))
+
+                self.rpc._freqtrade.wallets.update = refresh
+                self.bot._await_command = execute
+                self.bot._send_msg = send
+                with patch.object(self.module.UpstreamTelegram._balance, '__wrapped__', display):
+                    asyncio.run(self.bot._balance.__wrapped__(self.bot, None, None))
+                if failure:
+                    self.assertEqual(len(sent), 1)
+                    self.assertIn('余额刷新失败', sent[0])
+                    self.assertNotIn('2.01', sent[0])
+                    self.assertNotIn('SECRET_SIGNED_URL', sent[0])
+                else:
+                    self.assertEqual(sent, ['22.48'])
+
+    def test_balance_can_refresh_while_trading_is_stopped(self):
+        import asyncio
+        from freqtrade.enums import State
+
+        self.rpc._freqtrade.state = State.STOPPED
+        balance = {'available': 2.01}
+        sent = []
+
+        def refresh(require_update=True):
+            if require_update:
+                balance['available'] = 22.48
+
+        async def send(text, **kwargs):
+            sent.append(text)
+
+        async def display(bot, update, context):
+            await bot._send_msg(str(balance['available']))
+
+        self.rpc._freqtrade.wallets.update = refresh
+        self.bot._send_msg = send
+        with patch.object(self.module.UpstreamTelegram._balance, '__wrapped__', display):
+            asyncio.run(self.bot._balance.__wrapped__(self.bot, None, None))
+        self.assertEqual(sent, ['22.48'])
 
     def test_live_external_position_rejects_before_plan_or_order_mutation(self):
         self.strategy.config['dry_run'] = False

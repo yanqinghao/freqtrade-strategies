@@ -351,6 +351,62 @@ class EntryRequestFlowTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertNotIn('SECRET_SIGNED_URL', repr(store.recent()))
 
+    def test_entry_refreshes_transferred_funds_before_native_submission(self):
+        self.prepare()
+        from freqtrade.rpc import RPCException
+
+        wallet = self.rpc._freqtrade.wallets
+        balance = {'available': 2.01}
+
+        def refresh(require_update=True):
+            if require_update:
+                balance['available'] = 22.48
+
+        wallet.update = refresh
+        wallet.get_available_stake_amount = lambda: balance['available']
+        create = self.rpc._rpc_force_entry
+
+        def native(*args, **kwargs):
+            if balance['available'] < kwargs['stake_amount']:
+                raise RPCException('Failed to enter position')
+            return create(*args, **kwargs)
+
+        self.rpc._rpc_force_entry = native
+        row = self.bot._execute_entry_request({**self.request, 'size': 20}, self.ref)
+        self.assertEqual(row['state'], 'submitted')
+        self.assertEqual(self.calls[0]['stake_amount'], 20)
+
+    def test_insufficient_refreshed_balance_rejects_without_blocking_new_request(self):
+        self.prepare()
+        wallet = self.rpc._freqtrade.wallets
+        balance = {'available': 2.01}
+        wallet.get_available_stake_amount = lambda: balance['available']
+        prior = {'direction': 'long', 'stop_loss': 80, 'exit_points': [150]}
+        self.strategy.set_manual_plan(self.request['pair'], prior)
+        request = {**self.request, 'size': 20}
+        row = self.bot._execute_entry_request(request, self.ref)
+        self.assertEqual(row['state'], 'rejected')
+        self.assertIn('可用保证金不足', row['result']['message'])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.strategy.manual_open[self.request['pair']], prior)
+        balance['available'] = 22.48
+        self.assertEqual(self.bot._execute_entry_request(request, self.other)['state'], 'submitted')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_balance_refresh_failure_cannot_use_cached_funds(self):
+        self.prepare()
+
+        def unavailable(**kwargs):
+            raise TimeoutError('SECRET_SIGNED_URL')
+
+        self.rpc._freqtrade.wallets.update = unavailable
+        row = self.bot._execute_entry_request(self.request, self.ref)
+        self.assertEqual(row['state'], 'rejected')
+        self.assertIn('余额刷新失败', row['result']['message'])
+        self.assertNotIn('SECRET_SIGNED_URL', row['result']['message'])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.strategy.manual_open, {})
+
     def test_native_order_tag_recovers_crash_after_persistence(self):
         store = self.prepare()
 

@@ -911,6 +911,19 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
         ):
             raise ValueError('止盈必须位于入场价的盈利方向')
         strategy.enforce_entry_risk(request, existing, plan, rate)
+        # Explicit stake amounts bypass the native automatic-sizing wallet refresh.
+        # Refresh before recording submission intent; failure here cannot place an order.
+        try:
+            bot.wallets.update(require_update=True)
+            available = float(bot.wallets.get_available_stake_amount())
+            if not isfinite(available) or available < 0:
+                raise ValueError('invalid available balance')
+        except Exception:
+            raise strategy.risk_error('余额刷新失败，本次未提交，请稍后重试') from None
+        if request['size'] > available:
+            raise strategy.risk_error(
+                f"可用保证金不足（刷新后可用 {available:g} USDT，" f"本次需要 {request['size']:g} USDT），本次未提交，不会自动缩量"
+            )
         if request_ref:
             # Account queries can take time while a Telegram pause arrives.
             self._rpc._force_entry_validations(pair, SignalDirection(request['direction']))
@@ -975,6 +988,23 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
         if strategy.entry_pause:
             strategy.entry_pause.submitted(request_ref, result)
         return result
+
+    @authorized_only
+    async def _balance(self, update, context):
+        from freqtrade.enums import State
+
+        try:
+            bot = self._rpc._freqtrade
+            refresh = partial(bot.wallets.update, require_update=True)
+            if bot.state == State.STOPPED:
+                # Stopped bots do not drain the trading-thread command queue.
+                await asyncio.to_thread(refresh)
+            else:
+                await self._await_command(refresh)
+        except Exception:
+            await self._send_msg('余额刷新失败，请稍后重试；本次不显示缓存余额。', parse_mode=None)
+            return
+        await UpstreamTelegram._balance.__wrapped__(self, update, context)
 
     @authorized_only
     async def _manual(self, update, context):
