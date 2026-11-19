@@ -1,12 +1,18 @@
 """Explicit per-position TP2 protection edits, called under the native exit lock."""
 
+import logging
 from datetime import datetime, timezone
+from time import monotonic, sleep
 
 from freqtrade.exchange import ROUND_DOWN, ROUND_UP
+from freqtrade.exceptions import ExchangeError, OperationalException
 from freqtrade.persistence import Trade
 from entry_guard import ensure_position_matches
 from entry_risk import cost_stop, number
 from stop_protection import _evaluate, check_protection
+
+
+logger = logging.getLogger(__name__)
 
 
 def _crossed(short, stop, rate):
@@ -25,17 +31,56 @@ def _cancel_old_stop(bot, trade, order, rate, simulated):
     if _crossed(trade.is_short, trigger, number(rate)):
         raise ValueError('已触及旧止损，等待交易所处理。')
     # Never treat a cancel acknowledgement (or a synthesized fallback) as a terminal receipt.
-    exchange.cancel_stoploss_order(ident, trade.pair)
-    final = exchange.fetch_stoploss_order(ident, trade.pair)
-    if (
-        str(final.get('id')) != str(ident)
-        or final.get('symbol') != trade.pair
-        or final.get('side') != trade.exit_side
-        or final.get('status') not in ('canceled', 'cancelled')
-        or number(final.get('filled')) != 0
-        or final.get('status_stop') == 'triggered'
-    ):
-        raise ValueError('旧止损撤单或成交待核实，等待原生止损流程处理。')
+    try:
+        exchange.cancel_stoploss_order(ident, trade.pair)
+    except (ExchangeError, OperationalException, ValueError) as error:
+        # A lost or unparseable acknowledgement can follow a successful cancellation.
+        logger.warning(
+            'Tail stop cancel acknowledgement unavailable trade=%s order=%s (%s)',
+            trade.id,
+            ident,
+            type(error).__name__,
+        )
+    deadline = monotonic() + 4
+    for delay in (0, 0.15, 0.35, 0.75, 1.5):
+        if delay:
+            if monotonic() + delay > deadline:
+                raise ValueError('撤单回执核对超时，新止损未设置。请刷新核对当前保护价。')
+            sleep(delay)
+        try:
+            final = exchange.fetch_stoploss_order(ident, trade.pair)
+        except ExchangeError as error:
+            logger.warning(
+                'Tail stop receipt unavailable trade=%s order=%s (%s)',
+                trade.id,
+                ident,
+                type(error).__name__,
+            )
+            continue
+        status = final.get('status')
+        logger.info(
+            'Tail stop cancel receipt trade=%s order=%s status=%s filled=%s',
+            trade.id,
+            ident,
+            status,
+            final.get('filled'),
+        )
+        if (
+            str(final.get('id')) != str(ident)
+            or final.get('symbol') != trade.pair
+            or final.get('side') != trade.exit_side
+            or final.get('status_stop') == 'triggered'
+            or (final.get('filled') is not None and number(final['filled']) != 0)
+        ):
+            raise ValueError('旧止损撤单或成交待核实，等待原生止损流程处理。')
+        if status in ('canceled', 'cancelled'):
+            if final.get('filled') is not None:
+                break
+        elif status != 'open':
+            raise ValueError('旧止损撤单或成交待核实，等待原生止损流程处理。')
+    else:
+        raise ValueError('交易所尚未确认旧止损已撤且零成交，新止损未设置。请刷新核对当前保护价。')
+    logger.info('Tail stop cancel confirmed trade=%s order=%s', trade.id, ident)
     bot.update_trade_state(trade, ident, final, stoploss_order=True)
     Trade.commit()
 
@@ -72,6 +117,7 @@ def edit_tail_stop(bot, trade, data, price):
     mode = strategy.config.get('runmode')
     simulated = strategy.config.get('dry_run', getattr(mode, 'value', mode) == 'dry_run')
     on_exchange = strategy.order_types.get('stoploss_on_exchange')
+    logger.info('Tail stop edit trade=%s old=%s requested=%s', trade.id, old, price)
     if on_exchange:
         orders = list(trade.open_sl_orders)
         if len(orders) > 1 or (not orders and not simulated):

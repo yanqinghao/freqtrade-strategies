@@ -144,6 +144,7 @@ class OrderManagementTests(unittest.TestCase):
             self.assertEqual(self.management.snapshot(self.bot, trade.id)['stop'], floor)
 
     def test_live_tail_replacement_checks_both_exchange_receipts(self):
+        from unittest.mock import patch
         from freqtrade.persistence import Order
         from ccxt import TICK_SIZE
 
@@ -183,7 +184,7 @@ class OrderManagementTests(unittest.TestCase):
         self.Trade.commit()
         bot = self.rpc._freqtrade
         self.exchange.fetch_stoploss_order = Mock(
-            side_effect=[raw, dict(raw, status='closed', filled=trade.amount)]
+            side_effect=[raw, raw, dict(raw, status='closed', filled=trade.amount)]
         )
         self.exchange.cancel_stoploss_order = Mock()
         bot.handle_stoploss_on_exchange = Mock()
@@ -199,8 +200,26 @@ class OrderManagementTests(unittest.TestCase):
             change()
         bot.handle_stoploss_on_exchange.assert_not_called()
         self.assertEqual(trade.stop_loss, 110)
+        self.exchange.fetch_stoploss_order.side_effect = None
+        self.exchange.fetch_stoploss_order.return_value = raw
+        with patch('tail_stop.sleep'), self.assertRaisesRegex(ValueError, '新止损未设置'):
+            change()
+        self.assertEqual(self.exchange.cancel_stoploss_order.call_count, 2)
+        bot.update_trade_state.assert_not_called()
+        bot.handle_stoploss_on_exchange.assert_not_called()
+        from freqtrade.exceptions import TemporaryError
+
         new = dict(raw, id='new', stopPrice=103)
-        self.exchange.fetch_stoploss_order.side_effect = [raw, dict(raw, status='canceled'), new]
+        self.exchange.cancel_stoploss_order.side_effect = TemporaryError('ack unavailable')
+        # A cancellation may still read as open before its terminal receipt is visible.
+        self.exchange.fetch_stoploss_order.side_effect = [
+            raw,
+            TemporaryError('receipt unavailable'),
+            raw,
+            dict(raw, status='canceled', filled=None),
+            dict(raw, status='canceled'),
+            new,
+        ]
         bot.handle_stoploss_on_exchange.side_effect = lambda t: tracked(new)
         self.assertIn('交易所已确认', change())
         self.assertEqual(trade.stop_loss, 103)
