@@ -85,6 +85,7 @@ def plan_for_entry(strategy, request, trade, *, rate=None):
         raise EntryRiskError('金额/幅度参数用于新开仓；已有仓位请使用价格参数')
     plan = saved_plan(strategy, trade) if trade else {}
     if trade:
+        plan.pop('tail_stop_preset', None)
         clear_units(plan, stop=True, tp=True)
     plan.update(
         {
@@ -135,6 +136,22 @@ def plan_for_entry(strategy, request, trade, *, rate=None):
     return plan
 
 
+def tail_stage_stop(state, plan, first_target):
+    """None keeps the protection already earned when TP2 completes."""
+    value = state.get('tail_stop', plan.get('tail_stop_preset', first_target))
+    return None if value == 'keep' else value
+
+
+def cost_stop(trade):
+    entry = number(trade.open_rate, positive=True)
+    opening, closing = number(trade.fee_open), number(trade.fee_close)
+    if max(opening, closing) >= 1:
+        raise EntryRiskError('手续费率无效，无法计算成本价')
+    if trade.is_short:
+        return entry * (1 - opening) / (1 + closing)
+    return entry * (1 + opening) / (1 - closing)
+
+
 def effective_stop(strategy, trade, plan, fee_open=0, fee_close=0):
     stop = number(plan.get('stop_loss'), positive=True)
     if trade is None:
@@ -151,7 +168,7 @@ def effective_stop(strategy, trade, plan, fee_open=0, fee_close=0):
         stage = 0
     if not isinstance(stage, int) or isinstance(stage, bool) or not 0 <= stage <= 3:
         raise EntryRiskError('TP执行阶段无效')
-    if stage >= 1:
+    if stage >= 1 and not (stage >= 2 and state.get('tail_overridden_sl') is not None):
         fees = number(trade.fee_open or fee_open) + number(trade.fee_close or fee_close)
         candidates.append(
             number(trade.open_rate, positive=True) * (1 - fees if trade.is_short else 1 + fees)
@@ -160,7 +177,11 @@ def effective_stop(strategy, trade, plan, fee_open=0, fee_close=0):
         {number(p, positive=True) for p in plan.get('exit_points', [])}, reverse=trade.is_short
     )
     if stage >= 2 and targets:
-        candidates.append(targets[0])
+        if state.get('tail_overridden_sl') == plan.get('stop_loss'):
+            candidates.remove(stop)
+        tail = tail_stage_stop(state, plan, targets[0])
+        if tail is not None:
+            candidates.append(number(tail, positive=True))
     for value in (state.get('protected_stop'), getattr(trade, 'stop_loss', None)):
         if value is not None and value != 0:
             candidates.append(number(value, positive=True))

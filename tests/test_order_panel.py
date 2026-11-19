@@ -281,6 +281,17 @@ class OrderPanelTests(unittest.TestCase):
         self.bot._await_command.assert_awaited_once()
         self.assertEqual(self.bot._await_command.call_args.args[-1], {'soft_sl': 123})
 
+    def test_tp2_and_runner_policy_share_one_revision_checked_edit(self):
+        draft = dict(prompt=99, expires=10**20, id=1, revision='r', field='tp2', allow_tail=True)
+        self.bot._panel_edits = {(123, 7, None): draft}
+        self.bot._panel_detail = AsyncMock()
+        u = update(reply=99)
+        u.message.text = '111 保留'
+        asyncio.run(self.bot._panel_reply.__wrapped__(self.bot, u, None))
+        self.assertEqual(
+            self.bot._await_command.call_args.args[-1], {'tp2': 111, 'tail_stop': 'keep'}
+        )
+
     def test_invalid_price_retry_keeps_input_without_restoring_menu_between_prompts(self):
         from telegram import ForceReply, ReplyKeyboardMarkup
 

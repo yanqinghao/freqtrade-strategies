@@ -37,6 +37,7 @@ from freqtrade.exchange import ROUND_UP, ROUND_DOWN
 from entry_pause_monitor import EntryPauseMonitor
 from entry_risk import (
     EntryRiskError,
+    tail_stage_stop,
     plan_for_entry,
     assess_entry,
     load_limits,
@@ -442,6 +443,8 @@ class KamaFama_Dynamic(IStrategy):
             and plan.get('tp_keep_progress_from') != saved.get('exit_points')
         ):
             state = self._execution(trade)
+            state.pop('tail_stop', None)
+            state.pop('tail_overridden_sl', None)
             state.pop('tp2_completed_at', None)
             state.pop('final_tp_started', None)
             state.update(
@@ -572,16 +575,20 @@ class KamaFama_Dynamic(IStrategy):
         stage = state.get('stage', 0)
         candidates = []
         sl = plan.get('stop_loss')
-        if sl is not None:
+        if sl is not None and (stage < 2 or state.get('tail_overridden_sl') != sl):
             candidates.append(float(sl))
-        if stage >= 1:
+        if stage >= 1 and not (stage >= 2 and state.get('tail_overridden_sl') is not None):
             # Include trading fees in the cost-protection reference.
             fee = float(getattr(trade, 'fee_open', 0) or 0) + float(
                 getattr(trade, 'fee_close', 0) or 0
             )
             candidates.append(trade.open_rate * (1 - fee if trade.is_short else 1 + fee))
         if stage >= 2 and targets:
-            candidates.append(targets[0])
+            if plan.get('tail_stop_preset') is not None and getattr(trade, 'stop_loss', None):
+                candidates.append(float(trade.stop_loss))
+            tail = tail_stage_stop(state, plan, targets[0])
+            if tail is not None:
+                candidates.append(float(tail))
         if state.get('extension'):
             candidates.append(state['extension']['stop'])
         old = state.get('protected_stop')
@@ -1029,6 +1036,8 @@ class KamaFama_Dynamic(IStrategy):
                 tp_targets={},
                 stage=0,
             )
+            state.pop('tail_stop', None)
+            state.pop('tail_overridden_sl', None)
             state.pop('tp2_completed_at', None)
             state.pop('final_tp_started', None)
             state['protection'] = {

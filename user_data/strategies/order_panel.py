@@ -23,12 +23,13 @@ LABELS = {
     'tp2': 'TP2',
     'tp3': 'TP3',
     'price': '开仓价',
+    'tail_stop': '尾仓止损',
     'soft_sl': '软止损价',
     'extend_trigger': '延伸触发价',
     'extend_tp3': '延伸 TP3',
 }
 KINDS = {'pending': '挂单未成交', 'partial': '部分成交 / 入场余量', 'position': '持仓'}
-READ_ACTIONS = {'list', 'detail', 'confirm', 'pause_confirm'}
+READ_ACTIONS = {'list', 'detail', 'confirm', 'pause_confirm', 'tail_menu'}
 
 
 def order_list(owner, scope, page):
@@ -342,7 +343,6 @@ class OrderPanelMixin:
             current = data['plan'].get(field)
             if field.startswith('tp'):
                 index = int(field[-1]) - 1
-                targets = data['plan'].get('exit_points', [])
                 current = targets[index] if index < len(targets) else None
             if field == 'price':
                 current = data['orders'][0]['price']
@@ -355,6 +355,7 @@ class OrderPanelMixin:
                 id=ident,
                 field=field,
                 revision=data['revision'],
+                allow_tail=field == 'tp2' and data['kind'] == 'position' and len(targets) == 3,
                 current=current,
                 existing=existing,
                 values=values if field.endswith('_tf') else {},
@@ -384,6 +385,18 @@ class OrderPanelMixin:
         lines.append(f"硬 SL {plan.get('stop_loss', '未设置')} · 有效保护价 {data['stop'] or '未确认'}")
         lines.append('有效保护价为策略目标；交易所保护状态见 /overview。')
         targets = plan.get('exit_points', [])
+        if len(targets) == 3 and data['kind'] == 'position':
+            tail = data.get('tail_stop')
+            label = '随 TP1' if tail is None else ('保留当时有效止损' if tail == 'keep' else f'{tail:g}')
+            lines.append(f'TP2 完成后的尾仓止损：{label}')
+            if tail is not None:
+                actual = data.get('stop_receipt')
+                checked = data.get('stop_checked')
+                if actual is not None and checked:
+                    at = datetime.fromtimestamp(checked, timezone.utc)
+                    lines.append(f'最近交易所止损回执 {actual:g} · {at:%H:%M:%S} UTC')
+                else:
+                    lines.append('交易所止损触发价待核实')
         for i, price in enumerate(targets):
             progress = (
                 '已完成'
@@ -415,6 +428,22 @@ class OrderPanelMixin:
                 if tp_buttons:
                     buttons.append(tp_buttons)
                 buttons.append([edit('硬止损 SL', 'stop_loss'), edit('软止损', 'soft_sl')])
+                if (
+                    data['kind'] == 'position'
+                    and len(targets) == 3
+                    and not data['final_tp_started']
+                    and not data['extension']
+                ):
+                    buttons.append(
+                        [
+                            button(
+                                '修改尾仓止损' if data['stage'] == 2 else '预设 TP2 后止损',
+                                action='tail_menu',
+                                id=ident,
+                                revision=data['revision'],
+                            )
+                        ]
+                    )
                 if not data['extension']:
                     buttons.append([edit('延伸触发价', 'extend_trigger')])
                     if plan.get('extend_trigger') is not None:
@@ -532,6 +561,8 @@ class OrderPanelMixin:
         text = f"#{draft['id']} 修改 {LABELS[field]}\n请回复这条消息，输入新价格；回复“取消”放弃。"
         if draft.get('current') is not None:
             text += f"\n当前值 {draft['current']}"
+        if field == 'tp2' and draft.get('allow_tail'):
+            text += '\n如需一起改尾仓止损，可回复「TP2价格 保留」、「TP2价格 成本」或「TP2价格 止损价」。'
         if field in ('soft_sl', 'extend_trigger'):
             text += '\n回复“关闭”可关闭这组尚未生效的规则。'
         if field == 'price':
@@ -626,6 +657,49 @@ class OrderPanelMixin:
                         management.cancel_pause, self, payload['ref'], payload['revision']
                     )
                 await self._panel_pause_detail(update, payload['ref'], result)
+            elif action == 'tail_menu':
+                data = await self._await_command(management.snapshot, self, payload['id'])
+                if not data['fresh'] or data['revision'] != payload['revision']:
+                    raise ValueError('持仓已变化，请刷新。')
+                common = dict(id=data['id'], revision=data['revision'])
+                cost = data.get('tail_cost')
+                cost_label = f'用成本价 {cost:g}' if cost is not None else '用含费成本价'
+                buttons = [
+                    [
+                        self._panel_button(
+                            update, cost_label, action='tail_set', value='cost', **common
+                        ),
+                        self._panel_button(
+                            update, '输入价格', action='edit', field='tail_stop', **common
+                        ),
+                    ]
+                ]
+                if data['stage'] < 2:
+                    buttons.append(
+                        [
+                            self._panel_button(
+                                update, '保留当前止损', action='tail_set', value='keep', **common
+                            )
+                        ]
+                    )
+                buttons.append([self._panel_button(update, '返回详情', action='detail', id=data['id'])])
+                when = '选择后将撤旧止损并重挂，中间有保护空档。' if data['stage'] == 2 else '预设在 TP2 完成时生效，已有更紧保护优先。'
+                await self._panel_send(
+                    update,
+                    f"#{data['id']} {data['pair']} · 尾仓止损\n当前有效保护 {data['stop']}\n{when}",
+                    buttons,
+                )
+            elif action == 'tail_set':
+                async with self._manual_order_lock:
+                    mutation_started = True
+                    result = await self._await_command(
+                        management.edit_plan,
+                        self,
+                        payload['id'],
+                        payload['revision'],
+                        {'tail_stop': payload['value']},
+                    )
+                await self._panel_detail(update, payload['id'], result)
             elif action == 'edit':
                 if payload['field'].endswith('_tf'):
                     await self._panel_choose_tf(update, payload)
@@ -739,7 +813,11 @@ class OrderPanelMixin:
                 await self._panel_detail(update, draft['id'], '已取消修改。')
                 return
             field = draft['field']
-            if value in ('关闭', 'off') and field in RULE_GROUPS:
+            if field == 'tp2' and draft.get('allow_tail') and len(value.split()) == 2:
+                target, tail = value.split()
+                tail = {'保留': 'keep', '成本': 'cost'}.get(tail, tail)
+                changes = {'tp2': float(number(target, positive=True)), 'tail_stop': tail}
+            elif value in ('关闭', 'off') and field in RULE_GROUPS:
                 changes = {k: None for k in RULE_GROUPS[field]}
             else:
                 value = float(number(value, positive=True))

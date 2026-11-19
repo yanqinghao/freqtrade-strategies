@@ -99,6 +99,134 @@ class OrderManagementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '完成'):
             self.management.edit_plan(self.bot, trade.id, snap['revision'], {'tp1': 115})
 
+    def test_tail_preset_preserves_tp1_protection_and_final_target(self):
+        trade = self.prepare()
+        self.exchange.get_rate.return_value = 111
+        self.strategy._save_execution(trade, {'stage': 1, 'protected_stop': 101})
+        snap = self.management.snapshot(self.bot, trade.id)
+        self.management.edit_plan(
+            self.bot, trade.id, snap['revision'], {'tp2': 111, 'tail_stop': 'keep'}
+        )
+        state = self.strategy._execution(trade)
+        state['stage'] = 2
+        self.strategy._save_execution(trade, state)
+        plan = self.strategy._plan(trade)
+        self.assertEqual(plan['exit_points'], [110, 111, 130])
+        self.assertEqual(self.strategy._stop_price(trade, plan), 101)
+        self.assertIsNone(self.strategy.custom_exit(trade.pair, trade, None, 105, 0))
+        self.assertEqual(self.management.snapshot(self.bot, trade.id)['stop'], 101)
+
+    def test_active_tail_edits_lower_long_or_raise_short_to_fee_adjusted_cost(self):
+        from ccxt import TICK_SIZE
+        from freqtrade.exchange import price_to_precision
+
+        for short, old, rate, floor in [(False, 110, 115, 100.11), (True, 90, 85, 99.90)]:
+            trade = self.prepare(short=short)
+            trade.price_precision, trade.precision_mode_price = 0.01, TICK_SIZE
+            self.exchange.price_to_precision = (
+                lambda pair, value, rounding_mode: price_to_precision(
+                    value, 0.01, TICK_SIZE, rounding_mode=rounding_mode
+                )
+            )
+            self.exchange.get_rate.return_value = rate
+            self.strategy._save_execution(trade, {'stage': 2, 'protected_stop': old})
+            trade.stop_loss = old
+            snap = self.management.snapshot(self.bot, trade.id)
+            for invalid in (rate, 100):
+                with self.assertRaises(ValueError):
+                    self.management.edit_plan(
+                        self.bot, trade.id, snap['revision'], {'tail_stop': invalid}
+                    )
+            self.rpc._freqtrade.handle_stoploss_on_exchange = Mock(return_value=False)
+            self.management.edit_plan(self.bot, trade.id, snap['revision'], {'tail_stop': 'cost'})
+            self.assertEqual(self.strategy._stop_price(trade, self.strategy._plan(trade)), floor)
+            self.assertEqual(trade.stop_loss, floor)
+            self.assertEqual(self.management.snapshot(self.bot, trade.id)['stop'], floor)
+
+    def test_live_tail_replacement_checks_both_exchange_receipts(self):
+        from freqtrade.persistence import Order
+        from ccxt import TICK_SIZE
+
+        trade = self.prepare()
+        trade.price_precision, trade.precision_mode_price = 0.01, TICK_SIZE
+        self.strategy._save_execution(trade, {'stage': 2, 'protected_stop': 110})
+        trade.stop_loss = 110
+        self.strategy.config['dry_run'] = False
+        self.exchange.get_rate.return_value = 112
+        self.exchange.fetch_positions = Mock(
+            return_value=[
+                dict(symbol=trade.pair, side='long', contracts=trade.amount, hedged=False)
+            ]
+        )
+        self.exchange.price_to_precision = lambda pair, value, rounding_mode: round(value, 2)
+        raw = dict(
+            id='old',
+            symbol=trade.pair,
+            side='sell',
+            type='stop_market',
+            status='open',
+            amount=trade.amount,
+            remaining=trade.amount,
+            filled=0,
+            stopPrice=110,
+            reduceOnly=True,
+        )
+
+        def tracked(row):
+            trade.orders.append(
+                Order.parse_from_ccxt_object(
+                    row, trade.pair, 'stoploss', trade.amount, row['stopPrice']
+                )
+            )
+
+        tracked(raw)
+        self.Trade.commit()
+        bot = self.rpc._freqtrade
+        self.exchange.fetch_stoploss_order = Mock(
+            side_effect=[raw, dict(raw, status='closed', filled=trade.amount)]
+        )
+        self.exchange.cancel_stoploss_order = Mock()
+        bot.handle_stoploss_on_exchange = Mock()
+        bot.update_trade_state = Mock(side_effect=lambda t, ident, row, **kw: t.update_order(row))
+
+        def change():
+            snap = self.management.snapshot(self.bot, trade.id)
+            return self.management.edit_plan(
+                self.bot, trade.id, snap['revision'], {'tail_stop': 103}
+            )
+
+        with self.assertRaisesRegex(ValueError, '成交待核实'):
+            change()
+        bot.handle_stoploss_on_exchange.assert_not_called()
+        self.assertEqual(trade.stop_loss, 110)
+        new = dict(raw, id='new', stopPrice=103)
+        self.exchange.fetch_stoploss_order.side_effect = [raw, dict(raw, status='canceled'), new]
+        bot.handle_stoploss_on_exchange.side_effect = lambda t: tracked(new)
+        self.assertIn('交易所已确认', change())
+        self.assertEqual(trade.stop_loss, 103)
+        self.assertEqual(self.strategy._execution(trade)['stage'], 2)
+        self.assertEqual([o.order_id for o in trade.open_sl_orders], ['new'])
+        self.assertIsNone(self.strategy.custom_exit(trade.pair, trade, None, 105, 0))
+
+        self.Trade.session.expire_all()
+        restarted = type(self.strategy)(self.strategy.config)
+        self.assertEqual(restarted._stop_price(trade, restarted._plan(trade)), 103)
+        self.exchange.fetch_stoploss_order.side_effect = [dict(new, stopPrice=110)]
+        from stop_protection import check_protection
+
+        self.assertFalse(
+            check_protection(self.strategy, trade, datetime.now(timezone.utc), force=True)
+        )
+        # A clean cancel followed by a rejected replacement must never be shown as confirmed.
+        self.exchange.fetch_stoploss_order.side_effect = [
+            dict(new, stopPrice=110),
+            new,
+            dict(new, status='canceled'),
+        ]
+        bot.handle_stoploss_on_exchange.side_effect = lambda t: False
+        self.assertIn('尚未确认', change())
+        self.assertEqual(trade.open_sl_orders, [])
+
     def test_pending_can_edit_rules_and_tp_but_changed_fill_invalidates_edit(self):
         trade = self.prepare(pending=True)
         snap = self.management.snapshot(self.bot, trade.id)

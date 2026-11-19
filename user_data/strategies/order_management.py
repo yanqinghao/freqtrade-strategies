@@ -19,6 +19,7 @@ from entry_lifecycle import (
 from entry_risk import number, saved_plan, effective_stop, observed_quantities
 from entry_pause import ENDED as PAUSE_ENDS
 from entry_targets import clear_units
+from tail_stop import edit_tail_stop, tail_price
 
 
 PAUSE_PHASES = {'paused', 'canceling', 'resuming', 'submitting', 'unknown'}
@@ -232,6 +233,8 @@ def snapshot(owner, ident):
         plan=plan,
         orders=rows,
         stage=state.get('stage', 0),
+        tail_stop=state.get('tail_stop', plan.get('tail_stop_preset')),
+        stop_order_ids=[str(order.order_id) for order in trade.open_sl_orders],
         extension=state.get('extension'),
         full_exit=state.get('full_exit'),
         tp_filled=state.get('tp_filled', {}),
@@ -250,6 +253,16 @@ def snapshot(owner, ident):
         error='\n'.join(dict.fromkeys(errors)),
         checked=datetime.now(timezone.utc).strftime('%m-%d %H:%M:%S UTC'),
     )
+    if kind == 'position' and len(plan.get('exit_points', [])) == 3:
+        try:
+            data['tail_cost'] = tail_price(bot.exchange, trade, 'cost')
+        except (ValueError, TypeError, ArithmeticError):
+            data['tail_cost'] = None
+    protection = state.get('protection') or {}
+    data['stop_receipt'] = (
+        protection.get('stop_price') if protection.get('status') == 'confirmed' else None
+    )
+    data['stop_checked'] = protection.get('checked_at')
     data.update(position_profit(trade, rate))
     data['pause_ref'] = next(
         (m['ref'] for m in pause_plans(owner) if pause_trade(m, [trade]) is not None), None
@@ -286,7 +299,33 @@ def edit_plan(owner, ident, revision, changes):
             raise ValueError('正在退出，请等待结果后刷新。')
         if data['kind'] == 'partial' or any(r['side'] == trade.exit_side for r in data['orders']):
             raise ValueError('仍有成交待处理或退出订单，请等待完成后修改。')
-        if not changes or set(changes) - {'stop_loss', 'tp1', 'tp2', 'tp3', *RULE_FIELDS}:
+        if 'tail_stop' in changes:
+            if (
+                set(changes) - {'tail_stop', 'tp2'}
+                or len(plan.get('exit_points', [])) != 3
+                or data['kind'] != 'position'
+                or not trade.amount
+                or trade.has_open_orders
+                or data['stage'] not in (0, 1, 2)
+                or data['extension']
+                or data['final_tp_started']
+            ):
+                raise ValueError('仅可修改三档持仓的尾仓止损，请核对 TP 阶段和退出订单。')
+            value = changes['tail_stop']
+            tail = 'keep' if value == 'keep' else tail_price(bot.exchange, trade, value)
+            if data['stage'] == 2:
+                if tail == 'keep' or 'tp2' in changes:
+                    raise ValueError('TP2 已完成，请选择成本价或输入尾仓止损价。')
+                return edit_tail_stop(bot, trade, data, tail)
+            plan['tail_stop_preset'] = tail
+        if not changes or set(changes) - {
+            'tail_stop',
+            'stop_loss',
+            'tp1',
+            'tp2',
+            'tp3',
+            *RULE_FIELDS,
+        }:
             raise ValueError('不支持的修改字段')
         if state.get('extension') and any(k.startswith(('tp', 'extend')) for k in changes):
             raise ValueError('延伸止盈已生效，不能修改 TP 或延伸条件。')
@@ -322,13 +361,20 @@ def edit_plan(owner, ident, revision, changes):
                 if value <= reference if trade.is_short else value >= reference:
                     raise ValueError('SL 已越过参考价；立即退出请使用快速全平。')
                 plan[key] = value
-            else:
+            elif key != 'tail_stop':
                 plan[key] = value
         targets = plan.get('exit_points', [])
         if targets != sorted(set(targets), reverse=trade.is_short):
             raise ValueError('TP 必须按盈利方向严格递进，不能交换档位。')
         if any(p >= trade.open_rate if trade.is_short else p <= trade.open_rate for p in targets):
             raise ValueError('TP 必须位于开仓价的盈利方向。')
+        tail = plan.get('tail_stop_preset')
+        if (
+            ('tp2' in changes or 'tail_stop' in changes)
+            and isinstance(tail, (float, int))
+            and (tail <= targets[1] if trade.is_short else tail >= targets[1])
+        ):
+            raise ValueError('预设尾仓止损已越过新 TP2，请先修改尾仓止损。')
         validate_rules(plan)
         clear_units(
             plan, stop='stop_loss' in changes, tp=any(k in changes for k in ('tp1', 'tp2', 'tp3'))
@@ -341,6 +387,13 @@ def edit_plan(owner, ident, revision, changes):
             bot.strategy.entry_pause.revise_trade(trade.id, plan)
         bot.strategy.set_manual_plan(trade.pair, plan)
         bot.strategy._plan(trade)
+        if 'stop_loss' in changes and state.get('tail_overridden_sl') is not None:
+            latest = bot.strategy._execution(trade)
+            latest.pop('tail_overridden_sl', None)
+            bot.strategy._save_execution(trade, latest)
+        if 'tail_stop' in changes:
+            label = '保留当时的有效止损' if tail == 'keep' else f'保护至 {tail:g}，已有更紧保护优先'
+            return f'已保存。TP2 完成后{label}。'
         return '已保存；保护只收紧，收盘规则从下一次新收盘开始判断。'
 
 
