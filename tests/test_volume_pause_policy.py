@@ -31,26 +31,47 @@ class VolumePausePolicyTests(unittest.TestCase):
             request=dict(direction='long', entry_price=95.0, stop_loss=90.0),
         )
 
+    def analyze_volume(self, data, observed, now, direction):
+        return self.module.volume_shock(
+            self.module.volume_samples(data, observed, now), now, direction
+        )
+
     def test_forming_actual_volume_blocks_without_extrapolation(self):
         data = rows(self.now, 300, 28)
         data[-1][4:] = [99.0, 40.0]
-        signal = self.module.analyze_volume(data, self.now, self.now, 'long')
+        signal = self.analyze_volume(data, self.now, self.now, 'long')
         self.assertEqual(signal['ratio'], 4)
         self.assertEqual(signal['at'], self.now)
-        self.assertIsNone(self.module.analyze_volume(data, self.now, self.now, 'short'))
+        self.assertIsNone(self.analyze_volume(data, self.now, self.now, 'short'))
         data[-1][-1] = 3.0
-        self.assertIsNone(self.module.analyze_volume(data, self.now, self.now, 'long'))
+        self.assertIsNone(self.analyze_volume(data, self.now, self.now, 'long'))
+
+    def test_first_shock_sets_cap_and_lower_rolling_average_still_applies(self):
+        from entry_volume import volume_shock, VolumeSample
+
+        for side, opposite in [('long', 'short'), ('short', 'long')]:
+            samples = [
+                VolumeSample(self.now - 30, side, 40, 10),
+                VolumeSample(self.now - 20, side, 40, 15),
+                VolumeSample(self.now - 10, side, 20, 5),
+                VolumeSample(self.now, opposite, 100, 5),
+            ]
+            self.assertEqual(
+                volume_shock(samples[::-1], self.now, side),
+                dict(at=self.now - 10, ratio=4, baseline=10),
+            )
+            self.assertIsNone(volume_shock(samples, self.now + 900, side, 10))
 
     def test_stale_snapshot_and_missing_or_invalid_candles_fail_closed(self):
         data = rows(self.now, 300, 28)
         for changed in [data[:-1], data[:10] + data[11:], data[::-1]]:
             with self.assertRaises(ValueError):
-                self.module.analyze_volume(changed, self.now, self.now, 'long')
+                self.analyze_volume(changed, self.now, self.now, 'long')
         with self.assertRaises(ValueError):
-            self.module.analyze_volume(data, self.now - 31, self.now, 'long')
+            self.analyze_volume(data, self.now - 31, self.now, 'long')
         data[-1][-1] = float('nan')
         with self.assertRaises(ValueError):
-            self.module.analyze_volume(data, self.now, self.now, 'long')
+            self.analyze_volume(data, self.now, self.now, 'long')
 
     def test_no_entry_cross_resumes_after_quiet_period_without_waiting_for_touch(self):
         data = rows(self.now, 60, 10, price=96.1)

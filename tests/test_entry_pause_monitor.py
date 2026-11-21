@@ -3,6 +3,11 @@ import unittest
 from datetime import datetime, timezone
 from concurrent.futures import Future
 from test_volume_pause_policy import rows
+from entry_volume import volume_shock
+
+
+def long_shock(snapshot, baseline=None):
+    return volume_shock(snapshot['samples'], snapshot['observed_at'], 'long', baseline)
 
 
 class PauseMonitorTests(unittest.TestCase):
@@ -31,7 +36,7 @@ class PauseMonitorTests(unittest.TestCase):
         monitor._client = Client()
         snapshot = monitor.collect({'BTC/USDT:USDT': now - 120})['BTC/USDT:USDT']
         self.assertEqual(calls, ['5m', '1m', 'book', '15m'])
-        self.assertEqual(snapshot['signals']['long']['ratio'], 4.0)
+        self.assertEqual(long_shock(snapshot)['ratio'], 4.0)
         self.assertEqual(snapshot['ask'], 101.0)
         self.assertEqual(
             cache.get('BTC/USDT:USDT', lambda: self.fail('cache should be fresh'))[1],
@@ -84,7 +89,7 @@ class PauseMonitorTests(unittest.TestCase):
         from entry_pause_monitor import EntryPauseMonitor
 
         class Executor:
-            def submit(self, fn, needs):
+            def submit(self, fn, needs, legacy_starts):
                 self.needs = needs
                 return Future()
 
@@ -129,7 +134,7 @@ class PauseMonitorTests(unittest.TestCase):
         from entry_pause_monitor import EntryPauseMonitor
 
         class Executor:
-            def submit(self, fn, needs):
+            def submit(self, fn, needs, legacy_starts):
                 self.needs = needs
                 return Future()
 
@@ -193,6 +198,39 @@ class PauseMonitorTests(unittest.TestCase):
         self.assertEqual(third['BTC/USDT:USDT']['continuous_since'], now)
         self.assertEqual(third['BTC/USDT:USDT']['ask'], 101)
 
+    def test_legacy_pause_backfills_before_earliest_possible_shock(self):
+        from entry_pause_monitor import EntryPauseMonitor
+        from entry_volume import legacy_volume_start, legacy_volume_baseline
+
+        now = 1800000030
+        pair = 'BTC/USDT:USDT'
+        meta = dict(phase='paused', created=now - 7200, last_adverse=now - 1800)
+        start = legacy_volume_start(meta)
+        candles = rows(now, 300, 120)
+        for candle in candles:
+            if candle[0] >= (meta['created'] - 300) * 1000:
+                candle[5] = 40
+
+        class Client:
+            def fetch_ohlcv(self, pair, timeframe, since=None, limit=None):
+                if timeframe == '5m':
+                    if since is None:
+                        return candles[-28:]
+                    return [r for r in candles if r[0] >= since][:limit]
+                return rows(now, 60 if timeframe == '1m' else 900, 52)
+
+            def fetch_order_book(self, pair, **kwargs):
+                return dict(bids=[[100, 1]], asks=[[101, 1]])
+
+        monitor = EntryPauseMonitor(clock=lambda: now)
+        self.addCleanup(monitor.close)
+        monitor._client = Client()
+        result = monitor.collect({pair: now - 120}, {pair: start})[pair]
+        self.assertEqual(result['volume'][0][0], start * 1000)
+        self.assertEqual(legacy_volume_baseline(result['volume'], start, meta['last_adverse']), 10)
+        with self.assertRaisesRegex(ValueError, '补齐'):
+            legacy_volume_baseline(candles[-28:], start, meta['last_adverse'])
+
     def test_pending_worker_never_blocks_trading_thread(self):
         self.assertIsNotNone(
             importlib.util.find_spec('entry_pause_monitor'), 'public pause monitor missing'
@@ -224,7 +262,7 @@ class PauseMonitorTests(unittest.TestCase):
         monitor._future = Future()  # Even while other I/O remains pending, drain known volume.
         snapshots = monitor.tick(datetime.fromtimestamp(now, timezone.utc), [])
         self.assertIn('BTC/USDT:USDT', snapshots)
-        self.assertEqual(snapshots['BTC/USDT:USDT']['signals']['long']['ratio'], 4.0)
+        self.assertEqual(long_shock(snapshots['BTC/USDT:USDT'])['ratio'], 4.0)
         self.assertNotIn('minute', snapshots['BTC/USDT:USDT'])
 
     def test_observed_intrabar_shock_survives_later_direction_reversal(self):
@@ -237,7 +275,7 @@ class PauseMonitorTests(unittest.TestCase):
             def fetch_ohlcv(self, pair, timeframe, since=None, limit=None):
                 data = rows(now, 300 if timeframe == '5m' else 60, 28 if timeframe == '5m' else 10)
                 if timeframe == '5m':
-                    data[-1][4:] = [99.0 if adverse else 101.0, 40.0]
+                    data[-1][4:] = [99.0 if adverse else 101.0, 20.0]
                 return data
 
             def fetch_order_book(self, pair, limit):
@@ -251,7 +289,8 @@ class PauseMonitorTests(unittest.TestCase):
         now += 10
         monitor.collect({'BTC/USDT:USDT': now - 120})
         snapshots = monitor.drain()
-        signal = snapshots['BTC/USDT:USDT']['signals']['long']
+        self.assertIsNone(long_shock(snapshots['BTC/USDT:USDT']))
+        signal = long_shock(snapshots['BTC/USDT:USDT'], baseline=5)
         self.assertIsNotNone(signal)
         self.assertEqual(signal['at'], 1800000030.0)
 
@@ -288,5 +327,5 @@ class PauseMonitorTests(unittest.TestCase):
         self.assertNotIn('trend', second)
         drained = monitor.drain()['BTC/USDT:USDT']
         self.assertNotIn('trend', drained)
-        self.assertEqual(drained['signals']['long']['ratio'], 4)
+        self.assertEqual(long_shock(drained)['ratio'], 4)
         self.assertEqual(drained['ask'], 100)

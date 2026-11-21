@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import datetime, timezone
 from math import isfinite
+from typing import NamedTuple
 
 COOLDOWN = 900
 MAX_AGE = 30
@@ -63,20 +64,72 @@ def checked_rows(rows, width, observed_at, now, minimum=1):
     return rows
 
 
-def analyze_volume(rows, observed_at, now, direction):
-    """Actual base volume, never extrapolated; also retain recent closed shocks."""
+class VolumeSample(NamedTuple):
+    at: float
+    direction: str
+    volume: float
+    average: float
+
+
+def volume_samples(rows, observed_at, now):
+    """Use actual intrabar volume and the 24 completed candles preceding each bar."""
     checked_rows(rows, 300, observed_at, now, 28)
-    latest = None
+    samples = []
     for i in range(len(rows) - 4, len(rows)):
         stamp, op, _, _, close, volume = rows[i][:6]
-        baseline = sum(r[5] for r in rows[i - 24 : i]) / 24
-        if baseline <= 0:
+        average = sum(r[5] for r in rows[i - 24 : i]) / 24
+        if not isfinite(average) or average <= 0:
             raise EntryDataError('入场均量不可用')
-        adverse = close < op if direction == 'long' else close > op
         at = observed_at if i == len(rows) - 1 else stamp / 1000 + 300
-        if adverse and volume / baseline >= 4 and now - at < COOLDOWN:
-            latest = {'at': at, 'ratio': volume / baseline}
+        if close != op and now - at < COOLDOWN:
+            samples.append(VolumeSample(at, 'long' if close < op else 'short', volume, average))
+    return samples
+
+
+def volume_shock(samples, now, direction, baseline=None):
+    if baseline is not None and (not isfinite(baseline) or baseline <= 0):
+        raise EntryDataError('冻结均量无效，继续暂停')
+    latest = None
+    for sample in sorted(samples, key=lambda sample: sample.at):
+        if sample.direction != direction or not 0 <= now - sample.at < COOLDOWN:
+            continue
+        average = sample.average if baseline is None else min(baseline, sample.average)
+        ratio = sample.volume / average
+        if ratio >= 4:
+            if baseline is None:
+                baseline = sample.average
+            latest = dict(at=sample.at, ratio=ratio, baseline=baseline)
     return latest
+
+
+def legacy_volume_start(meta):
+    """Old paused plans recorded only the latest shock, not the first trigger."""
+    if (
+        'volume_baseline' in meta
+        or 'last_adverse' not in meta
+        or (meta['phase'] == 'watching' and meta.get('decision') in ('ready', 'normal'))
+        or meta['phase'] in ('filled', 'done')
+    ):
+        return None
+    created = meta.get('original_created', meta['created'])
+    first = min(created - COOLDOWN, meta['last_adverse'] - 300)
+    return (int(first) // 300 - 24) * 300
+
+
+def legacy_volume_baseline(rows, start, last_adverse):
+    # Take the lowest possible trigger average. Intrabar reversals cannot be replayed.
+    offset = (start * 1000 - rows[0][0]) // 300000
+    if offset < 0 or last_adverse > rows[-1][0] / 1000 + 300:
+        raise EntryDataError('等待补齐旧暂停计划的5m均量历史')
+    averages = (
+        sum(r[5] for r in rows[i - 24 : i]) / 24
+        for i in range(int(offset) + 24, len(rows))
+        if rows[i][0] / 1000 <= last_adverse
+    )
+    baseline = min((v for v in averages if v > 0 and isfinite(v)), default=None)
+    if baseline is None:
+        raise EntryDataError('旧暂停计划的历史均量不可用')
+    return baseline
 
 
 def analyze_recovery_trend(rows, observed_at, now):

@@ -174,7 +174,9 @@ class PauseIntegrationTests(unittest.TestCase):
     def test_new_plan_respects_observed_shock_even_if_forming_bar_reversed(self):
         self.prepare()
         snap = self.controller.snapshots[self.request['pair']]
-        snap['signals'] = {'long': dict(at=snap['observed_at'] - 10, ratio=4.0)}
+        from entry_volume import VolumeSample
+
+        snap['samples'] = [VolumeSample(snap['observed_at'] - 10, 'long', 40, 10)]
         snap['volume'][-1][4] = 106.0
         snap['volume'][-1][2] = 106.0
         row = self.bot._execute_entry_request(self.request, self.ref)
@@ -191,7 +193,7 @@ class PauseIntegrationTests(unittest.TestCase):
         snapshot.update(
             observed_at=now,
             minute=flat_rows(now, 60, 30, 99),
-            volume=rows(now, 300, 28, 101),
+            volume=rows(now, 300, 121, 101),
             bid=98.9,
             ask=99,
             trend=dict(direction='偏多', observed_at=now, closed_at=int(now) // 900 * 900),
@@ -264,6 +266,44 @@ class PauseIntegrationTests(unittest.TestCase):
             api.create_order('BTC/USDT:USDT', 'market', 'sell', 1, None, {'reduceOnly': True})
             self.assertEqual(len(outbound), 2)
 
+    def test_final_guard_rejects_frozen_only_intrabar_shock_after_reversal(self):
+        from unittest.mock import patch
+        from entry_risk import EntryRiskError
+        from entry_volume import VolumeSample
+
+        self.prepare()
+        now = self.controller.snapshots[self.request['pair']]['observed_at']
+        snap = self.controller.snapshots[self.request['pair']]
+        snap.update(samples=[VolumeSample(now - 10, 'long', 40, 20)])
+        for row in snap['volume']:
+            row[4:] = [106, 20]
+        store = self.strategy.entry_requests
+        store.put_pause(
+            dict(
+                ref=self.ref,
+                attempt_ref=self.ref,
+                phase='resuming',
+                decision='ready',
+                created=now - 3600,
+                checked_until=now - 120,
+                deadline=now + 3600,
+                ever_paused=True,
+                last_adverse=now - 901,
+                volume_baseline=10,
+                request=self.request,
+            )
+        )
+        self.exchange.fetch_l2_order_book = lambda *args: dict(bids=[[101, 1]], asks=[[102, 1]])
+        with patch('entry_pause.time.time', return_value=now), self.assertRaises(EntryRiskError):
+            self.controller.guard(self.ref)
+        saved = store.get_pause(self.ref)
+        self.assertEqual(saved['last_adverse'], now - 10)
+        self.assertEqual(saved['decision'], 'paused')
+        self.assertEqual(saved['volume_baseline'], 10)
+        # Only a confirmed placement starts a new independently anchored episode.
+        self.controller.submitted(self.ref, {'id': 2, 'order_ids': ['next']})
+        self.assertNotIn('volume_baseline', store.get_pause(self.ref))
+
     def test_slow_final_book_cannot_outlive_trend_freshness_or_original_deadline(self):
         from unittest.mock import patch
         from entry_risk import EntryRiskError
@@ -280,7 +320,7 @@ class PauseIntegrationTests(unittest.TestCase):
                 self.controller.snapshots[self.request['pair']] = dict(
                     observed_at=base,
                     minute=flat_rows(base, 60, 30, 99),
-                    volume=rows(base, 300, 28, 101),
+                    volume=rows(base, 300, 121, 101),
                     bid=98.9,
                     ask=99,
                     continuous_since=base - 1000,
