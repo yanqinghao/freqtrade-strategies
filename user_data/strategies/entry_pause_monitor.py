@@ -6,9 +6,7 @@ from queue import SimpleQueue, Empty
 from market_monitor import HourlyMarketMonitor, MONITOR_PAIRS
 from entry_volume import (
     checked_rows,
-    volume_samples,
-    legacy_volume_start,
-    COOLDOWN,
+    analyze_volume,
     analyze_recovery_trend,
     EntryDataError,
     data_error_reason,
@@ -25,18 +23,12 @@ class EntryPauseMonitor(HourlyMarketMonitor):
         self._continuous = {}
         self._scheduled = 0
         self._updates = SimpleQueue()
-        self._samples = {}
+        self._signals = {}
 
-    def collect(self, needs, legacy_starts=None):
+    def collect(self, needs):
         volumes, results = {}, {}
         # Publish valid volume immediately, before historical backfill or book I/O.
         # Those can block restoration, but must not discard known cancellation evidence.
-        now = self.clock()
-        self._samples = {
-            pair: samples
-            for pair, samples in self._samples.items()
-            if now - self._last[pair] < COOLDOWN
-        }
         for pair in needs:
             try:
                 observed = self.clock()
@@ -48,19 +40,22 @@ class EntryPauseMonitor(HourlyMarketMonitor):
                 if self._volume_candles is not None:
                     observed = self._volume_observed_at
                 current = self.clock()
-                fresh = volume_samples(volume, observed, current)
-                # Retain adverse observations even below the rolling threshold. Each
-                # plan applies its own frozen baseline after the worker queue is drained.
-                recent = (s for s in self._samples.get(pair, ()) if current - s.at < COOLDOWN)
-                samples = tuple(dict.fromkeys([*recent, *fresh]))
-                self._samples[pair] = samples
+                fresh = {
+                    direction: analyze_volume(volume, observed, current, direction)
+                    for direction in ('long', 'short')
+                }
+                signals = dict(self._signals.get(pair, {}))
+                for direction, signal in fresh.items():
+                    if signal and signal['at'] >= signals.get(direction, {}).get('at', 0):
+                        signals[direction] = signal
+                self._signals[pair] = signals
                 if observed - self._last.get(pair, 0) > 30:
                     self._continuous[pair] = observed
                 self._last[pair] = observed
                 snapshot = dict(
                     observed_at=observed,
                     volume=volume,
-                    samples=samples,
+                    signals=signals,
                     continuous_since=self._continuous[pair],
                 )
                 volumes[pair] = snapshot
@@ -76,19 +71,6 @@ class EntryPauseMonitor(HourlyMarketMonitor):
             try:
                 client = self._get_client()
                 observed = snapshot['observed_at']
-                legacy_start = (legacy_starts or {}).get(pair)
-                volume = snapshot['volume']
-                if legacy_start is not None and legacy_start * 1000 < volume[0][0]:
-                    cursor = legacy_start * 1000
-                    history = []
-                    while cursor < volume[0][0]:
-                        count = min(1000, int((volume[0][0] - cursor) // 300000))
-                        batch = client.fetch_ohlcv(pair, timeframe='5m', since=cursor, limit=count)
-                        if not batch or batch[0][0] != cursor or batch[-1][0] < cursor:
-                            raise EntryDataError('旧暂停计划缺少5m均量历史')
-                        history.extend(r for r in batch if r[0] < volume[0][0])
-                        cursor = batch[-1][0] + 300000
-                    snapshot = {**snapshot, 'volume': history + volume}
                 minute = []
                 cursor = int(needs[pair]) // 60 * 60000
                 while cursor <= int(observed) // 60 * 60000:
@@ -146,16 +128,12 @@ class EntryPauseMonitor(HourlyMarketMonitor):
         if stamp - self._scheduled >= 10:
             # Advisory symbols are prewarmed; protection follows every live plan.
             needs = dict.fromkeys(MONITOR_PAIRS)
-            legacy_starts = {}
             for meta in plans:
                 if meta['phase'] not in ('filled', 'done'):
                     pair = meta['request']['pair']
-                    legacy = legacy_volume_start(meta)
-                    if legacy is not None:
-                        legacy_starts[pair] = min(legacy_starts.get(pair, legacy), legacy)
                     since = meta.get('checked_until', meta['created'])
                     previous = needs.get(pair)
                     needs[pair] = min(stamp - 120 if previous is None else previous, since)
             self._scheduled = stamp
-            self._future = self._executor.submit(self.collect, needs, legacy_starts)
+            self._future = self._executor.submit(self.collect, needs)
         return results

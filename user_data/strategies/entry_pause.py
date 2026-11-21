@@ -12,10 +12,7 @@ from candle_exits import RULE_FIELDS
 from entry_targets import UNIT_FIELDS
 from entry_risk import EntryRiskError
 from entry_volume import (
-    volume_samples,
-    volume_shock,
-    legacy_volume_start,
-    legacy_volume_baseline,
+    analyze_volume,
     advance_pause,
     EntryDataError,
     data_error_reason,
@@ -79,44 +76,26 @@ class EntryPause:
             )
         return reason
 
-    def _record_volume(self, meta, samples, now):
-        signal = volume_shock(
-            samples, now, meta['request']['direction'], meta.get('volume_baseline')
-        )
-        if signal:
-            meta.update(
-                last_adverse=max(meta.get('last_adverse', 0), signal['at']),
-                volume_baseline=signal['baseline'],
-                ever_paused=True,
-            )
-            if meta['decision'] not in ENDED:
-                meta['decision'] = 'paused'
-            self.store.put_pause(meta)
-        return signal
-
-    def _check_volume(self, meta, snapshot, now):
-        cached = snapshot.get('samples', ())
-        legacy = legacy_volume_start(meta)
-        try:
-            fresh = volume_samples(snapshot['volume'], snapshot['observed_at'], now)
-        except (EntryDataError, KeyError):
-            # Valid intrabar evidence can outlive a stale or incomplete current snapshot.
-            if legacy is None:
-                self._record_volume(meta, cached, now)
-            raise
-        if legacy is not None:
-            meta['volume_baseline'] = legacy_volume_baseline(
-                snapshot['volume'], legacy, meta['last_adverse']
-            )
-            self.store.put_pause(meta)
-        return self._record_volume(meta, [*cached, *fresh], now)
-
     def evaluate(self, meta, now, *, quote=None):
         snapshot = self.snapshots.get(meta['request']['pair'])
         if not snapshot:
             raise EntryDataError('等待新鲜行情')
         observed = snapshot['observed_at']
-        signal = self._check_volume(meta, snapshot, now)
+        signal = snapshot.get('signals', {}).get(meta['request']['direction'])
+        if signal and 0 <= now - signal['at'] < 900:
+            meta['last_adverse'] = max(meta.get('last_adverse', 0), signal['at'])
+            meta['ever_paused'] = True
+            if meta['decision'] not in ENDED:
+                meta['decision'] = 'paused'
+            self.store.put_pause(meta)
+        signal = analyze_volume(snapshot['volume'], observed, now, meta['request']['direction'])
+        # Persist every observed shock before attempting full price-history validation.
+        if signal:
+            meta['last_adverse'] = max(meta.get('last_adverse', 0), signal['at'])
+            meta['ever_paused'] = True
+            if meta.get('decision') not in ENDED:
+                meta['decision'] = 'paused'
+            self.store.put_pause(meta)
         short = meta['request']['direction'] == 'short'
         quote = snapshot['bid' if short else 'ask'] if quote is None else quote
         updated = advance_pause(
@@ -185,7 +164,12 @@ class EntryPause:
         self.store.put_pause(meta)
         try:
             snapshot = self.snapshots[request['pair']]
-            self._check_volume(meta, snapshot, now)
+            signal = analyze_volume(
+                snapshot['volume'], snapshot['observed_at'], now, request['direction']
+            )
+            signal = signal or snapshot.get('signals', {}).get(request['direction'])
+            if signal and 0 <= now - signal['at'] < 900:
+                meta.update(last_adverse=signal['at'], ever_paused=True, decision='paused')
         except (KeyError, ValueError):
             meta['decision'] = 'waiting_data'
         if meta['decision'] != 'normal':
@@ -201,16 +185,8 @@ class EntryPause:
             return
         if len(result.get('order_ids', [])) != 1:
             raise ValueError('原限价订单关联尚未确认')
-        self._watch_order(meta, result['id'], result['order_ids'][0])
-
-    def _watch_order(self, meta, trade_id, order_id):
-        if meta.get('trade_id') == trade_id and meta.get('order_id') == order_id:
-            if meta['phase'] in ('watching', 'canceling', 'paused', 'filled', 'done'):
-                return  # A duplicate receipt must not clear a later shock for this order.
-        # A confirmed placement ends this pause episode, including after reconciliation.
-        for key in ('zero_receipt', 'volume_baseline', 'last_adverse'):
-            meta.pop(key, None)
-        meta.update(phase='watching', trade_id=trade_id, order_id=order_id)
+        meta.pop('zero_receipt', None)
+        meta.update(phase='watching', trade_id=result['id'], order_id=result['order_ids'][0])
         self.store.put_pause(meta)
 
     def guard(self, ref, *, now=None):
@@ -234,7 +210,13 @@ class EntryPause:
         try:
             if meta['phase'] == 'submitting':
                 snap = self.snapshots[meta['request']['pair']]
-                if self._check_volume(meta, snap, now):
+                signal = analyze_volume(
+                    snap['volume'], snap['observed_at'], now, meta['request']['direction']
+                )
+                signal = signal or snap.get('signals', {}).get(meta['request']['direction'])
+                if signal and 0 <= now - signal['at'] < 900:
+                    meta.update(last_adverse=signal['at'], ever_paused=True, decision='paused')
+                    self.store.put_pause(meta)
                     raise EntryDataError('新增逆向放量')
             else:
                 # Actual executable best price determines whether the original
@@ -327,7 +309,9 @@ class EntryPause:
         ]
         if len(orders) == 1:
             order = orders[0]
-            self._watch_order(meta, order.ft_trade_id, order.order_id)
+            meta.pop('zero_receipt', None)
+            meta.update(phase='watching', order_id=order.order_id, trade_id=order.ft_trade_id)
+            self.store.put_pause(meta)
         elif row and row['state'] == 'resolved':
             meta['phase'] = 'done'
             self.store.put_pause(meta)

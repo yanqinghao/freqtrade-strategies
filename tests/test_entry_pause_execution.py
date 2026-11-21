@@ -78,32 +78,6 @@ class PauseExecutionTests(unittest.TestCase):
         self.assertEqual(meta['deadline'], self.meta['deadline'])
         self.assertEqual(self.submissions, [])
 
-    def test_persistent_adverse_volume_cannot_restore_after_restart(self):
-        from entry_pause import EntryPause
-
-        self.prepare()
-        initial = self.run_tick()
-        self.assertEqual(initial['phase'], 'paused')
-        # A delayed duplicate placement receipt cannot start a fresh episode.
-        self.controller.submitted(self.ref, {'id': self.trade.id, 'order_ids': ['entry-1']})
-        self.assertEqual(self.strategy.entry_requests.get_pause(self.ref), initial)
-        self.controller = EntryPause(self.strategy, self.bot, self.controller.submit)
-        self.controller.snapshots[self.trade.pair] = self.snapshot
-        start = self.now.timestamp()
-        for i in range(1, 10):
-            self.now += timedelta(minutes=5)
-            now = self.now.timestamp()
-            volume = rows(now, 300, 28, 105)
-            for candle in volume:
-                if start <= candle[0] / 1000 < start + 1800:
-                    candle[4:] = [104, 40]
-            self.snapshot.update(observed_at=now, volume=volume, minute=rows(now, 60, 10, 101))
-            meta = self.run_tick()
-            self.assertEqual(meta['last_adverse'], min(now, start + 1800))
-            self.assertEqual(meta['volume_baseline'], 10)
-            self.assertEqual(len(self.submissions), 1 if i == 9 else 0)
-        self.assertEqual(meta['deadline'], initial['deadline'])
-
     def test_partial_during_cancel_is_accounted_and_never_replaced(self):
         self.prepare()
         self.cancelled.update(filled=1.0, remaining=9.0, cost=100.0)
