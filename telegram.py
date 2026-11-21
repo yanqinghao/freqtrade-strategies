@@ -19,6 +19,7 @@ from freqtrade.rpc import RPCException
 from freqtrade.rpc._telegram_base import Telegram as UpstreamTelegram, authorized_only
 from candle_exits import RULE_GROUPS, RULE_FIELDS, TIMEFRAMES, validate_rules, describe_rules
 
+from freqtrade.rpc.order_management import save_stop_edit
 from freqtrade.rpc.order_panel import OrderPanelMixin
 from freqtrade.rpc.watch_panel import WatchPanelMixin
 from freqtrade.rpc.notification_format import notice, with_time, local_time
@@ -132,7 +133,7 @@ def entry_usage(direction):
         '新开仓SL任选：sl=价格 / loss=亏损USDT / sl_pct=币价逆向百分比。\n'
         'TP任选：tp=价格列表 / profit=原始完整仓位净浮盈USDT列表 / tp_pct=币价顺向百分比列表。\n'
         '每档口径不可混用；金额/幅度列表须递增，最多三档。SL与TP可用不同口径。\n'
-        '金额/幅度目标按实际初始成交校准并固定，SL只收紧；不含未来资金费和滑点。\n'
+        '金额/幅度目标按实际初始成交校准并固定，自动校准时SL只收紧；不含未来资金费和滑点。\n'
         f'{command} BTC 10 5 loss=2 profit=2,4,6\n'
         f'{command} BTC 10 5 sl_pct=1 tp_pct=1,2,3\n'
         '新参数用于新开仓；已有仓位的加仓与修改继续使用价格参数。\n\n'
@@ -1066,7 +1067,7 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
                     for field in RULE_GROUPS['extend_trigger']
                 )
             ):
-                raise ValueError('延伸止盈已生效，不能修改 TP 或延伸条件；仍可收紧SL或平仓')
+                raise ValueError('延伸止盈已生效，不能修改 TP 或延伸条件；仍可修改SL或平仓')
             if trade.has_open_orders and request.get(
                 'exit_points', plan.get('exit_points')
             ) != plan.get('exit_points'):
@@ -1078,10 +1079,13 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             if not plan.get('stop_loss'):
                 raise ValueError('请提供 sl=<止损价>')
             plan['trade_id'] = trade.id
+            if 'stop_loss' in request:
+                result = save_stop_edit(self, trade, plan)
+                return f'{trade.pair} {result}'
             if strategy.entry_pause:
                 strategy.entry_pause.revise_trade(trade.id, plan)
             strategy.set_manual_plan(trade.pair, plan)
-            return trade.pair
+            return f'{trade.pair} 计划已更新。'
 
     @authorized_only
     async def _set_manual(self, update, context):
@@ -1099,9 +1103,9 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             return
         try:
             async with self._manual_order_lock:
-                pair = await self._await_command(self._update_plan, args[0], args[1:])
+                result = await self._await_command(self._update_plan, args[0], args[1:])
             await self._send_msg(
-                f'{pair} 计划已更新；保护止损只向盈利方向收紧。' '收盘规则变更从下一次新收盘起判断；/overview 查看当前规则。',
+                f'{result}\n/overview 查看当前规则。',
                 parse_mode=None,
             )
         except (ValueError, RPCException) as exc:

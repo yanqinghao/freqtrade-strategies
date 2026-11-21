@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 from math import isfinite, ulp
 
 from freqtrade.exchange import ROUND_DOWN, ROUND_UP
+from entry_risk import manual_stop_active
 from notification_format import notice
 
 logger = logging.getLogger(__name__)
@@ -179,12 +180,14 @@ def check_protection(strategy, trade, now, *, force=False):
                 continue
             try:
                 result = _evaluate(exchange, trade, order.order_id, raw, target)
-                if (
-                    state.get('stage') == 2
-                    and state.get('tail_stop', plan.get('tail_stop_preset')) is not None
-                    and (len(trade.open_sl_orders) != 1 or _number(result['stop_price']) != target)
+                stage = state.get('stage', 0)
+                exact = manual_stop_active(state, stage) or (
+                    stage == 2 and state.get('tail_stop', plan.get('tail_stop_preset')) is not None
+                )
+                if exact and (
+                    len(trade.open_sl_orders) != 1 or _number(result['stop_price']) != target
                 ):
-                    raise ValueError('交易所触发价或止损单数量与尾仓设置尚未一致')
+                    raise ValueError('交易所触发价或止损单数量与止损设置尚未一致')
                 break
             except ValueError as error:
                 result = {'status': 'unconfirmed', 'reason': str(error)}

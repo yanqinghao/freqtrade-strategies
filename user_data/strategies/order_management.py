@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from math import isfinite, ulp
 
+from freqtrade.exchange import ROUND_DOWN, ROUND_UP
 from freqtrade.enums import SignalDirection
 from freqtrade.persistence import Trade
 from candle_exits import RULE_FIELDS, validate_rules
@@ -19,7 +20,7 @@ from entry_lifecycle import (
 from entry_risk import number, saved_plan, effective_stop, observed_quantities
 from entry_pause import ENDED as PAUSE_ENDS
 from entry_targets import clear_units
-from tail_stop import edit_tail_stop, tail_price
+from tail_stop import replace_stop, store_plan, tail_price
 
 
 PAUSE_PHASES = {'paused', 'canceling', 'resuming', 'submitting', 'unknown'}
@@ -241,7 +242,9 @@ def snapshot(owner, ident):
         final_tp_started=state.get('final_tp_started', False),
     )
     try:
-        data['stop'] = float(effective_stop(strategy, trade, plan))
+        data['stop'] = (
+            float(effective_stop(strategy, trade, plan)) if plan else trade.stop_loss or None
+        )
     except ValueError:
         data['stop'] = None
     data['revision'] = hashlib.sha256(
@@ -288,6 +291,72 @@ def checked(owner, ident, revision):
     return get_trade(ident), data
 
 
+def save_stop_edit(owner, trade, plan, data=None):
+    """Use native trailing updates for tightening and explicitly replace a widened stop."""
+    bot = owner._rpc._freqtrade
+    strategy = bot.strategy
+    if data is None:
+        original = saved_plan(strategy, trade)
+        old = (
+            float(effective_stop(strategy, trade, original))
+            if original
+            else trade.stop_loss or None
+        )
+    else:
+        old = data['stop']
+    price = float(number(plan['stop_loss'], positive=True))
+    widening = old is not None and (price > old if trade.is_short else price < old)
+    if data is None and (widening or not trade.amount):
+        data = snapshot(owner, trade.id)
+    if data is not None:
+        if not data['fresh']:
+            raise ValueError('最新订单状态未核实，请刷新后重试。')
+        reference = data['orders'][0]['price'] if data['kind'] == 'pending' else data['rate']
+    else:
+        reference = float(
+            number(
+                bot.exchange.get_rate(
+                    trade.pair, side='exit', is_short=trade.is_short, refresh=True
+                ),
+                positive=True,
+            )
+        )
+    if price <= reference if trade.is_short else price >= reference:
+        raise ValueError('SL 已越过参考价；立即退出请使用快速全平。')
+    state = strategy._execution(trade)
+    if state.get('full_exit'):
+        raise ValueError('正在退出，请等待结果后刷新。')
+    if widening:
+        if data['kind'] == 'pending':
+            store_plan(strategy, trade, plan)
+            state = strategy._execution(trade)
+            state['protected_stop'] = price
+            if trade.stop_loss:
+                trade.stop_loss = price
+                trade.stop_loss_pct = -abs((price / reference - 1) * (trade.leverage or 1))
+            strategy._save_execution(trade, state)
+            Trade.commit()
+            return f'挂单硬止损已改为 {price:g}。'
+        if trade.has_open_orders or data['kind'] != 'position' or state.get('final_tp_started'):
+            raise ValueError('仍有订单或成交待处理，请等待完成后修改止损。')
+        price = float(
+            number(
+                bot.exchange.price_to_precision(
+                    trade.pair, price, rounding_mode=ROUND_DOWN if trade.is_short else ROUND_UP
+                ),
+                positive=True,
+            )
+        )
+        plan['stop_loss'] = price
+        return replace_stop(bot, trade, data, price, plan=plan)
+    store_plan(strategy, trade, plan)
+    if state.get('tail_overridden_sl') is not None:
+        state = strategy._execution(trade)
+        state.pop('tail_overridden_sl', None)
+        strategy._save_execution(trade, state)
+    return f'已保存硬止损目标 {price:g}。'
+
+
 def edit_plan(owner, ident, revision, changes):
     bot = owner._rpc._freqtrade
     with bot._exit_lock:
@@ -316,7 +385,7 @@ def edit_plan(owner, ident, revision, changes):
             if data['stage'] == 2:
                 if tail == 'keep' or 'tp2' in changes:
                     raise ValueError('TP2 已完成，请选择成本价或输入尾仓止损价。')
-                return edit_tail_stop(bot, trade, data, tail)
+                return replace_stop(bot, trade, data, tail)
             plan['tail_stop_preset'] = tail
         if not changes or set(changes) - {
             'tail_stop',
@@ -352,14 +421,6 @@ def edit_plan(owner, ident, revision, changes):
                     targets[index] = value
             elif key == 'stop_loss':
                 value = float(number(value, positive=True))
-                stop = data['stop']
-                if stop and (value > stop if trade.is_short else value < stop):
-                    raise ValueError(f'保护只能收紧，当前有效 SL 为 {stop:g}。')
-                reference = (
-                    data['orders'][0]['price'] if data['kind'] == 'pending' else data['rate']
-                )
-                if value <= reference if trade.is_short else value >= reference:
-                    raise ValueError('SL 已越过参考价；立即退出请使用快速全平。')
                 plan[key] = value
             elif key != 'tail_stop':
                 plan[key] = value
@@ -383,18 +444,13 @@ def edit_plan(owner, ident, revision, changes):
         # Persist intent in the same JSON update. _plan observes this marker after a crash too.
         if targets != data['plan'].get('exit_points', []):
             plan['tp_keep_progress_from'] = data['plan'].get('exit_points', [])
-        if bot.strategy.entry_pause:
-            bot.strategy.entry_pause.revise_trade(trade.id, plan)
-        bot.strategy.set_manual_plan(trade.pair, plan)
-        bot.strategy._plan(trade)
-        if 'stop_loss' in changes and state.get('tail_overridden_sl') is not None:
-            latest = bot.strategy._execution(trade)
-            latest.pop('tail_overridden_sl', None)
-            bot.strategy._save_execution(trade, latest)
+        if 'stop_loss' in changes:
+            return save_stop_edit(owner, trade, plan, data)
+        store_plan(bot.strategy, trade, plan)
         if 'tail_stop' in changes:
             label = '保留当时的有效止损' if tail == 'keep' else f'保护至 {tail:g}，已有更紧保护优先'
             return f'已保存。TP2 完成后{label}。'
-        return '已保存；保护只收紧，收盘规则从下一次新收盘开始判断。'
+        return '已保存。收盘规则从下一次新收盘开始判断。'
 
 
 def replace_entry(owner, ident, revision, price, ref):

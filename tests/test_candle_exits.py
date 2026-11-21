@@ -359,6 +359,7 @@ class CandlePlanValidationTests(unittest.TestCase):
         for tokens in (['tp=110,120,150'], ['extend_trigger=off']):
             with self.subTest(tokens=tokens), self.assertRaisesRegex(ValueError, '延伸'):
                 self.bot._update_plan(str(trade.id), tokens)
+        self.exchange.get_rate = lambda *args, **kwargs: 128
         self.bot._update_plan(str(trade.id), ['sl=121'])
         with self.assertRaisesRegex(ValueError, '延伸'):
             self.bot._submit_entry(self.request)

@@ -79,9 +79,7 @@ def describe_rules(plan, state=None):
         )
     extension = state.get('extension')
     if extension:
-        lines.append(
-            f"延伸已生效：TP3 {extension['target']:g}，" f"保护至少推进至 TP2 {extension['stop']:g}（触价退出，只收紧）。"
-        )
+        lines.append(f"延伸已生效：TP3 {extension['target']:g}，" f"触发延伸时保护推进至 TP2 {extension['stop']:g}。")
     elif plan.get('extend_trigger') is not None:
         lines.append(
             f"待延伸：TP2成交后，{plan['extend_tf']} 收盘 {'≤' if short else '≥'} "

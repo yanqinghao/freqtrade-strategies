@@ -1,4 +1,4 @@
-"""Explicit per-position TP2 protection edits, called under the native exit lock."""
+"""Explicit per-position stop replacements, called under the native exit lock."""
 
 import logging
 from datetime import datetime, timezone
@@ -36,7 +36,7 @@ def _cancel_old_stop(bot, trade, order, rate, simulated):
     except (ExchangeError, OperationalException, ValueError) as error:
         # A lost or unparseable acknowledgement can follow a successful cancellation.
         logger.warning(
-            'Tail stop cancel acknowledgement unavailable trade=%s order=%s (%s)',
+            'Stop cancel acknowledgement unavailable trade=%s order=%s (%s)',
             trade.id,
             ident,
             type(error).__name__,
@@ -51,7 +51,7 @@ def _cancel_old_stop(bot, trade, order, rate, simulated):
             final = exchange.fetch_stoploss_order(ident, trade.pair)
         except ExchangeError as error:
             logger.warning(
-                'Tail stop receipt unavailable trade=%s order=%s (%s)',
+                'Stop receipt unavailable trade=%s order=%s (%s)',
                 trade.id,
                 ident,
                 type(error).__name__,
@@ -59,7 +59,7 @@ def _cancel_old_stop(bot, trade, order, rate, simulated):
             continue
         status = final.get('status')
         logger.info(
-            'Tail stop cancel receipt trade=%s order=%s status=%s filled=%s',
+            'Stop cancel receipt trade=%s order=%s status=%s filled=%s',
             trade.id,
             ident,
             status,
@@ -80,7 +80,7 @@ def _cancel_old_stop(bot, trade, order, rate, simulated):
             raise ValueError('旧止损撤单或成交待核实，等待原生止损流程处理。')
     else:
         raise ValueError('交易所尚未确认旧止损已撤且零成交，新止损未设置。请刷新核对当前保护价。')
-    logger.info('Tail stop cancel confirmed trade=%s order=%s', trade.id, ident)
+    logger.info('Stop cancel confirmed trade=%s order=%s', trade.id, ident)
     bot.update_trade_state(trade, ident, final, stoploss_order=True)
     Trade.commit()
 
@@ -102,34 +102,42 @@ def tail_price(exchange, trade, value):
     return price
 
 
-def edit_tail_stop(bot, trade, data, price):
+def store_plan(strategy, trade, plan):
+    if strategy.entry_pause:
+        strategy.entry_pause.revise_trade(trade.id, plan)
+    strategy.set_manual_plan(trade.pair, plan)
+    strategy._plan(trade)
+
+
+def replace_stop(bot, trade, data, price, *, plan=None):
+    """Replace a verified, untriggered stop under the caller's native exit lock."""
     strategy, exchange = bot.strategy, bot.exchange
     state = strategy._execution(trade)
-    targets = data['plan']['exit_points']
     short = trade.is_short
     rate, old = data['rate'], data['stop']
     if old is None or _crossed(short, old, rate) or _crossed(short, price, rate):
         raise ValueError('已触及当前或请求的止损价，请核对持仓。')
     if trade.liquidation_price and _crossed(short, trade.liquidation_price, price):
-        raise ValueError('尾仓止损已越过强平保护边界。')
-    if _crossed(short, rate, targets[2]):
-        raise ValueError('已触及 TP3，等待退出。')
+        raise ValueError('止损已越过强平保护边界。')
+    targets = strategy._targets(data['plan'], trade)
+    final = targets[-1] if targets and state.get('stage', 0) >= len(targets) - 1 else None
+    if final and _crossed(short, rate, final):
+        raise ValueError('已触及最终止盈价，等待退出。')
     mode = strategy.config.get('runmode')
     simulated = strategy.config.get('dry_run', getattr(mode, 'value', mode) == 'dry_run')
     on_exchange = strategy.order_types.get('stoploss_on_exchange')
-    logger.info('Tail stop edit trade=%s old=%s requested=%s', trade.id, old, price)
+    logger.info('Stop edit trade=%s old=%s requested=%s', trade.id, old, price)
     if on_exchange:
         orders = list(trade.open_sl_orders)
         if len(orders) > 1 or (not orders and not simulated):
             raise ValueError('当前交易所止损单尚未唯一确认，请等待止损核验后刷新。')
         if (
-            orders
+            plan is None
+            and orders
             and old == price
             and state.get('tail_stop') == price
-            and (
-                check_protection(strategy, trade, datetime.now(timezone.utc), force=True)
-                and not simulated
-            )
+            and check_protection(strategy, trade, datetime.now(timezone.utc), force=True)
+            and not simulated
         ):
             return f'当前尾仓止损已经是 {price:g}，交易所已确认。'
         if orders:
@@ -146,27 +154,37 @@ def edit_tail_stop(bot, trade, data, price):
                 or trade.has_open_orders
                 or _crossed(short, old, rate)
                 or _crossed(short, price, rate)
-                or _crossed(short, rate, targets[2])
+                or (final and _crossed(short, rate, final))
             ):
                 raise ValueError('撤单后行情或持仓已变化，交回原生保护与退出流程。')
 
-    # Price is already rounded to the exchange tick. Preserve original stop metadata.
+    if plan is not None:
+        store_plan(strategy, trade, plan)
+    state = strategy._execution(trade)
+    if plan is None:
+        label = '尾仓止损'
+        state.update(tail_stop=price, tail_overridden_sl=data['plan']['stop_loss'])
+        state.pop('manual_stop_phase', None)
+    else:
+        label = '硬止损'
+        state['manual_stop_phase'] = [state.get('stage', 0), bool(state.get('extension'))]
+        state.pop('tail_overridden_sl', None)
+    state['protected_stop'] = price
+    state.pop('protection', None)
     trade.stop_loss = price
     trade.stop_loss_pct = -abs((price / rate - 1) * (trade.leverage or 1))
-    state = strategy._execution(trade)
-    state.update(
-        tail_stop=price, protected_stop=price, tail_overridden_sl=data['plan']['stop_loss']
-    )
-    state.pop('protection', None)
     strategy._save_execution(trade, state)
     Trade.commit()
     if not on_exchange:
-        return f'策略尾仓止损已设为 {price:g}。'
-    bot.handle_stoploss_on_exchange(trade)
+        return f'策略{label}已设为 {price:g}。'
+    try:
+        bot.handle_stoploss_on_exchange(trade)
+    except (ExchangeError, OperationalException) as error:
+        logger.warning('Stop placement unavailable trade=%s (%s)', trade.id, type(error).__name__)
     Trade.commit()
     if not trade.is_open:
         return '持仓已结束，请核对成交。'
     confirmed = check_protection(strategy, trade, datetime.now(timezone.utc), force=True)
     if simulated:
-        return f'模拟尾仓止损目标已设为 {price:g}。'
-    return f'尾仓止损 {price:g}：' + ('交易所已确认。' if confirmed else '交易所尚未确认，请核对 /order。')
+        return f'模拟{label}目标已设为 {price:g}。'
+    return f'{label} {price:g}：' + ('交易所已确认。' if confirmed else '交易所尚未确认，请核对 /order。')

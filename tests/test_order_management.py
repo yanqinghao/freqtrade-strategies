@@ -144,6 +144,12 @@ class OrderManagementTests(unittest.TestCase):
             self.assertEqual(self.management.snapshot(self.bot, trade.id)['stop'], floor)
 
     def test_live_tail_replacement_checks_both_exchange_receipts(self):
+        self.check_live_stop_replacement('tail_stop')
+
+    def test_live_hard_sl_replacement_checks_both_exchange_receipts(self):
+        self.check_live_stop_replacement('stop_loss')
+
+    def check_live_stop_replacement(self, field):
         from unittest.mock import patch
         from freqtrade.persistence import Order
         from ccxt import TICK_SIZE
@@ -190,11 +196,9 @@ class OrderManagementTests(unittest.TestCase):
         bot.handle_stoploss_on_exchange = Mock()
         bot.update_trade_state = Mock(side_effect=lambda t, ident, row, **kw: t.update_order(row))
 
-        def change():
+        def change(price=103):
             snap = self.management.snapshot(self.bot, trade.id)
-            return self.management.edit_plan(
-                self.bot, trade.id, snap['revision'], {'tail_stop': 103}
-            )
+            return self.management.edit_plan(self.bot, trade.id, snap['revision'], {field: price})
 
         with self.assertRaisesRegex(ValueError, '成交待核实'):
             change()
@@ -238,12 +242,12 @@ class OrderManagementTests(unittest.TestCase):
         )
         # A clean cancel followed by a rejected replacement must never be shown as confirmed.
         self.exchange.fetch_stoploss_order.side_effect = [
-            dict(new, stopPrice=110),
+            *([dict(new, stopPrice=110)] if field == 'tail_stop' else []),
             new,
             dict(new, status='canceled'),
         ]
         bot.handle_stoploss_on_exchange.side_effect = lambda t: False
-        self.assertIn('尚未确认', change())
+        self.assertIn('尚未确认', change(102 if field == 'stop_loss' else 103))
         self.assertEqual(trade.open_sl_orders, [])
 
     def test_pending_can_edit_rules_and_tp_but_changed_fill_invalidates_edit(self):
@@ -259,14 +263,63 @@ class OrderManagementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '变化'):
             self.management.edit_plan(self.bot, trade.id, snap['revision'], {'stop_loss': 95})
 
-    def test_short_sl_only_tightens_and_tp_order_is_not_silently_sorted(self):
+    def test_short_sl_respects_market_price_and_tp_order_is_not_silently_sorted(self):
         trade = self.prepare(short=True)
         snap = self.management.snapshot(self.bot, trade.id)
-        for patch in ({'stop_loss': 115}, {'tp2': 95}, {'tp1': float('nan')}):
+        for patch in ({'stop_loss': 99}, {'tp2': 95}, {'tp1': float('nan')}):
             with self.assertRaises(ValueError):
                 self.management.edit_plan(self.bot, trade.id, snap['revision'], patch)
         self.management.edit_plan(self.bot, trade.id, snap['revision'], {'stop_loss': 105})
         self.assertEqual(self.strategy.manual_open[trade.pair]['stop_loss'], 105)
+
+    def test_manual_sl_correction_reaches_native_and_strategy_after_restart(self):
+        for short, wrong, corrected in [(False, 98, 89), (True, 102, 112)]:
+            with self.subTest(short=short):
+                trade = self.prepare(short=short)
+                self.strategy.order_types = dict(
+                    self.strategy.order_types, stoploss_on_exchange=False
+                )
+                self.exchange.price_to_precision = lambda pair, value, rounding_mode: value
+                snap = self.management.snapshot(self.bot, trade.id)
+                self.management.edit_plan(
+                    self.bot, trade.id, snap['revision'], {'stop_loss': wrong}
+                )
+                trade.stop_loss = self.strategy._stop_price(trade, self.strategy._plan(trade))
+                snap = self.management.snapshot(self.bot, trade.id)
+                if short:
+                    self.bot._update_plan(str(trade.id), [f'sl={corrected}'])
+                else:
+                    self.management.edit_plan(
+                        self.bot, trade.id, snap['revision'], {'stop_loss': corrected}
+                    )
+                self.Trade.session.expire_all()
+                restarted = type(self.strategy)(self.strategy.config)
+                self.assertEqual(restarted._stop_price(trade, restarted._plan(trade)), corrected)
+                self.assertEqual(trade.stop_loss, corrected)
+                self.assertEqual(self.management.snapshot(self.bot, trade.id)['stop'], corrected)
+
+    def test_next_tp_resumes_automatic_protection_after_manual_correction(self):
+        trade = self.prepare()
+        self.strategy.order_types = dict(self.strategy.order_types, stoploss_on_exchange=False)
+        self.exchange.price_to_precision = lambda pair, value, rounding_mode: value
+        self.exchange.get_rate.return_value = 115
+        self.strategy._save_execution(trade, {'protected_stop': 105, 'stage': 1})
+        self.bot._update_plan(str(trade.id), ['sl=97'])
+        plan = self.strategy._plan(trade)
+        self.assertEqual(self.strategy._stop_price(trade, plan), 97)
+        self.assertEqual(self.management.snapshot(self.bot, trade.id)['stop'], 97)
+        state = self.strategy._execution(trade)
+        state['stage'] = 2
+        self.strategy._save_execution(trade, state)
+        self.assertEqual(self.strategy._stop_price(trade, plan), 110)
+        self.assertEqual(self.management.snapshot(self.bot, trade.id)['stop'], 110)
+
+    def test_pending_sl_correction_replaces_cached_protection_without_exchange_order(self):
+        trade = self.prepare(pending=True)
+        self.strategy._save_execution(trade, {'protected_stop': 90})
+        snap = self.management.snapshot(self.bot, trade.id)
+        self.management.edit_plan(self.bot, trade.id, snap['revision'], {'stop_loss': 85})
+        self.assertEqual(self.management.snapshot(self.bot, trade.id)['stop'], 85)
 
     def test_replacement_partial_cancel_never_resubmits(self):
         trade = self.prepare(pending=True)

@@ -136,6 +136,11 @@ def plan_for_entry(strategy, request, trade, *, rate=None):
     return plan
 
 
+def manual_stop_active(state, stage):
+    # A new TP fill or candle extension starts a new automatic protection phase.
+    return state.get('manual_stop_phase') == [stage, bool(state.get('extension'))]
+
+
 def tail_stage_stop(state, plan, first_target):
     """None keeps the protection already earned when TP2 completes."""
     value = state.get('tail_stop', plan.get('tail_stop_preset', first_target))
@@ -168,6 +173,9 @@ def effective_stop(strategy, trade, plan, fee_open=0, fee_close=0):
         stage = 0
     if not isinstance(stage, int) or isinstance(stage, bool) or not 0 <= stage <= 3:
         raise EntryRiskError('TP执行阶段无效')
+    manual = manual_stop_active(state, stage)
+    if manual:
+        stage = 0
     if stage >= 1 and not (stage >= 2 and state.get('tail_overridden_sl') is not None):
         fees = number(trade.fee_open or fee_open) + number(trade.fee_close or fee_close)
         candidates.append(
@@ -185,7 +193,7 @@ def effective_stop(strategy, trade, plan, fee_open=0, fee_close=0):
     for value in (state.get('protected_stop'), getattr(trade, 'stop_loss', None)):
         if value is not None and value != 0:
             candidates.append(number(value, positive=True))
-    if state.get('extension'):
+    if state.get('extension') and not manual:
         candidates.append(number(state['extension']['stop'], positive=True))
     return min(candidates) if trade.is_short else max(candidates)
 

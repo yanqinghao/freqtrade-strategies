@@ -108,7 +108,7 @@ def _trade_message(strategy, trade, snapshot, now):
         if not plan:
             raise ValueError('plan')
         goal = effective_stop(strategy, trade, plan)
-        lines.append(f'目标保护SL {goal:g}（只收紧）。')
+        lines.append(f'目标保护SL {goal:g}。')
         targets = plan.get('exit_points', [])
         stage = state.get('stage', 0)
         if not isinstance(stage, int) or isinstance(stage, bool) or not 0 <= stage <= 3:

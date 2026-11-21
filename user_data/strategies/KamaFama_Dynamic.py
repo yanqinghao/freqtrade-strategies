@@ -37,6 +37,7 @@ from freqtrade.exchange import ROUND_UP, ROUND_DOWN
 from entry_pause_monitor import EntryPauseMonitor
 from entry_risk import (
     EntryRiskError,
+    manual_stop_active,
     tail_stage_stop,
     plan_for_entry,
     assess_entry,
@@ -443,6 +444,7 @@ class KamaFama_Dynamic(IStrategy):
             and plan.get('tp_keep_progress_from') != saved.get('exit_points')
         ):
             state = self._execution(trade)
+            state.pop('manual_stop_phase', None)
             state.pop('tail_stop', None)
             state.pop('tail_overridden_sl', None)
             state.pop('tp2_completed_at', None)
@@ -573,6 +575,9 @@ class KamaFama_Dynamic(IStrategy):
         targets = self._targets(plan, trade)
         state = self._execution(trade)
         stage = state.get('stage', 0)
+        manual = manual_stop_active(state, stage)
+        if manual:
+            stage = 0
         candidates = []
         sl = plan.get('stop_loss')
         if sl is not None and (stage < 2 or state.get('tail_overridden_sl') != sl):
@@ -589,7 +594,7 @@ class KamaFama_Dynamic(IStrategy):
             tail = tail_stage_stop(state, plan, targets[0])
             if tail is not None:
                 candidates.append(float(tail))
-        if state.get('extension'):
+        if state.get('extension') and not manual:
             candidates.append(state['extension']['stop'])
         old = state.get('protected_stop')
         if old:
@@ -1036,6 +1041,7 @@ class KamaFama_Dynamic(IStrategy):
                 tp_targets={},
                 stage=0,
             )
+            state.pop('manual_stop_phase', None)
             state.pop('tail_stop', None)
             state.pop('tail_overridden_sl', None)
             state.pop('tp2_completed_at', None)
