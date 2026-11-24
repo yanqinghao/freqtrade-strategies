@@ -6,7 +6,7 @@ from time import monotonic, sleep
 
 from freqtrade.exchange import ROUND_DOWN, ROUND_UP
 from freqtrade.exceptions import ExchangeError, OperationalException
-from freqtrade.persistence import Trade
+from freqtrade.persistence import Order, Trade
 from entry_guard import ensure_position_matches
 from entry_risk import cost_stop, number
 from stop_protection import (
@@ -115,7 +115,64 @@ def store_plan(strategy, trade, plan):
     strategy._plan(trade)
 
 
-def replace_stop(bot, trade, data, price, *, plan=None):
+def stop_edit_orders(exchange, trade, price):
+    """An explicit hard-SL edit may select one existing stop by its exact trigger."""
+    stops = listed_stops(exchange, trade)
+    tracked = {str(o.order_id): o for o in trade.open_sl_orders}
+    matches = [ident for ident, trigger in stops.items() if trigger == price]
+    if len(matches) == 1 and set(tracked).issubset(stops):
+        selected = matches[0]
+        others = set(stops) - {selected}
+        if len(others) == 1:
+            old = others.pop()
+            if old in tracked and (
+                selected not in tracked or tracked[selected].ft_order_tag == f'adopt_stop:{old}'
+            ):
+                return stops[old], (old, selected)
+        elif (
+            not others
+            and selected in tracked
+            and (tracked[selected].ft_order_tag or '').startswith('adopt_stop:')
+        ):
+            # Recover an edit interrupted after the old cancellation was acknowledged.
+            return price, (None, selected)
+    return unique_tracked_stop(exchange, trade, allow_missing=True, stops=stops), None
+
+
+def track_selected_stop(bot, trade, price, adoption):
+    old, ident = adoption
+    exchange = bot.exchange
+    try:
+        row = exchange.fetch_stoploss_order(ident, trade.pair)
+    except Exception:
+        raise ValueError('备选止损回执暂未核实，请刷新重试。') from None
+    verified = _evaluate(exchange, trade, ident, row, number(price))
+    info = row.get('info', {})
+    reference = bot.strategy.order_types.get('stoploss_price_type', 'last')
+    working_type = {'last': 'CONTRACT_PRICE', 'mark': 'MARK_PRICE'}.get(reference)
+    if (
+        verified['stop_price'] != price
+        or verified['covered_amount'] != trade.amount
+        or info.get('orderType') != 'STOP_MARKET'
+        or not working_type
+        or info.get('workingType') != working_type
+    ):
+        raise ValueError('仅可接管触发价和触发基准匹配、覆盖整仓的市价止损。')
+    existing = Order.order_by_id(ident)
+    if existing is not None:
+        if existing not in trade.open_sl_orders or not (existing.ft_order_tag or '').startswith(
+            'adopt_stop:'
+        ):
+            raise ValueError('这张止损已有其他归属，请刷新核对。')
+        return
+    order = Order.parse_from_ccxt_object(row, trade.pair, 'stoploss', trade.amount, price)
+    order.ft_order_tag = f'adopt_stop:{old}'
+    trade.orders.append(order)
+    # Persist before cancellation so native fill accounting survives an interrupted edit.
+    Trade.commit()
+
+
+def replace_stop(bot, trade, data, price, *, plan=None, adoption=None):
     """Replace a verified, untriggered stop under the caller's native exit lock."""
     strategy, exchange = bot.strategy, bot.exchange
     state = strategy._execution(trade)
@@ -137,11 +194,22 @@ def replace_stop(bot, trade, data, price, *, plan=None):
         raise ValueError('止损已越过强平保护边界。')
     logger.info('Stop edit trade=%s old=%s requested=%s', trade.id, old, price)
     if on_exchange:
-        if not simulated:
+        orders = list(trade.open_sl_orders)
+        if adoption:
+            actual, current = stop_edit_orders(exchange, trade, price)
+            if current != adoption:
+                raise ValueError('交易所止损单已变化，请刷新后重新选择。')
+            old = (min if short else max)(old, actual)
+            if _crossed(short, old, rate):
+                raise ValueError('当前止损已触价，等待成交核对。')
+            if not isolated:
+                ensure_position_matches(exchange, trade.pair, trade)
+            track_selected_stop(bot, trade, price, adoption)
+            orders = [o for o in orders if str(o.order_id) == adoption[0]]
+        elif not simulated:
             actual = unique_tracked_stop(exchange, trade)
             old = (min if short else max)(old, actual)
-        orders = list(trade.open_sl_orders)
-        if len(orders) > 1 or (not orders and not simulated):
+        if len(orders) > 1 or (not orders and not simulated and not adoption):
             raise ValueError('当前交易所止损单尚未唯一确认，请等待止损核验后刷新。')
         if (
             plan is None
@@ -160,8 +228,9 @@ def replace_stop(bot, trade, data, price, *, plan=None):
                     raise ValueError('撤单后强平边界已变化，交回原生保护流程。')
             else:
                 ensure_position_matches(exchange, trade.pair, trade, dry_run=simulated)
-            if not simulated and listed_stops(exchange, trade):
-                raise ValueError('撤单后交易所仍有活跃止损，交回原生保护流程。')
+            expected = {adoption[1]: price} if adoption else {}
+            if not simulated and listed_stops(exchange, trade) != expected:
+                raise ValueError('撤单后活跃止损已变化，交回原生保护流程。')
             rate = float(
                 number(
                     exchange.get_rate(trade.pair, side='exit', is_short=short, refresh=True),
@@ -196,14 +265,19 @@ def replace_stop(bot, trade, data, price, *, plan=None):
     Trade.commit()
     if not on_exchange:
         return f'策略{label}已设为 {price:g}。'
-    try:
-        bot.handle_stoploss_on_exchange(trade)
-    except (ExchangeError, OperationalException) as error:
-        logger.warning('Stop placement unavailable trade=%s (%s)', trade.id, type(error).__name__)
-    Trade.commit()
+    if not adoption:
+        try:
+            bot.handle_stoploss_on_exchange(trade)
+        except (ExchangeError, OperationalException) as error:
+            logger.warning(
+                'Stop placement unavailable trade=%s (%s)', trade.id, type(error).__name__
+            )
+        Trade.commit()
     if not trade.is_open:
         return '持仓已结束，请核对成交。'
     confirmed = check_protection(strategy, trade, datetime.now(timezone.utc), force=True)
     if simulated:
         return f'模拟{label}目标已设为 {price:g}。'
+    if adoption and confirmed:
+        return f'已接管现有{label} {price:g}，交易所已确认唯一止损。'
     return f'{label} {price:g}：' + ('交易所已确认。' if confirmed else '交易所尚未确认，请核对 /order。')

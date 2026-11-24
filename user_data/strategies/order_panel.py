@@ -566,7 +566,7 @@ class OrderPanelMixin:
         if draft.get('current') is not None:
             text += f"\n当前值 {draft['current']}"
         if field == 'stop_loss':
-            text += '\n可收紧或放宽。放宽持仓止损时会撤旧单再重挂，期间有保护空档。'
+            text += '\n可收紧或放宽。放宽时通常撤旧单再重挂，期间有保护空档。若输入同仓未跟踪止损的触发价，将核验并接管该单，保留其价格保护设置，再撤原跟踪单。'
         if field == 'tp2' and draft.get('allow_tail'):
             text += '\n如需一起改尾仓止损，可回复「TP2价格 保留」、「TP2价格 成本」或「TP2价格 止损价」。'
         if field in ('soft_sl', 'extend_trigger'):

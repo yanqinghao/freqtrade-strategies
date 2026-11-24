@@ -20,8 +20,8 @@ from entry_lifecycle import (
 from entry_risk import number, saved_plan, effective_stop, observed_quantities
 from entry_pause import ENDED as PAUSE_ENDS
 from entry_targets import clear_units
-from stop_protection import unique_tracked_stop, refresh_isolated_boundary
-from tail_stop import replace_stop, store_plan, tail_price
+from stop_protection import refresh_isolated_boundary
+from tail_stop import replace_stop, stop_edit_orders, store_plan, tail_price
 
 
 PAUSE_PHASES = {'paused', 'canceling', 'resuming', 'submitting', 'unknown'}
@@ -313,8 +313,18 @@ def save_stop_edit(owner, trade, plan, data=None):
     price = float(number(plan['stop_loss'], positive=True))
     mode = strategy.config.get('runmode')
     simulated = strategy.config.get('dry_run', getattr(mode, 'value', mode) == 'dry_run')
+    adoption = None
     if trade.amount and not simulated and strategy.order_types.get('stoploss_on_exchange'):
-        actual = unique_tracked_stop(bot.exchange, trade, allow_missing=True)
+        price = float(
+            number(
+                bot.exchange.price_to_precision(
+                    trade.pair, price, rounding_mode=ROUND_DOWN if trade.is_short else ROUND_UP
+                ),
+                positive=True,
+            )
+        )
+        plan['stop_loss'] = price
+        actual, adoption = stop_edit_orders(bot.exchange, trade, price)
         if actual is not None:
             old = actual if old is None else (min if trade.is_short else max)(actual, old)
         if strategy.config.get('margin_mode') == 'isolated':
@@ -323,7 +333,7 @@ def save_stop_edit(owner, trade, plan, data=None):
             if price >= boundary if trade.is_short else price <= boundary:
                 raise ValueError('止损已越过强平保护边界。')
     widening = old is not None and (price > old if trade.is_short else price < old)
-    if data is None and (widening or not trade.amount):
+    if data is None and (adoption or widening or not trade.amount):
         data = snapshot(owner, trade.id)
     if data is not None:
         if not data['fresh']:
@@ -343,7 +353,7 @@ def save_stop_edit(owner, trade, plan, data=None):
     state = strategy._execution(trade)
     if state.get('full_exit'):
         raise ValueError('正在退出，请等待结果后刷新。')
-    if widening:
+    if widening or adoption:
         if data['kind'] == 'pending':
             store_plan(strategy, trade, plan)
             state = strategy._execution(trade)
@@ -365,7 +375,7 @@ def save_stop_edit(owner, trade, plan, data=None):
             )
         )
         plan['stop_loss'] = price
-        return replace_stop(bot, trade, data, price, plan=plan)
+        return replace_stop(bot, trade, data, price, plan=plan, adoption=adoption)
     store_plan(strategy, trade, plan)
     if state.get('tail_overridden_sl') is not None:
         state = strategy._execution(trade)

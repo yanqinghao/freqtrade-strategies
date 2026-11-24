@@ -182,8 +182,9 @@ def listed_stops(exchange, trade):
     return stops
 
 
-def unique_tracked_stop(exchange, trade, *, allow_missing=False):
-    stops = listed_stops(exchange, trade)
+def unique_tracked_stop(exchange, trade, *, allow_missing=False, stops=None):
+    if stops is None:
+        stops = listed_stops(exchange, trade)
     tracked = [str(order.order_id) for order in trade.open_sl_orders]
     if allow_missing and not tracked and not stops:
         return None
@@ -191,7 +192,10 @@ def unique_tracked_stop(exchange, trade, *, allow_missing=False):
         details = '、'.join(
             f"{price:g}（{'已跟踪' if ident in tracked else '未跟踪'}）" for ident, price in stops.items()
         )
-        raise ValueError('交易所止损未唯一匹配：' + (details or '未查到活跃止损'))
+        message = '交易所止损未唯一匹配：' + (details or '未查到活跃止损')
+        if len(stops) == 2 and len(tracked) == 1 and tracked[0] in stops:
+            message += '。可在「硬止损 SL」输入未跟踪单的触发价，核验后接管并撤原单，再按需改价。'
+        raise ValueError(message)
     return stops[tracked[0]]
 
 

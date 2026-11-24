@@ -256,12 +256,13 @@ class OrderManagementTests(unittest.TestCase):
     def test_can_tighten_live_plan_during_initial_stop_placement(self):
         trade = self.prepare()
         self.strategy.config['dry_run'] = False
+        self.exchange.price_to_precision = lambda pair, price, rounding_mode: price
         result = self.bot._update_plan(str(trade.id), ['sl=95'])
         self.assertIn('95', result)
         self.assertEqual(self.strategy._plan(trade)['stop_loss'], 95)
         self.assertEqual(list(trade.open_sl_orders), [])
 
-    def test_same_plan_price_can_replace_tighter_exchange_stop_after_margin_change(self):
+    def setup_duplicate_stops(self):
         from ccxt import TICK_SIZE
         from freqtrade.persistence import Order
 
@@ -291,9 +292,15 @@ class OrderManagementTests(unittest.TestCase):
             filled=0,
             stopPrice=105,
             reduceOnly=True,
+            info=dict(
+                orderType='STOP_MARKET',
+                workingType='CONTRACT_PRICE',
+                positionSide='BOTH',
+                priceProtect=False,
+            ),
         )
         new = dict(old, id='new', stopPrice=110)
-        active = [old, dict(new, id='external')]
+        active = [old, dict(new, id='external', info=dict(new['info'], priceProtect=True))]
         self.exchange._api.fetch_open_orders = lambda *a, **kw: list(active)
 
         def track(row):
@@ -305,21 +312,78 @@ class OrderManagementTests(unittest.TestCase):
 
         track(old)
         bot = self.rpc._freqtrade
-        self.exchange.cancel_stoploss_order = Mock(side_effect=lambda *args: active.clear())
+        self.exchange.cancel_stoploss_order = Mock(
+            side_effect=lambda ident, pair: active.remove(
+                next(r for r in active if r['id'] == ident)
+            )
+        )
         self.exchange.fetch_stoploss_order = lambda ident, pair: next(
-            (r for r in active if r['id'] == ident), dict(old, status='canceled')
+            (r for r in active if r['id'] == ident), dict(old, id=ident, status='canceled')
         )
         bot.update_trade_state = lambda t, ident, row, **kw: t.update_order(row)
         bot.handle_stoploss_on_exchange = lambda t: (active.append(new), track(new))
 
-        def change():
+        def change(price=110):
             snap = self.management.snapshot(self.bot, trade.id)
             return self.management.edit_plan(
-                self.bot, trade.id, snap['revision'], {'stop_loss': 110}
+                self.bot, trade.id, snap['revision'], {'stop_loss': price}
             )
 
-        with self.assertRaisesRegex(ValueError, '唯一'):
+        return trade, active, change
+
+    def test_matching_external_stop_is_adopted_without_a_replacement_order(self):
+        trade, active, change = self.setup_duplicate_stops()
+        bot = self.rpc._freqtrade
+        bot.handle_stoploss_on_exchange = Mock(side_effect=AssertionError('unexpected placement'))
+        self.assertIn('交易所已确认', change())
+        self.assertEqual([r['id'] for r in active], ['external'])
+        self.exchange.cancel_stoploss_order.assert_called_once_with('old', trade.pair)
+        self.Trade.session.expire_all()
+        self.assertEqual([o.order_id for o in trade.open_sl_orders], ['external'])
+        self.assertEqual(trade.stop_loss, 110)
+        self.assertEqual(self.strategy._execution(trade)['protection']['order_id'], 'external')
+
+    def test_uncertain_old_cancellation_can_retry_adoption_without_new_order(self):
+        from unittest.mock import patch
+
+        trade, active, change = self.setup_duplicate_stops()
+        cancel = self.exchange.cancel_stoploss_order
+        original_cancel = cancel.side_effect
+        cancel.side_effect = lambda *args: None
+        bot = self.rpc._freqtrade
+        bot.handle_stoploss_on_exchange = Mock(side_effect=AssertionError('unexpected placement'))
+        with patch('tail_stop.sleep'), self.assertRaisesRegex(ValueError, '旧止损'):
             change()
+        self.Trade.session.expire_all()
+        self.assertEqual({o.order_id for o in trade.open_sl_orders}, {'old', 'external'})
+        cancel.side_effect = original_cancel
+        self.assertIn('交易所已确认', change())
+        self.assertIn('交易所已确认', change())
+        self.assertEqual([r['id'] for r in active], ['external'])
+        self.assertEqual(cancel.call_count, 2)
+
+    def test_ineligible_external_stop_never_cancels_tracked_order(self):
+        trade, active, change = self.setup_duplicate_stops()
+        for field, value in [('remaining', 1), ('filled', 1), ('status_stop', 'triggered')]:
+            with self.subTest(field=field):
+                original = active[1].get(field)
+                active[1][field] = value
+                with self.assertRaises(ValueError):
+                    change()
+                active[1][field] = original
+        for field, value in [('orderType', 'STOP'), ('workingType', 'MARK_PRICE')]:
+            original = active[1]['info'][field]
+            active[1]['info'][field] = value
+            with self.assertRaisesRegex(ValueError, '整仓的市价止损'):
+                change()
+            active[1]['info'][field] = original
+        self.exchange.cancel_stoploss_order.assert_not_called()
+        self.assertEqual([o.order_id for o in trade.open_sl_orders], ['old'])
+
+    def test_same_plan_price_can_replace_tighter_exchange_stop_after_margin_change(self):
+        trade, active, change = self.setup_duplicate_stops()
+        with self.assertRaisesRegex(ValueError, '唯一'):
+            change(108)
         self.exchange.cancel_stoploss_order.assert_not_called()
         active.pop()
         self.assertIn('交易所已确认', change())
