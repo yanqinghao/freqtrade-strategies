@@ -382,21 +382,25 @@ class OrderPanelMixin:
         if data['profit_abs'] is not None:
             lines.append('按已记账余仓估算；收益率含杠杆，浮盈亏不含已实现止盈。')
         lines.append('查询时间 ' + data['checked'])
-        lines.append(f"硬 SL {plan.get('stop_loss', '未设置')} · 有效保护价 {data['stop'] or '未确认'}")
-        lines.append('有效保护价为策略目标；交易所保护状态见 /overview。')
+        lines.append(f"硬 SL {plan.get('stop_loss', '未设置')} · 策略保护目标 {data['stop'] or '未确认'}")
+        if data['kind'] != 'pending':
+            actual = data.get('stop_receipt')
+            checked = data.get('stop_checked')
+            if actual is not None and checked:
+                at = datetime.fromtimestamp(checked, timezone.utc)
+                lines.append(f'最近交易所止损回执 {actual:g} · {at:%H:%M:%S} UTC')
+            else:
+                lines.append(data.get('stop_reason') or '交易所止损触发价待核实')
+            if data.get('exchange_liquidation') is not None:
+                lines.append(
+                    f"交易所强平价 {data['exchange_liquidation']:.8g} · "
+                    f"缓冲后保护边界 {data['buffered_liquidation']:.8g}"
+                )
         targets = plan.get('exit_points', [])
         if len(targets) == 3 and data['kind'] == 'position':
             tail = data.get('tail_stop')
             label = '随 TP1' if tail is None else ('保留当时有效止损' if tail == 'keep' else f'{tail:g}')
             lines.append(f'TP2 完成后的尾仓止损：{label}')
-            if tail is not None:
-                actual = data.get('stop_receipt')
-                checked = data.get('stop_checked')
-                if actual is not None and checked:
-                    at = datetime.fromtimestamp(checked, timezone.utc)
-                    lines.append(f'最近交易所止损回执 {actual:g} · {at:%H:%M:%S} UTC')
-                else:
-                    lines.append('交易所止损触发价待核实')
         for i, price in enumerate(targets):
             progress = (
                 '已完成'
@@ -688,7 +692,7 @@ class OrderPanelMixin:
                 when = '选择后将撤旧止损并重挂，中间有保护空档。' if data['stage'] == 2 else '预设在 TP2 完成时生效，已有更紧保护优先。'
                 await self._panel_send(
                     update,
-                    f"#{data['id']} {data['pair']} · 尾仓止损\n当前有效保护 {data['stop']}\n{when}",
+                    f"#{data['id']} {data['pair']} · 尾仓止损\n策略保护目标 {data['stop']}\n{when}",
                     buttons,
                 )
             elif action == 'tail_set':

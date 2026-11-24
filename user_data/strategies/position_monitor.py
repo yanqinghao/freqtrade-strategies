@@ -177,7 +177,7 @@ def build_position_report(strategy, trade, market, now):
             )
     protection = []
     if plan and stop is not None:
-        protection.append(f"硬止损：{plan['stop_loss']:g} / 当前保护：{stop:g}")
+        protection.append(f"硬止损：{plan['stop_loss']:g} / 策略目标：{stop:g}")
         if pending:
             protection.append('TP计划待应用，请核对执行进度')
         elif stage < len(active_targets):

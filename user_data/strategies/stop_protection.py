@@ -1,10 +1,11 @@
-"""Read actual tracked stop receipts; never create or cancel orders here."""
+"""Refresh isolated risk and verify live stop orders without creating or cancelling orders."""
 import logging
 from datetime import timezone
 from decimal import Decimal, InvalidOperation
 from math import isfinite, ulp
 
 from freqtrade.exchange import ROUND_DOWN, ROUND_UP
+from entry_guard import ensure_position_matches
 from entry_risk import manual_stop_active
 from notification_format import notice
 
@@ -131,6 +132,69 @@ def _evaluate(exchange, trade, ident, row, target):
     }
 
 
+def refresh_isolated_boundary(strategy, trade):
+    """Refresh the native, buffered boundary from a matching live position."""
+    exchange = strategy.dp._exchange
+    position = ensure_position_matches(exchange, trade.pair, trade)
+    if position.get('marginMode') != 'isolated':
+        raise ValueError('交易所逐仓模式无法核实')
+    raw = _number(position.get('liquidationPrice'), positive=True)
+    buffer = _number(exchange.liquidation_buffer)
+    if buffer > 1:
+        raise ValueError('强平缓冲比例无效')
+    offset = abs(raw - _number(trade.open_rate, positive=True)) * buffer
+    boundary = raw - offset if trade.is_short else raw + offset
+    price = exchange.price_to_precision(
+        trade.pair, float(boundary), rounding_mode=ROUND_DOWN if trade.is_short else ROUND_UP
+    )
+    trade.set_liquidation_price(float(_number(price, positive=True)))
+    return float(raw)
+
+
+def listed_stops(exchange, trade):
+    """Read Binance open conditional exits, including stops created by other clients."""
+    try:
+        rows = exchange._api.fetch_open_orders(trade.pair, params={'trigger': True})
+    except Exception:
+        raise ValueError('交易所条件单列表暂未核实') from None
+    if not isinstance(rows, list):
+        raise ValueError('交易所条件单列表无效')
+    stops = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get('symbol') != trade.pair:
+            raise ValueError('交易所条件单身份无法核实')
+        if row.get('side') not in ('buy', 'sell') or row.get('status') != 'open':
+            raise ValueError('交易所条件单状态无法核实')
+        if row['side'] != trade.exit_side:
+            continue
+        info = row.get('info') or {}
+        kind = str(info.get('orderType') or info.get('origType') or row.get('type')).upper()
+        if kind.startswith('TAKE_PROFIT'):
+            continue
+        if not (_flag(row, 'reduceOnly') or _flag(row, 'closePosition')):
+            continue
+        ident = str(row.get('id') or '')
+        if not ident or ident in stops:
+            raise ValueError('交易所止损编号无法核实')
+        stops[ident] = float(
+            _number(row.get('stopPrice') or row.get('triggerPrice'), positive=True)
+        )
+    return stops
+
+
+def unique_tracked_stop(exchange, trade, *, allow_missing=False):
+    stops = listed_stops(exchange, trade)
+    tracked = [str(order.order_id) for order in trade.open_sl_orders]
+    if allow_missing and not tracked and not stops:
+        return None
+    if len(tracked) != 1 or set(tracked) != set(stops):
+        details = '、'.join(
+            f"{price:g}（{'已跟踪' if ident in tracked else '未跟踪'}）" for ident, price in stops.items()
+        )
+        raise ValueError('交易所止损未唯一匹配：' + (details or '未查到活跃止损'))
+    return stops[tracked[0]]
+
+
 def check_protection(strategy, trade, now, *, force=False):
     if not trade.is_open or not trade.amount:
         return False
@@ -145,7 +209,9 @@ def check_protection(strategy, trade, now, *, force=False):
     state = strategy._execution(trade)
     old = state.get('protection') or {}
     stamp = now.timestamp()
-    target = None
+    signature = [None, float(trade.amount)]
+    reading_receipts = False
+    boundary_info = {}
     try:
         plan = strategy.manual_open.get(trade.pair) or {}
         direction = 'short' if trade.is_short else 'long'
@@ -170,34 +236,34 @@ def check_protection(strategy, trade, now, *, force=False):
             and stamp - old.get('checked_at', 0) < interval
         ):
             return old.get('status') == 'confirmed'
-        result = {'status': 'unconfirmed', 'reason': '未找到活跃的已跟踪止损单'}
-        for order in trade.open_sl_orders:
-            try:
-                raw = exchange.fetch_stoploss_order(order.order_id, trade.pair)
-            except Exception as error:
-                logger.warning('Stop verification unavailable (%s)', type(error).__name__)
-                result = {'status': 'unconfirmed', 'reason': '交易所止损状态暂未查询确认'}
-                continue
-            try:
-                result = _evaluate(exchange, trade, order.order_id, raw, target)
-                stage = state.get('stage', 0)
-                exact = manual_stop_active(state, stage) or (
-                    stage == 2 and state.get('tail_stop', plan.get('tail_stop_preset')) is not None
-                )
-                if exact and (
-                    len(trade.open_sl_orders) != 1 or _number(result['stop_price']) != target
-                ):
-                    raise ValueError('交易所触发价或止损单数量与止损设置尚未一致')
-                break
-            except ValueError as error:
-                result = {'status': 'unconfirmed', 'reason': str(error)}
-            except Exception as error:
-                logger.warning('Stop verification unavailable (%s)', type(error).__name__)
-                result = {'status': 'unconfirmed', 'reason': '交易所止损状态暂未查询确认'}
+        if strategy.config.get('margin_mode') == 'isolated':
+            raw_liq = refresh_isolated_boundary(strategy, trade)
+            boundary = trade.liquidation_price
+            boundary_info = dict(exchange_liquidation=raw_liq, buffered_liquidation=boundary)
+            target = (min if trade.is_short else max)(target, _number(boundary, positive=True))
+        reading_receipts = True
+        listed = unique_tracked_stop(exchange, trade)
+        ident = trade.open_sl_orders[0].order_id
+        try:
+            raw = exchange.fetch_stoploss_order(ident, trade.pair)
+        except Exception:
+            raise ValueError('交易所止损回执暂未核实') from None
+        result = _evaluate(exchange, trade, ident, raw, target)
+        if listed != result['stop_price']:
+            raise ValueError('条件单列表与止损回执已变化，等待重新核验')
+        stage = state.get('stage', 0)
+        exact = manual_stop_active(state, stage) or (
+            stage == 2 and state.get('tail_stop', plan.get('tail_stop_preset')) is not None
+        )
+        if exact and result['stop_price'] != signature[0]:
+            raise ValueError('交易所触发价与手动止损设置尚未一致')
+    except ValueError as error:
+        reason = str(error) if reading_receipts else '当前保护目标或强平边界无法核实'
+        result = {'status': 'unconfirmed', 'reason': reason}
     except Exception as error:
-        logger.warning('Stop target unavailable (%s)', type(error).__name__)
-        signature = [None, float(trade.amount)]
-        result = {'status': 'unconfirmed', 'reason': '当前保护目标或市场数据无效'}
+        logger.warning('Stop verification unavailable (%s)', type(error).__name__)
+        result = {'status': 'unconfirmed', 'reason': '当前保护目标或交易所数据无法核实'}
+    result.update(boundary_info)
     # _stop_price may tighten/persist state: never overwrite that or fill accounting.
     state = strategy._execution(trade)
     previous = state.get('protection') or {}
@@ -240,6 +306,7 @@ def check_protection(strategy, trade, now, *, force=False):
                     (
                         '核验结果',
                         [
+                            f"策略目标：{signature[0]:g}",
                             f"触发价：{result['stop_price']:g}",
                             f"覆盖数量：{result['covered_amount']:g}",
                         ]

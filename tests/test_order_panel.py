@@ -174,6 +174,8 @@ class OrderPanelTests(unittest.TestCase):
             tp_filled={},
             final_tp_started=False,
             stop=90,
+            stop_receipt=93,
+            stop_checked=1795490008,
             revision='r',
             rate=105,
             fresh=True,
@@ -193,6 +195,7 @@ class OrderPanelTests(unittest.TestCase):
         self.assertIn('刷新', labels)
         self.assertNotIn('开仓价', labels)
         self.assertIn('105', kwargs['text'])
+        self.assertIn('交易所止损回执 93', kwargs['text'])
         data['fresh'] = False
         data['error'] = '订单回执暂未核实'
         asyncio.run(self.bot._panel_detail(update(), 1))

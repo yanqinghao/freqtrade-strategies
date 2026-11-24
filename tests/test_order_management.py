@@ -187,6 +187,9 @@ class OrderManagementTests(unittest.TestCase):
             )
 
         tracked(raw)
+        self.exchange._api.fetch_open_orders = lambda *a, **kw: [
+            dict(raw, id=o.order_id, stopPrice=o.stop_price) for o in trade.open_sl_orders
+        ]
         self.Trade.commit()
         bot = self.rpc._freqtrade
         self.exchange.fetch_stoploss_order = Mock(
@@ -249,6 +252,79 @@ class OrderManagementTests(unittest.TestCase):
         bot.handle_stoploss_on_exchange.side_effect = lambda t: False
         self.assertIn('尚未确认', change(102 if field == 'stop_loss' else 103))
         self.assertEqual(trade.open_sl_orders, [])
+
+    def test_can_tighten_live_plan_during_initial_stop_placement(self):
+        trade = self.prepare()
+        self.strategy.config['dry_run'] = False
+        result = self.bot._update_plan(str(trade.id), ['sl=95'])
+        self.assertIn('95', result)
+        self.assertEqual(self.strategy._plan(trade)['stop_loss'], 95)
+        self.assertEqual(list(trade.open_sl_orders), [])
+
+    def test_same_plan_price_can_replace_tighter_exchange_stop_after_margin_change(self):
+        from ccxt import TICK_SIZE
+        from freqtrade.persistence import Order
+
+        trade = self.prepare(short=True)
+        trade.price_precision, trade.precision_mode_price = 0.01, TICK_SIZE
+        trade.stop_loss, trade.liquidation_price = 110, 105
+        self.strategy.config.update(dry_run=False, margin_mode='isolated')
+        self.exchange.liquidation_buffer = 0.05
+        self.exchange.price_to_precision = lambda pair, price, rounding_mode: round(price, 2)
+        position = dict(
+            symbol=trade.pair,
+            side='short',
+            contracts=trade.amount,
+            hedged=False,
+            marginMode='isolated',
+            liquidationPrice=120,
+        )
+        self.exchange.fetch_positions = lambda pair: [position]
+        old = dict(
+            id='old',
+            symbol=trade.pair,
+            side='buy',
+            type='stop_market',
+            status='open',
+            amount=trade.amount,
+            remaining=trade.amount,
+            filled=0,
+            stopPrice=105,
+            reduceOnly=True,
+        )
+        new = dict(old, id='new', stopPrice=110)
+        active = [old, dict(new, id='external')]
+        self.exchange._api.fetch_open_orders = lambda *a, **kw: list(active)
+
+        def track(row):
+            trade.orders.append(
+                Order.parse_from_ccxt_object(
+                    row, trade.pair, 'stoploss', trade.amount, row['stopPrice']
+                )
+            )
+
+        track(old)
+        bot = self.rpc._freqtrade
+        self.exchange.cancel_stoploss_order = Mock(side_effect=lambda *args: active.clear())
+        self.exchange.fetch_stoploss_order = lambda ident, pair: next(
+            (r for r in active if r['id'] == ident), dict(old, status='canceled')
+        )
+        bot.update_trade_state = lambda t, ident, row, **kw: t.update_order(row)
+        bot.handle_stoploss_on_exchange = lambda t: (active.append(new), track(new))
+
+        def change():
+            snap = self.management.snapshot(self.bot, trade.id)
+            return self.management.edit_plan(
+                self.bot, trade.id, snap['revision'], {'stop_loss': 110}
+            )
+
+        with self.assertRaisesRegex(ValueError, '唯一'):
+            change()
+        self.exchange.cancel_stoploss_order.assert_not_called()
+        active.pop()
+        self.assertIn('交易所已确认', change())
+        self.assertEqual(trade.liquidation_price, 119)
+        self.assertEqual([r['stopPrice'] for r in active], [110])
 
     def test_pending_can_edit_rules_and_tp_but_changed_fill_invalidates_edit(self):
         trade = self.prepare(pending=True)

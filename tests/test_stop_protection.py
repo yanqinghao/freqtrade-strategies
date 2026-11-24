@@ -88,6 +88,8 @@ class StopProtectionTests(unittest.TestCase):
             'reduceOnly': True,
             'info': {'positionSide': 'BOTH', 'reduceOnly': True},
         }
+        self.listed = [self.raw]
+        self.exchange._api = SimpleNamespace(fetch_open_orders=lambda *a, **kw: self.listed)
         self.queries = []
         self.messages = []
         capture_alerts(self.strategy, self.messages)
@@ -100,6 +102,58 @@ class StopProtectionTests(unittest.TestCase):
 
     def check(self):
         return self.module.check_protection(self.strategy, self.trade, self.now, force=True)
+
+    def test_external_stop_conflict_includes_both_prices_and_blocks_add(self):
+        self.listed.append(dict(self.raw, id='external', stopPrice=92))
+        self.assertFalse(self.check())
+        reason = self.strategy._execution(self.trade)['protection']['reason']
+        self.assertIn('90', reason)
+        self.assertIn('92', reason)
+        with self.assertRaisesRegex(ValueError, '止损尚未确认'):
+            self.strategy.ensure_entry_protection(self.trade)
+        self.listed[-1].update(type='take_profit_market')
+        self.assertTrue(self.check())
+
+    def test_isolated_short_refreshes_buffer_before_verifying_stop(self):
+        from unittest.mock import Mock
+
+        self.trade.is_short = True
+        self.trade.exit_side = 'buy'
+        self.trade.open_rate = 0.07755
+        self.trade.liquidation_price = 0.08111
+        self.trade.set_liquidation_price = lambda p: setattr(self.trade, 'liquidation_price', p)
+        self.strategy.config['margin_mode'] = 'isolated'
+        self.plan.update(direction='short', stop_loss=0.08290)
+        self.strategy.set_manual_plan(self.trade.pair, self.plan)
+        self.raw.update(side='buy', stopPrice=0.08111)
+        self.listed[:] = [self.raw]
+        from freqtrade.exchange import ROUND_DOWN
+
+        def precision(pair, value, rounding_mode):
+            mode = ROUND_FLOOR if rounding_mode == ROUND_DOWN else ROUND_CEILING
+            return float(Decimal(str(value)).quantize(Decimal('0.00001'), rounding=mode))
+
+        self.exchange.price_to_precision = precision
+        self.exchange.liquidation_buffer = 0.05
+        position = dict(
+            symbol=self.trade.pair,
+            side='short',
+            contracts=10,
+            hedged=False,
+            marginMode='isolated',
+            liquidationPrice=0.08868262,
+        )
+        self.exchange.fetch_positions = Mock(return_value=[position])
+        self.assertTrue(self.check())
+        self.assertEqual(self.trade.liquidation_price, 0.08812)
+        self.assertEqual(self.strategy._execution(self.trade)['protection']['stop_price'], 0.08111)
+        position['liquidationPrice'] = 0.080
+        self.assertFalse(self.check())
+        self.assertLess(self.trade.liquidation_price, 0.080)
+        last = self.trade.liquidation_price
+        position['liquidationPrice'] = None
+        self.assertFalse(self.check())
+        self.assertEqual(self.trade.liquidation_price, last)
 
     def test_same_incident_reason_changes_do_not_spam_and_recovery_is_once(self):
         self.raw['status'] = 'canceled'
@@ -297,12 +351,16 @@ class StopProtectionTests(unittest.TestCase):
 
     def test_periodic_cadence_is_bypassed_by_explicit_add_check(self):
         self.assertTrue(self.check())
-        self.raw['status'] = 'canceled'
+        from unittest.mock import Mock
+
+        self.exchange._api.fetch_open_orders = Mock(return_value=[])
         self.now += timedelta(seconds=1)
         self.module.check_protection(self.strategy, self.trade, self.now)
         self.assertEqual(len(self.queries), 1)
         self.assertFalse(self.check())
-        self.assertEqual(len(self.queries), 2)
+        self.exchange._api.fetch_open_orders.assert_called_once_with(
+            self.trade.pair, params={'trigger': True}
+        )
 
     def test_simulation_never_claims_exchange_confirmation_or_queries_live(self):
         self.strategy.config['dry_run'] = True

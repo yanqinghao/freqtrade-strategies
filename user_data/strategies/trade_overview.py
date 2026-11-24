@@ -16,7 +16,7 @@ def _protection(trade, state, quantity, goal, now, *, compact=False):
     if row.get('status') == 'simulated':
         return '交易所SL：模拟状态，不代表真实交易所已保护。'
     if row.get('status') != 'confirmed':
-        return '交易所SL：待确认/尚未确认，请核对 /order 与交易所。'
+        return '交易所SL：待确认/尚未确认。' + (row.get('reason') or '请核对 /order 与交易所。')
     try:
         price = number(row.get('stop_price'), positive=True)
         covered = number(row.get('covered_amount'), positive=True)

@@ -80,6 +80,8 @@ def ensure_position_matches(exchange, pair, trade, *, dry_run=False):
     if abs(actual - expected) > tolerance:
         raise ValueError('交易所与本地持仓数量不一致，未提交订单；请核对 /status、/order 与交易所')
 
+    return position
+
 
 def _closing_flag(order, name):
     values = []

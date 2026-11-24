@@ -9,7 +9,13 @@ from freqtrade.exceptions import ExchangeError, OperationalException
 from freqtrade.persistence import Trade
 from entry_guard import ensure_position_matches
 from entry_risk import cost_stop, number
-from stop_protection import _evaluate, check_protection
+from stop_protection import (
+    _evaluate,
+    check_protection,
+    listed_stops,
+    refresh_isolated_boundary,
+    unique_tracked_stop,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -117,8 +123,6 @@ def replace_stop(bot, trade, data, price, *, plan=None):
     rate, old = data['rate'], data['stop']
     if old is None or _crossed(short, old, rate) or _crossed(short, price, rate):
         raise ValueError('已触及当前或请求的止损价，请核对持仓。')
-    if trade.liquidation_price and _crossed(short, trade.liquidation_price, price):
-        raise ValueError('止损已越过强平保护边界。')
     targets = strategy._targets(data['plan'], trade)
     final = targets[-1] if targets and state.get('stage', 0) >= len(targets) - 1 else None
     if final and _crossed(short, rate, final):
@@ -126,8 +130,16 @@ def replace_stop(bot, trade, data, price, *, plan=None):
     mode = strategy.config.get('runmode')
     simulated = strategy.config.get('dry_run', getattr(mode, 'value', mode) == 'dry_run')
     on_exchange = strategy.order_types.get('stoploss_on_exchange')
+    isolated = not simulated and strategy.config.get('margin_mode') == 'isolated'
+    if isolated:
+        refresh_isolated_boundary(strategy, trade)
+    if trade.liquidation_price and _crossed(short, trade.liquidation_price, price):
+        raise ValueError('止损已越过强平保护边界。')
     logger.info('Stop edit trade=%s old=%s requested=%s', trade.id, old, price)
     if on_exchange:
+        if not simulated:
+            actual = unique_tracked_stop(exchange, trade)
+            old = (min if short else max)(old, actual)
         orders = list(trade.open_sl_orders)
         if len(orders) > 1 or (not orders and not simulated):
             raise ValueError('当前交易所止损单尚未唯一确认，请等待止损核验后刷新。')
@@ -142,7 +154,14 @@ def replace_stop(bot, trade, data, price, *, plan=None):
             return f'当前尾仓止损已经是 {price:g}，交易所已确认。'
         if orders:
             _cancel_old_stop(bot, trade, orders[0], rate, simulated)
-            ensure_position_matches(exchange, trade.pair, trade, dry_run=simulated)
+            if isolated:
+                refresh_isolated_boundary(strategy, trade)
+                if _crossed(short, trade.liquidation_price, price):
+                    raise ValueError('撤单后强平边界已变化，交回原生保护流程。')
+            else:
+                ensure_position_matches(exchange, trade.pair, trade, dry_run=simulated)
+            if not simulated and listed_stops(exchange, trade):
+                raise ValueError('撤单后交易所仍有活跃止损，交回原生保护流程。')
             rate = float(
                 number(
                     exchange.get_rate(trade.pair, side='exit', is_short=short, refresh=True),

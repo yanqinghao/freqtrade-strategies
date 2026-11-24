@@ -20,6 +20,7 @@ from entry_lifecycle import (
 from entry_risk import number, saved_plan, effective_stop, observed_quantities
 from entry_pause import ENDED as PAUSE_ENDS
 from entry_targets import clear_units
+from stop_protection import unique_tracked_stop, refresh_isolated_boundary
 from tail_stop import replace_stop, store_plan, tail_price
 
 
@@ -266,6 +267,11 @@ def snapshot(owner, ident):
         protection.get('stop_price') if protection.get('status') == 'confirmed' else None
     )
     data['stop_checked'] = protection.get('checked_at')
+    data['stop_reason'] = (
+        '模拟止损，无交易所回执' if protection.get('status') == 'simulated' else protection.get('reason')
+    )
+    for field in ('exchange_liquidation', 'buffered_liquidation'):
+        data[field] = protection.get(field)
     data.update(position_profit(trade, rate))
     data['pause_ref'] = next(
         (m['ref'] for m in pause_plans(owner) if pause_trade(m, [trade]) is not None), None
@@ -305,6 +311,17 @@ def save_stop_edit(owner, trade, plan, data=None):
     else:
         old = data['stop']
     price = float(number(plan['stop_loss'], positive=True))
+    mode = strategy.config.get('runmode')
+    simulated = strategy.config.get('dry_run', getattr(mode, 'value', mode) == 'dry_run')
+    if trade.amount and not simulated and strategy.order_types.get('stoploss_on_exchange'):
+        actual = unique_tracked_stop(bot.exchange, trade, allow_missing=True)
+        if actual is not None:
+            old = actual if old is None else (min if trade.is_short else max)(actual, old)
+        if strategy.config.get('margin_mode') == 'isolated':
+            refresh_isolated_boundary(strategy, trade)
+            boundary = trade.liquidation_price
+            if price >= boundary if trade.is_short else price <= boundary:
+                raise ValueError('止损已越过强平保护边界。')
     widening = old is not None and (price > old if trade.is_short else price < old)
     if data is None and (widening or not trade.amount):
         data = snapshot(owner, trade.id)
