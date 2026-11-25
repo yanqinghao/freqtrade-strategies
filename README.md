@@ -220,6 +220,8 @@ docker compose logs -f
 
 健康文件是 `user_data/health/assistant.json`，守护状态是 `user_data/watchdog/watchdog.json`，均不提交。`docker compose logs watchdog` 可查看不含凭据的守护状态。单独重启交易进程可用 `docker compose restart freqtrade`，守护继续运行。
 
+交易容器内的监督进程读取这两个文件。交易循环超过 180 秒未完成（或启动后 180 秒仍没有心跳），且看门狗连续两轮确认币安现货、合约接口可用时，监督进程先结束旧交易进程，再启动一次 Freqtrade。已记录的 `/stop`、`/pause` 状态会阻止主动恢复。每次异常只触发一次由监督进程发起的重启，交易循环恢复后才允许处理下一次异常，主动重启之间至少间隔 10 分钟。Docker 继续按已有策略处理进程退出，短时断线继续由 Freqtrade 的请求重试处理。通过 `docker compose logs freqtrade` 查看自动重启记录。
+
 公共接口探测失败会记录接口名称、异常类型或无效响应、HTTP 状态码及耗时，不记录异常原文或请求 URL，便于区分超时、限流和响应异常；这些诊断只写日志，不额外推送 TG。
 
 上述 `up` 会按 `deploy/config.json` 的 `dry_run` 值运行；需要模拟时先设为 `true`。数据使用新的 `user_data/assistant_trades.sqlite`。HTTP API 已关闭，不映射端口；开仓和加仓只走 TG。`deploy` 使用目录挂载，使计划文件可以原子更新。

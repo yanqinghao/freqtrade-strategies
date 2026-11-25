@@ -65,3 +65,10 @@ class ExecutionHealthTests(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text())['last_process'], 999.0)
         publisher.close()
         self.assertFalse(publisher._thread.is_alive())
+
+    def test_close_publishes_manual_stop_that_followed_last_heartbeat(self):
+        publisher = self.cls(self.bot, self.path)
+        publisher.publish(1000.0)
+        self.bot.state.name = 'STOPPED'
+        publisher.close()
+        self.assertEqual(json.loads(self.path.read_text())['state'], 'STOPPED')

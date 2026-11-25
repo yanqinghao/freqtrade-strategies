@@ -4,3 +4,4 @@ FROM freqtradeorg/freqtrade:2026.10
 RUN cp /freqtrade/freqtrade/rpc/telegram.py /freqtrade/freqtrade/rpc/_telegram_base.py
 COPY telegram.py /freqtrade/freqtrade/rpc/telegram.py
 COPY user_data/strategies/order_panel.py user_data/strategies/order_management.py user_data/strategies/watch_panel.py user_data/strategies/notification_format.py /freqtrade/freqtrade/rpc/
+COPY tools/supervise_freqtrade.py /freqtrade/tools/supervise_freqtrade.py

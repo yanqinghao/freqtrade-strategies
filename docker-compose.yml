@@ -5,6 +5,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     container_name: freqtrade
+    init: true
+    stop_grace_period: 30s
+    entrypoint: ["python", "/freqtrade/tools/supervise_freqtrade.py"]
     volumes:
       - ./user_data:/freqtrade/user_data
       # Directory bind permits atomic replacement of the plan JSON file.
@@ -12,6 +15,7 @@ services:
     environment:
       ASSISTANT_STATE_FILE: /freqtrade/deploy/strategy_state.json
     command: >
+      --supervise
       trade
       --logfile /freqtrade/user_data/logs/assistant.log
       --db-url sqlite:////freqtrade/user_data/assistant_trades.sqlite
