@@ -46,7 +46,12 @@ def load_limits(path):
         row = json.loads(path.read_text())
         if not isinstance(row, dict) or set(row) != set(LIMITS):
             raise ValueError('schema')
-        result = {key: float(number(row[key], positive=True)) for key in LIMITS}
+        result = {
+            key: None
+            if key == 'max_stop_loss_usdt' and row[key] is None
+            else float(number(row[key], positive=True))
+            for key in LIMITS
+        }
         if result['max_leverage'] < 1:
             raise ValueError('leverage')
         return result
@@ -389,10 +394,9 @@ def assess_entry(strategy, request, trade, plan, *, rate=None, amount=None, igno
                 reasons.append(f"杠杆 {leverage:g}倍超过上限 {limits['max_leverage']:g}倍")
             if total > number(limits['max_total_notional_usdt']):
                 reasons.append(f"助手总名义敞口预计 {total:g}U 超过上限 {limits['max_total_notional_usdt']:g}U")
-            if complete and loss + fees > number(limits['max_stop_loss_usdt']):
-                reasons.append(
-                    f"该币种加仓后估算止损亏损 {loss + fees:g}U 超过上限 {limits['max_stop_loss_usdt']:g}U"
-                )
+            stop_loss_cap = limits['max_stop_loss_usdt']
+            if complete and stop_loss_cap is not None and loss + fees > number(stop_loss_cap):
+                reasons.append(f"该币种加仓后估算止损亏损 {loss + fees:g}U 超过上限 {stop_loss_cap:g}U")
             if unknown_requests(strategy, ignore_request):
                 reasons.append('存在待核实入场请求，助手总敞口无法可靠确认')
         return {

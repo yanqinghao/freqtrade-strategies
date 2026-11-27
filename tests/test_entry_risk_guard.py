@@ -196,6 +196,11 @@ class EntryRiskGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(self.risk.EntryRiskError, '亏损'):
             self.exchange.create_order(**params)
         self.assertEqual(self.calls, [])
+        self.path.write_text(
+            json.dumps({**self.limits, 'max_margin_usdt': 1000, 'max_stop_loss_usdt': None})
+        )
+        self.exchange.create_order(**params)
+        self.assertEqual(self.calls, [params])
 
     def test_downward_native_price_rounding_uses_actual_permitted_margin(self):
         self.prepare()

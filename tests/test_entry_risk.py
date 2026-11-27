@@ -97,6 +97,34 @@ class EntryRiskTests(unittest.TestCase):
         self.assertFalse(self.assess({**self.request, 'size': 100.01, 'leverage': 1})['allowed'])
         self.assertFalse(self.assess({**self.request, 'size': 0.1, 'leverage': 20.01})['allowed'])
 
+    def test_null_stop_loss_cap_keeps_estimate_and_remaining_limits(self):
+        self.prepare()
+        request = {**self.request, 'size': 20}
+        capped = self.assess(request)
+        self.assertFalse(capped['allowed'])
+        self.assertGreater(capped['estimated_loss'], 10)
+
+        self.path.write_text(json.dumps({**self.limits, 'max_stop_loss_usdt': None}))
+        uncapped = self.assess(request)
+        self.assertTrue(uncapped['allowed'])
+        self.assertEqual(uncapped['estimated_loss'], capped['estimated_loss'])
+        self.assertEqual(uncapped['stop_price'], 97)
+        self.assertIn('估算亏损上限已关闭', self.bot._format_risk_preview(uncapped))
+        overview = self.strategy.overview('RUNNING', datetime.now(timezone.utc))
+        self.assertIn('估算止损亏损上限已关闭', overview[0])
+
+        for change, reason in (
+            ({'size': 101, 'leverage': 1}, '保证金'),
+            ({'leverage': 21}, '杠杆'),
+            ({'size': 100}, '总名义敞口'),
+        ):
+            with self.subTest(change=change):
+                result = self.assess({**request, **change})
+                self.assertFalse(result['allowed'])
+                self.assertTrue(any(reason in message for message in result['reasons']))
+        with self.assertRaises(self.risk.EntryRiskError):
+            self.assess({**request, 'stop_loss': 101})
+
     def test_missing_limits_are_explicit_and_bad_present_limits_fail_closed(self):
         self.prepare()
         self.path.unlink()

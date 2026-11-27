@@ -539,10 +539,12 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             )
         limits = row['limits']
         if limits:
+            stop_loss_cap = limits['max_stop_loss_usdt']
+            loss_limit = '估算亏损上限已关闭' if stop_loss_cap is None else f'估算亏损 {stop_loss_cap:g}U'
             text += (
                 f"上限：保证金 {limits['max_margin_usdt']:g}U／杠杆 {limits['max_leverage']:g}倍／"
                 f"总敞口 {limits['max_total_notional_usdt']:g}U／"
-                f"估算亏损 {limits['max_stop_loss_usdt']:g}U\n"
+                f'{loss_limit}\n'
             )
         else:
             text += '额度限制未启用，不能把本预览当作额度保护。\n'
@@ -1175,7 +1177,7 @@ class Telegram(WatchPanelMixin, OrderPanelMixin, UpstreamTelegram):
             '同一开单消息重放只返回原请求；主动发送新消息视为新开仓/加仓请求。\n'
             '/preview long|short BTC <保证金> <杠杆> sl=... [price=...] [tp=...] [ttl=24h] 只读预览\n'
             '/overview 汇总助手持仓、挂单TTL、TP及止损核验快照\n'
-            '风险上限覆盖保证金、杠杆、助手总敞口和该币种加仓后估算止损亏损；超限拒绝，不自动缩量。\n'
+            '风险上限覆盖保证金、杠杆、助手总敞口，估算止损亏损上限见 /overview。超限拒绝，不自动缩量。\n'
             '/request 历史开单、复制命令与风险预览按钮；/request page 2 翻页\n'
             '/preview <请求编号> 带入历史参数，复制预览命令修改后再算；预览不会下单\n'
             '/request <编号> resolve 核实后解除未知请求阻塞（不重发旧请求）\n'

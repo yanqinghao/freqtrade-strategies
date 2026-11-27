@@ -156,10 +156,12 @@ def overview_messages(strategy, trades, bot_state, now):
     try:
         limits = load_limits(strategy.risk_limits_file)
         if limits:
+            stop_loss_cap = limits['max_stop_loss_usdt']
+            loss_limit = '估算止损亏损上限已关闭' if stop_loss_cap is None else f'估算止损亏损 {stop_loss_cap:g}U'
             summary.append(
                 f"上限：单笔保证金 {limits['max_margin_usdt']:g}U，杠杆 {limits['max_leverage']:g}倍，"
                 f"总敞口 {limits['max_total_notional_usdt']:g}U，"
-                f"估算止损亏损 {limits['max_stop_loss_usdt']:g}U。"
+                f'{loss_limit}。'
             )
         else:
             summary.append('额度限制未启用。')
